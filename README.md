@@ -101,6 +101,8 @@ shortcuts:
 - SQL-safe zone names, such as `odin`: facts for that zone.
 - `active`: facts matching the detected or overridden repo/component context.
 - `components`: flattened component facts.
+- `valid_facts`: raw facts whose status is compatible/passed/observed/candidate.
+- `invalid_facts`: raw facts whose status is incompatible/failed/invalid/blocked.
 - `requirements`: expanded `requires` capability edges.
 - `capabilities`: expanded `provides` capability edges.
 - `context`: the detected repo, zone, tag, ref, and SHA.
@@ -111,15 +113,22 @@ name.
 
 Bare values in common filters can be left unquoted, so
 `type==chaincode` is normalized to `type = 'chaincode'`.
+`status==valid` expands to the compatible status set:
+`compatible`, `passed`, `observed`, `candidate`, `valid`, and `ready`.
 
 Examples:
 
 ```sql
-select * from zone where type==chaincode;
+select * from zone where type==chaincode and status==valid;
 
 select *
 from odin
 where component==eos and repo==red-wiz/eos and status==failed;
+
+select id, component, repo, status, observed_at, accepted_at
+from facts
+order by accepted_at desc
+limit 25;
 
 select eos.id, eos.component, eos.version
 from odin eos
@@ -152,6 +161,7 @@ terminal supports it.
 ```text
 matrix> select id, zone, status from facts limit 10;
 matrix> .context
+matrix> .context set repo red-wiz/putto
 matrix> .component eos
 matrix> .versions
 matrix> .use 1
@@ -177,6 +187,7 @@ Useful commands:
 - `.context`: show the active zone, repo, component, version, tag, ref, and SHA.
 - `.context <field> <value>`: set `zone`, `repo`, `component`, `version`,
   `tag`, `sha`, or `ref` without leaving the REPL.
+- `.context set <field> <value>`: alias for `.context <field> <value>`.
 - `.context auto`: reset to the current git repo/tag/ref/SHA.
 - `.context clear [field]`: clear one context field, or all fields.
 - `.zone`, `.repo`, `.component`, `.version`, `.tag`, `.sha`, `.ref`: shortcut

@@ -822,6 +822,7 @@ impl<'a> ReplSession<'a> {
     fn handle_context_command(&mut self, args: Vec<&str>) -> Result<()> {
         match args.as_slice() {
             [] | ["show"] => self.print_context(),
+            ["set", field, rest @ ..] => self.set_context_field(field, &rest.join(" ")),
             ["auto"] => {
                 self.context = MatrixContext::detect(ContextArgs::default());
                 self.rebuild_context()?;
@@ -1020,12 +1021,17 @@ fn build_facts_db(facts: &[Value], context: &MatrixContext) -> Result<Connection
           type text, component text, version text, repo text,
           source_repository text, source_repo text, source_sha text, source_ref text,
           subject_type text, subject_name text, channel text,
-          tag text, observed_at text, requires text, provides text, json text not null
+          tag text, observed_at text, accepted_at text,
+          requires text, provides text, json text not null
         );",
     )?;
     let mut zones = Vec::new();
-    for fact in facts {
-        let zone = text_at(fact, &["track"]).or_else(|| text_at(fact, &["zone"]));
+    for record in facts {
+        let fact = record.get("fact").filter(|value| value.is_object()).unwrap_or(record);
+        let zone = text_at(fact, &["track"])
+            .or_else(|| text_at(record, &["track"]))
+            .or_else(|| text_at(fact, &["zone"]))
+            .or_else(|| text_at(record, &["zone"]));
         if let Some(zone) = zone.clone()
             && is_sql_identifier(&zone)
             && !zones.contains(&zone)
@@ -1040,18 +1046,28 @@ fn build_facts_db(facts: &[Value], context: &MatrixContext) -> Result<Connection
         let subject_repo =
             text_at(fact, &["subjectRepo"]).or_else(|| text_at(fact, &["subject", "repo"]));
         let source_repo =
-            text_at(fact, &["sourceRepository"]).or_else(|| text_at(fact, &["source", "repo"]));
+            text_at(fact, &["sourceRepository"])
+                .or_else(|| text_at(record, &["sourceRepository"]))
+                .or_else(|| text_at(fact, &["source", "repo"]))
+                .or_else(|| text_at(record, &["source", "repo"]))
+                .or_else(|| text_at(record, &["source", "repository"]));
         let source_sha =
-            text_at(fact, &["sourceSha"]).or_else(|| text_at(fact, &["source", "sha"]));
+            text_at(fact, &["sourceSha"])
+                .or_else(|| text_at(record, &["sourceSha"]))
+                .or_else(|| text_at(fact, &["source", "sha"]))
+                .or_else(|| text_at(record, &["source", "sha"]));
         let source_ref =
-            text_at(fact, &["sourceRef"]).or_else(|| text_at(fact, &["source", "ref"]));
+            text_at(fact, &["sourceRef"])
+                .or_else(|| text_at(record, &["sourceRef"]))
+                .or_else(|| text_at(fact, &["source", "ref"]))
+                .or_else(|| text_at(record, &["source", "ref"]));
         let tag = text_at(fact, &["tag"]).or_else(|| source_ref.clone());
         db.execute(
-            "insert into facts values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+            "insert into facts values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
             params![
-                fact.get("id").and_then(Value::as_str),
+                text_at(fact, &["id"]).or_else(|| text_at(record, &["id"])),
                 zone,
-                text_at(fact, &["kind"]),
+                text_at(fact, &["kind"]).or_else(|| text_at(record, &["kind"])),
                 text_at(fact, &["status"]),
                 subject_type.clone(),
                 component,
@@ -1065,10 +1081,11 @@ fn build_facts_db(facts: &[Value], context: &MatrixContext) -> Result<Connection
                 subject_name,
                 text_at(fact, &["channel"]),
                 tag,
-                text_at(fact, &["observedAt"]),
+                text_at(fact, &["observedAt"]).or_else(|| text_at(record, &["observedAt"])),
+                text_at(record, &["acceptedAt"]).or_else(|| text_at(fact, &["acceptedAt"])),
                 json_array_text(fact.get("requires"))?,
                 json_array_text(fact.get("provides"))?,
-                serde_json::to_string(fact)?,
+                serde_json::to_string(record)?,
             ],
         )?;
     }
@@ -1092,9 +1109,21 @@ fn create_matrix_views(db: &Connection, context: &MatrixContext, zones: &[String
           where component is not null
           group by type, component, repo;
         create view components as
-          select zone, type, component, repo, version, status, observed_at, id
+          select zone, type, component, repo, version, status,
+                 case
+                   when status in ('compatible', 'passed', 'observed', 'candidate', 'valid', 'ready') then 'valid'
+                   when status in ('incompatible', 'failed', 'invalid', 'blocked') then 'invalid'
+                   else coalesce(status, 'unknown')
+                 end as status_class,
+                 observed_at, accepted_at, id
           from facts
           where component is not null;
+        create view valid_facts as
+          select * from facts
+          where status in ('compatible', 'passed', 'observed', 'candidate', 'valid', 'ready');
+        create view invalid_facts as
+          select * from facts
+          where status in ('incompatible', 'failed', 'invalid', 'blocked');
         create view requirements as
           select f.id as fact_id, f.zone, f.type, f.component, f.repo, f.version, f.status,
                  json_extract(item.value, '$.capability') as capability,
@@ -1147,6 +1176,8 @@ fn create_matrix_views(db: &Connection, context: &MatrixContext, zones: &[String
                 | "context"
                 | "subjects"
                 | "components"
+                | "valid_facts"
+                | "invalid_facts"
                 | "requirements"
                 | "capabilities"
                 | "zones"
@@ -1287,7 +1318,59 @@ fn normalize_matrix_sql(sql: &str) -> String {
         index += 1;
     }
 
-    normalized.join("")
+    normalize_status_class_filters(normalized).join("")
+}
+
+fn normalize_status_class_filters(tokens: Vec<String>) -> Vec<String> {
+    let mut normalized = tokens.clone();
+    let mut index = 0;
+    while index < tokens.len() {
+        let field = comparable_field_name(&tokens[index]);
+        if field == "status"
+            && token_boundary_before(&tokens, index)
+            && token_boundary_after(&tokens, index)
+            && let Some(op_index) = next_non_ws(&tokens, index + 1)
+            && matches!(tokens[op_index].as_str(), "=" | "!=" | "<>")
+            && let Some(value_index) = next_non_ws(&tokens, op_index + 1)
+            && let Some(status_class) = status_class_value(&tokens[value_index])
+        {
+            let negated = matches!(tokens[op_index].as_str(), "!=" | "<>");
+            normalized[index] = format!(
+                "{} {} {}",
+                tokens[index],
+                if negated { "not in" } else { "in" },
+                status_class_sql(status_class),
+            );
+            for token in normalized.iter_mut().take(value_index + 1).skip(index + 1) {
+                token.clear();
+            }
+            index = value_index + 1;
+            continue;
+        }
+        index += 1;
+    }
+    normalized
+}
+
+fn status_class_value(token: &str) -> Option<&'static str> {
+    let value = token
+        .trim()
+        .trim_matches('\'')
+        .trim_matches('"')
+        .to_ascii_lowercase();
+    match value.as_str() {
+        "valid" => Some("valid"),
+        "invalid" => Some("invalid"),
+        _ => None,
+    }
+}
+
+fn status_class_sql(status_class: &str) -> &'static str {
+    match status_class {
+        "valid" => "('compatible','passed','observed','candidate','valid','ready')",
+        "invalid" => "('incompatible','failed','invalid','blocked')",
+        _ => "('')",
+    }
 }
 
 fn comparable_field_name(token: &str) -> String {
@@ -1523,6 +1606,7 @@ Matrix shell commands
   .refresh                  Reload facts from the construct
   .context                  Show active context
   .context <field> <value>  Set zone, repo, component, version, tag, sha, or ref
+  .context set <field> ...  Same as `.context <field> <value>`
   .context clear [field]    Clear one context field, or all fields
   .context auto             Reset to detected git repo, tag, ref, and sha
   .zone/.repo/.component    Shortcut setters for common context fields
@@ -1542,7 +1626,8 @@ Matrix shell commands
 SQL
   End SQL statements with `;`.
   Available tables/views: facts, active, zone, zones, subjects, components,
-  capabilities, requirements, and one view per SQL-safe zone such as odin.
+  valid_facts, invalid_facts, capabilities, requirements, and one view per
+  SQL-safe zone such as odin. `status = valid` expands to compatible statuses.
 "
     );
 }
@@ -1631,6 +1716,7 @@ impl MatrixCompleter {
             "kind",
             "limit",
             "observed_at",
+            "accepted_at",
             "order",
             "provides",
             "red",
@@ -1992,6 +2078,10 @@ mod tests {
             normalize_matrix_sql("select * from zone where repo==red-wiz/eos and status!=failed"),
             "select * from zone where repo='red-wiz/eos' and status!='failed'"
         );
+        assert_eq!(
+            normalize_matrix_sql("select * from zone where type==chaincode and status==valid"),
+            "select * from zone where type='chaincode' and status in ('compatible','passed','observed','candidate','valid','ready')"
+        );
     }
 
     #[test]
@@ -2083,6 +2173,78 @@ mod tests {
         assert_eq!(result["rows"].as_array().unwrap().len(), 1);
         assert_eq!(result["rows"][0]["id"], "eos-2");
         assert_eq!(result["rows"][0]["component"], "eos");
+    }
+
+    #[test]
+    fn flattens_construct_wrapped_facts() {
+        let facts = vec![
+            json!({
+                "acceptedAt": "2026-06-17T21:49:24.064Z",
+                "id": "chaincode.csr_vdr_go.0.2.9.6d562df953ec",
+                "kind": "CompatibilityFact",
+                "source": {"repository": "red-wiz/aglaea"},
+                "track": "odin",
+                "fact": {
+                    "id": "chaincode.csr_vdr_go.0.2.9.6d562df953ec",
+                    "kind": "CompatibilityFact",
+                    "observedAt": "2026-06-17T21:49:21.392Z",
+                    "source": {
+                        "ref": "refs/tags/v0.2.9",
+                        "repo": "red-wiz/aglaea",
+                        "sha": "6d562df953eca829f918a6ea956482f761dccba8"
+                    },
+                    "status": "candidate",
+                    "subject": {
+                        "name": "csr_vdr_go",
+                        "repo": "red-wiz/aglaea",
+                        "type": "chaincode",
+                        "version": "0.2.9"
+                    },
+                    "track": "odin"
+                }
+            }),
+            json!({
+                "acceptedAt": "2026-06-17T21:49:24.133Z",
+                "id": "validation.odin.csr_vdr_go.0.2.9",
+                "kind": "ValidationFact",
+                "track": "odin",
+                "fact": {
+                    "id": "validation.odin.csr_vdr_go.0.2.9",
+                    "kind": "ValidationFact",
+                    "observedAt": "2026-06-17T21:49:21.392Z",
+                    "source": {
+                        "repo": "red-wiz/aglaea",
+                        "sha": "6d562df953eca829f918a6ea956482f761dccba8"
+                    },
+                    "status": "not-run",
+                    "track": "odin"
+                }
+            }),
+        ];
+        let db = build_facts_db(
+            &facts,
+            &MatrixContext {
+                zone: Some("odin".to_string()),
+                ..MatrixContext::default()
+            },
+        )
+        .unwrap();
+        let result = execute_readonly_sql(
+            &db,
+            "select component, version, repo, source_sha, status, observed_at, accepted_at from zone where type==chaincode and status==valid",
+        )
+        .unwrap();
+        assert_eq!(result["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(result["rows"][0]["component"], "csr_vdr_go");
+        assert_eq!(result["rows"][0]["version"], "0.2.9");
+        assert_eq!(result["rows"][0]["repo"], "red-wiz/aglaea");
+        assert_eq!(
+            result["rows"][0]["source_sha"],
+            "6d562df953eca829f918a6ea956482f761dccba8"
+        );
+        assert_eq!(result["rows"][0]["status"], "candidate");
+        assert_eq!(result["rows"][0]["observed_at"], "2026-06-17T21:49:21.392Z");
+        assert_eq!(result["rows"][0]["accepted_at"], "2026-06-17T21:49:24.064Z");
     }
 
     #[test]

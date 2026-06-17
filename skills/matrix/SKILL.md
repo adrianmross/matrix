@@ -60,10 +60,17 @@ Only `SELECT` and `WITH` statements are allowed. The `facts` table includes:
 - `subject_name`
 - `channel`
 - `observed_at`
+- `accepted_at`
 - `json`
 
 Use the `json` column for fields that have not been promoted into first-class
 columns yet.
+
+The local engine also exposes `active`, `zone`, `zones`, `subjects`,
+`components`, `valid_facts`, `invalid_facts`, `requirements`, `capabilities`,
+and one SQL-safe view per zone such as `odin`. In status filters,
+`status==valid` expands to the compatible status set:
+`compatible`, `passed`, `observed`, `candidate`, `valid`, and `ready`.
 
 ## Producer Adapters
 
@@ -75,4 +82,6 @@ start emitting facts before a specialized adapter exists.
 ## Interactive Mode
 
 Use `matrix enter` when the user wants an interactive SQL session. In the REPL,
-`red` exits and `blue` clears local session context.
+`red` exits and `blue` clears local session context. Use `.context repo
+red-wiz/putto` or `.context set repo red-wiz/putto` to change context without
+leaving the REPL.
