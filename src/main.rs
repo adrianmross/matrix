@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 #[derive(Parser)]
 #[command(name = "matrix", version, about = "Compatibility matrix CLI")]
 struct Cli {
-    #[arg(long, alias = "oracle", env = "MATRIX_CONSTRUCT_URL", global = true)]
+    #[arg(long, env = "MATRIX_CONSTRUCT_URL", global = true)]
     construct: Option<String>,
     #[arg(long, env = "MATRIX_API_PREFIX", global = true)]
     api_prefix: Option<String>,
@@ -122,7 +122,7 @@ struct IngestArgs {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct Config {
-    #[serde(default, alias = "oracle", skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     construct: Option<String>,
     api_prefix: Option<String>,
     token: Option<String>,
@@ -203,7 +203,6 @@ impl Matrix {
         };
         let construct = construct_override
             .or_else(|| env::var("MATRIX_CONSTRUCT_URL").ok())
-            .or_else(|| env::var("MATRIX_ORACLE_URL").ok())
             .or_else(|| config.construct.clone())
             .map(|value| value.trim_end_matches('/').to_string());
         let api_prefix = prefix_override
@@ -298,14 +297,14 @@ async fn config_command(matrix: &mut Matrix, command: ConfigCommand) -> Result<V
             "hasToken": matrix.config.token.is_some(),
         })),
         ConfigSubcommand::Get { key } => match key.as_str() {
-            "construct" | "oracle" => Ok(json!({"construct": matrix.config.construct})),
+            "construct" => Ok(json!({"construct": matrix.config.construct})),
             "api-prefix" | "apiPrefix" => Ok(json!({"apiPrefix": matrix.config.api_prefix})),
             "token" => Ok(json!({"hasToken": matrix.config.token.is_some()})),
             _ => bail!("unknown config key {key:?}; expected construct, api-prefix, or token"),
         },
         ConfigSubcommand::Set { key, value } => {
             match key.as_str() {
-                "construct" | "oracle" => matrix.config.construct = Some(value),
+                "construct" => matrix.config.construct = Some(value),
                 "api-prefix" | "apiPrefix" => matrix.config.api_prefix = Some(value),
                 "token" => matrix.config.token = Some(value),
                 _ => bail!("unknown config key {key:?}; expected construct, api-prefix, or token"),

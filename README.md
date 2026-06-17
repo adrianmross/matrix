@@ -87,11 +87,8 @@ matrix config set api-prefix /v1/matrix
 Environment overrides:
 
 - `MATRIX_CONSTRUCT_URL`
-- `MATRIX_ORACLE_URL`
 - `MATRIX_API_PREFIX`
 - `MATRIX_TOKEN`
-
-`oracle` and `MATRIX_ORACLE_URL` are kept as compatibility aliases.
 
 ## Design Notes
 

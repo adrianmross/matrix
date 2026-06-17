@@ -1,6 +1,6 @@
 {
   "name": "matrix",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Use the Matrix compatibility CLI from Codex to inspect zones, query facts, evaluate gates, and publish evidence.",
   "author": {
     "name": "Adrian Ross",
