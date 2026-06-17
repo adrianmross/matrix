@@ -44,6 +44,21 @@ matrix ingest sbom --file bom.cdx.json
 Add `--upload` to submit the normalized adapter payload to the configured
 oracle.
 
+## Codex Plugin
+
+This repository can also be installed as a Codex plugin. The plugin does not
+bundle a server or credentials; it teaches Codex how to use the local `matrix`
+binary against the oracle you configure.
+
+```bash
+matrix config set oracle https://matrix.example.dev
+matrix doctor
+```
+
+The plugin skill prefers `--json` for automation, uses `matrix query` for
+read-only SQL over compatibility facts, and uses `matrix upload` or
+`matrix ingest --upload` for producer evidence.
+
 ## REPL
 
 ```bash
@@ -65,7 +80,7 @@ matrix> red
 ```bash
 matrix config list
 matrix config set oracle https://matrix.example.dev
-matrix config set api-prefix /v1/compatibility
+matrix config set api-prefix /v1/matrix
 ```
 
 Environment overrides:

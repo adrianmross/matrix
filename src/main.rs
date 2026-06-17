@@ -147,15 +147,21 @@ async fn run() -> Result<()> {
     let output = match cli.command {
         Commands::Config(command) => config_command(&mut matrix, command).await?,
         Commands::List => matrix.get("").await?,
-        Commands::View { zone } => matrix.get(&format!("/tracks/{}", enc(&zone))).await?,
+        Commands::View { zone } => {
+            matrix
+                .get_fallback(
+                    &format!("/zones/{}", enc(&zone)),
+                    &format!("/tracks/{}", enc(&zone)),
+                )
+                .await?
+        }
         Commands::Current(args) => current(&matrix, args).await?,
         Commands::Gate { zone, level } => {
             matrix
-                .get(&format!(
-                    "/tracks/{}/promotion-gates/{}",
-                    enc(&zone),
-                    enc(&level)
-                ))
+                .get_fallback(
+                    &format!("/zones/{}/gates/{}", enc(&zone), enc(&level)),
+                    &format!("/tracks/{}/promotion-gates/{}", enc(&zone), enc(&level)),
+                )
                 .await?
         }
         Commands::Trace(args) => trace(&matrix, args).await?,
@@ -191,7 +197,7 @@ impl Matrix {
         let api_prefix = prefix_override
             .or_else(|| env::var("MATRIX_API_PREFIX").ok())
             .or_else(|| config.api_prefix.clone())
-            .unwrap_or_else(|| "/v1/compatibility".to_string())
+            .unwrap_or_else(|| "/v1/matrix".to_string())
             .trim_end_matches('/')
             .to_string();
         Ok(Self {
@@ -222,6 +228,16 @@ impl Matrix {
 
     async fn get(&self, path: &str) -> Result<Value> {
         self.request(Method::GET, path, None).await
+    }
+
+    async fn get_fallback(&self, primary: &str, fallback: &str) -> Result<Value> {
+        match self.request(Method::GET, primary, None).await {
+            Ok(value) => Ok(value),
+            Err(primary_error) => self
+                .request(Method::GET, fallback, None)
+                .await
+                .with_context(|| format!("primary path failed: {primary_error:#}")),
+        }
     }
 
     async fn request(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {
@@ -307,30 +323,47 @@ async fn current(matrix: &Matrix, args: CandidateArgs) -> Result<Value> {
     if let Some(capability) = args.capability {
         query.push(("capability", capability));
     }
+    let qs = query_string(query);
     matrix
-        .get(&format!(
-            "/tracks/{}/promotion-candidates/{}?{}",
-            enc(&args.zone),
-            enc(&args.level),
-            query_string(query)
-        ))
+        .get_fallback(
+            &format!(
+                "/zones/{}/candidates/{}?{}",
+                enc(&args.zone),
+                enc(&args.level),
+                qs
+            ),
+            &format!(
+                "/tracks/{}/promotion-candidates/{}?{}",
+                enc(&args.zone),
+                enc(&args.level),
+                qs
+            ),
+        )
         .await
 }
 
 async fn trace(matrix: &Matrix, args: TraceArgs) -> Result<Value> {
     let mut query = Vec::new();
+    let mut fallback_query = Vec::new();
     if let Some(zone) = args.zone {
-        query.push(("track", zone));
+        query.push(("zone", zone.clone()));
+        fallback_query.push(("track", zone));
     }
     if let Some(subject) = args.subject {
-        query.push(("subjectName", subject));
+        query.push(("subjectName", subject.clone()));
+        fallback_query.push(("subjectName", subject));
     }
     if let Some(id) = args.id {
-        query.push(("id", id));
+        query.push(("id", id.clone()));
+        fallback_query.push(("id", id));
     }
     query.push(("limit", args.limit.to_string()));
+    fallback_query.push(("limit", args.limit.to_string()));
     let facts = matrix
-        .get(&format!("/facts?{}", query_string(query)))
+        .get_fallback(
+            &format!("/facts?{}", query_string(query)),
+            &format!("/facts?{}", query_string(fallback_query)),
+        )
         .await?;
     Ok(json!({
         "trace": facts,

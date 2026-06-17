@@ -1,0 +1,43 @@
+{
+  "name": "matrix",
+  "version": "0.1.0",
+  "description": "Use the Matrix compatibility CLI from Codex to inspect zones, query facts, evaluate gates, and publish evidence.",
+  "author": {
+    "name": "Adrian Ross",
+    "email": "adrianmross@users.noreply.github.com",
+    "url": "https://github.com/adrianmross"
+  },
+  "homepage": "https://github.com/adrianmross/matrix",
+  "repository": "https://github.com/adrianmross/matrix",
+  "license": "Apache-2.0",
+  "keywords": [
+    "compatibility",
+    "matrix",
+    "release-trains",
+    "cli",
+    "codex"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Matrix",
+    "shortDescription": "Query and publish compatibility facts",
+    "longDescription": "Matrix helps Codex use a local compatibility matrix CLI to inspect software zones and levels, evaluate gates, trace facts, and publish producer evidence to a configured oracle.",
+    "developerName": "Adrian Ross",
+    "category": "Coding",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/adrianmross/matrix",
+    "privacyPolicyURL": "https://github.com/adrianmross/matrix",
+    "termsOfServiceURL": "https://github.com/adrianmross/matrix",
+    "defaultPrompt": [
+      "Check compatibility for this repo",
+      "Query Matrix facts with SQL",
+      "Publish compatibility evidence"
+    ],
+    "brandColor": "#16A34A",
+    "screenshots": []
+  }
+}
