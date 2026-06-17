@@ -41,6 +41,7 @@ matrix gate --zone sdk-runtime --level stage
 matrix trace --zone sdk-runtime --subject my-package
 matrix upload facts.json
 matrix query 'select id, zone, status, subject_name from facts limit 20'
+matrix query --zone sdk-runtime 'select * from zone where type==chaincode'
 matrix completion zsh
 ```
 
@@ -79,6 +80,58 @@ matrix doctor
 The plugin skill prefers `--json` for automation, uses `matrix query` for
 read-only SQL over compatibility facts, and uses `matrix upload` or
 `matrix ingest --upload` for producer evidence.
+
+## Context Queries
+
+`matrix query` and `matrix enter` detect the current git repository, branch,
+tag, and SHA. Override that context when needed:
+
+```bash
+matrix query --zone odin --repo red-wiz/putto \
+  'select * from zone where type==chaincode and status!=failed'
+
+matrix enter --zone odin --repo red-wiz/eos
+```
+
+The local query engine keeps the raw `facts` table and adds Matrix-native
+shortcuts:
+
+- `zone`: facts for the active or inferred zone.
+- SQL-safe zone names, such as `odin`: facts for that zone.
+- `active`: facts matching the detected or overridden repo/component context.
+- `components`: flattened component facts.
+- `requirements`: expanded `requires` capability edges.
+- `capabilities`: expanded `provides` capability edges.
+- `context`: the detected repo, zone, tag, ref, and SHA.
+
+Bare values in common filters can be left unquoted, so
+`type==chaincode` is normalized to `type = 'chaincode'`.
+
+Examples:
+
+```sql
+select * from zone where type==chaincode;
+
+select *
+from odin
+where component==eos and repo==red-wiz/eos and status==failed;
+
+select eos.id, eos.component, eos.version
+from odin eos
+where eos.repo==red-wiz/eos
+  and exists (
+    select 1
+    from requirements r
+    where r.fact_id = eos.id
+      and r.capability in (
+        select p.capability
+        from capabilities p
+        where p.repo==red-wiz/athena and p.status!=failed
+        order by p.version desc
+        limit 1
+      )
+  );
+```
 
 ## REPL
 

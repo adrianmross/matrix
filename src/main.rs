@@ -56,12 +56,8 @@ enum Commands {
     Upload(UploadArgs),
     Publish(UploadArgs),
     Ingest(IngestArgs),
-    Query {
-        sql: String,
-        #[arg(long, default_value_t = 1000)]
-        max_facts: usize,
-    },
-    Enter,
+    Query(QueryArgs),
+    Enter(ContextArgs),
     Doctor,
     RedPill,
     BluePill,
@@ -110,6 +106,31 @@ struct TraceArgs {
     limit: usize,
 }
 
+#[derive(Args, Clone, Default)]
+struct ContextArgs {
+    #[arg(long, env = "MATRIX_ZONE")]
+    zone: Option<String>,
+    #[arg(long)]
+    repo: Option<String>,
+    #[arg(long)]
+    component: Option<String>,
+    #[arg(long)]
+    tag: Option<String>,
+    #[arg(long)]
+    sha: Option<String>,
+    #[arg(long)]
+    r#ref: Option<String>,
+}
+
+#[derive(Args)]
+struct QueryArgs {
+    sql: String,
+    #[arg(long, default_value_t = 1000)]
+    max_facts: usize,
+    #[command(flatten)]
+    context: ContextArgs,
+}
+
 #[derive(Args, Clone)]
 struct UploadArgs {
     file: Option<PathBuf>,
@@ -144,6 +165,16 @@ struct Matrix {
     api_prefix: String,
     json: bool,
     client: reqwest::Client,
+}
+
+#[derive(Clone, Debug, Default)]
+struct MatrixContext {
+    zone: Option<String>,
+    repo: Option<String>,
+    component: Option<String>,
+    tag: Option<String>,
+    sha: Option<String>,
+    reference: Option<String>,
 }
 
 #[tokio::main]
@@ -186,8 +217,8 @@ async fn run() -> Result<()> {
         Commands::Trace(args) => trace(&matrix, args).await?,
         Commands::Upload(args) | Commands::Publish(args) => upload(&matrix, args).await?,
         Commands::Ingest(args) => ingest(&matrix, args).await?,
-        Commands::Query { sql, max_facts } => query(&matrix, &sql, max_facts).await?,
-        Commands::Enter => enter(&matrix).await?,
+        Commands::Query(args) => query(&matrix, args).await?,
+        Commands::Enter(context) => enter(&matrix, context).await?,
         Commands::Doctor => doctor(&matrix).await?,
         Commands::RedPill => red_pill(&matrix).await?,
         Commands::BluePill => blue_pill(&matrix).await?,
@@ -363,6 +394,19 @@ async fn current(matrix: &Matrix, args: CandidateArgs) -> Result<Value> {
         .await
 }
 
+impl MatrixContext {
+    fn detect(args: ContextArgs) -> Self {
+        Self {
+            zone: args.zone.or_else(|| env::var("MATRIX_ZONE").ok()),
+            repo: args.repo.or_else(current_repo),
+            component: args.component,
+            tag: args.tag.or_else(current_exact_tag),
+            sha: args.sha.or_else(current_sha),
+            reference: args.r#ref.or_else(current_branch),
+        }
+    }
+}
+
 async fn trace(matrix: &Matrix, args: TraceArgs) -> Result<Value> {
     let mut query = Vec::new();
     let mut fallback_query = Vec::new();
@@ -411,14 +455,15 @@ async fn ingest(matrix: &Matrix, args: IngestArgs) -> Result<Value> {
     }
 }
 
-async fn query(matrix: &Matrix, sql: &str, max_facts: usize) -> Result<Value> {
-    let facts = fetch_facts(matrix, max_facts).await?;
-    let db = build_facts_db(&facts)?;
-    execute_readonly_sql(&db, sql)
+async fn query(matrix: &Matrix, args: QueryArgs) -> Result<Value> {
+    let facts = fetch_facts(matrix, args.max_facts).await?;
+    let context = MatrixContext::detect(args.context);
+    let db = build_facts_db(&facts, &context)?;
+    execute_readonly_sql(&db, &args.sql)
 }
 
-async fn enter(matrix: &Matrix) -> Result<Value> {
-    let mut repl = ReplSession::new(matrix).await?;
+async fn enter(matrix: &Matrix, context: ContextArgs) -> Result<Value> {
+    let mut repl = ReplSession::new(matrix, MatrixContext::detect(context)).await?;
     repl.run().await?;
     Ok(json!({"status":"left"}))
 }
@@ -432,6 +477,7 @@ enum OutputMode {
 
 struct ReplSession<'a> {
     matrix: &'a Matrix,
+    context: MatrixContext,
     db: Connection,
     max_facts: usize,
     fact_count: usize,
@@ -442,13 +488,14 @@ struct ReplSession<'a> {
 }
 
 impl<'a> ReplSession<'a> {
-    async fn new(matrix: &'a Matrix) -> Result<Self> {
+    async fn new(matrix: &'a Matrix, context: MatrixContext) -> Result<Self> {
         let max_facts = 1000;
         let facts = fetch_facts(matrix, max_facts).await?;
         let fact_count = facts.len();
         Ok(Self {
             matrix,
-            db: build_facts_db(&facts)?,
+            db: build_facts_db(&facts, &context)?,
+            context,
             max_facts,
             fact_count,
             output_mode: if matrix.json {
@@ -465,7 +512,7 @@ impl<'a> ReplSession<'a> {
     async fn refresh(&mut self) -> Result<()> {
         let facts = fetch_facts(self.matrix, self.max_facts).await?;
         self.fact_count = facts.len();
-        self.db = build_facts_db(&facts)?;
+        self.db = build_facts_db(&facts, &self.context)?;
         self.last_refresh = SystemTime::now();
         Ok(())
     }
@@ -713,6 +760,14 @@ impl<'a> ReplSession<'a> {
         let value = json!({
             "construct": self.matrix.construct,
             "apiPrefix": self.matrix.api_prefix,
+            "context": {
+                "zone": self.context.zone,
+                "repo": self.context.repo,
+                "component": self.context.component,
+                "tag": self.context.tag,
+                "sha": self.context.sha,
+                "ref": self.context.reference,
+            },
             "facts": self.fact_count,
             "maxFacts": self.max_facts,
             "mode": format!("{:?}", self.output_mode).to_ascii_lowercase(),
@@ -724,53 +779,369 @@ impl<'a> ReplSession<'a> {
     }
 }
 
-fn build_facts_db(facts: &[Value]) -> Result<Connection> {
+fn build_facts_db(facts: &[Value], context: &MatrixContext) -> Result<Connection> {
     let db = Connection::open_in_memory()?;
     db.execute_batch(
         "create table facts (
           id text, zone text, kind text, status text,
-          source_repository text, source_sha text,
+          type text, component text, version text, repo text,
+          source_repository text, source_repo text, source_sha text, source_ref text,
           subject_type text, subject_name text, channel text,
-          observed_at text, json text not null
-        );
-        create view zones as
-          select zone, count(*) as facts,
-                 sum(case when status = 'compatible' then 1 else 0 end) as compatible,
-                 sum(case when status = 'incompatible' then 1 else 0 end) as incompatible
-          from facts
-          where zone is not null
-          group by zone;
-        create view subjects as
-          select subject_type, subject_name, count(*) as facts,
-                 max(observed_at) as last_observed_at
-          from facts
-          where subject_name is not null
-          group by subject_type, subject_name;",
+          tag text, observed_at text, requires text, provides text, json text not null
+        );",
     )?;
+    let mut zones = Vec::new();
     for fact in facts {
+        let zone = text_at(fact, &["track"]).or_else(|| text_at(fact, &["zone"]));
+        if let Some(zone) = zone.clone()
+            && is_sql_identifier(&zone)
+            && !zones.contains(&zone)
+        {
+            zones.push(zone);
+        }
+        let subject_type =
+            text_at(fact, &["subjectType"]).or_else(|| text_at(fact, &["subject", "type"]));
+        let subject_name =
+            text_at(fact, &["subjectName"]).or_else(|| text_at(fact, &["subject", "name"]));
+        let subject_repo =
+            text_at(fact, &["subjectRepo"]).or_else(|| text_at(fact, &["subject", "repo"]));
+        let source_repo =
+            text_at(fact, &["sourceRepository"]).or_else(|| text_at(fact, &["source", "repo"]));
+        let source_sha =
+            text_at(fact, &["sourceSha"]).or_else(|| text_at(fact, &["source", "sha"]));
+        let source_ref =
+            text_at(fact, &["sourceRef"]).or_else(|| text_at(fact, &["source", "ref"]));
         db.execute(
-            "insert into facts values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "insert into facts values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
             params![
                 fact.get("id").and_then(Value::as_str),
-                fact.get("track")
-                    .or_else(|| fact.get("zone"))
-                    .and_then(Value::as_str),
-                fact.get("kind").and_then(Value::as_str),
-                fact.get("status").and_then(Value::as_str),
-                fact.get("sourceRepository").and_then(Value::as_str),
-                fact.get("sourceSha").and_then(Value::as_str),
-                fact.get("subjectType").and_then(Value::as_str),
-                fact.get("subjectName").and_then(Value::as_str),
-                fact.get("channel").and_then(Value::as_str),
-                fact.get("observedAt").and_then(Value::as_str),
+                zone,
+                text_at(fact, &["kind"]),
+                text_at(fact, &["status"]),
+                subject_type.clone(),
+                subject_name.clone(),
+                text_at(fact, &["subjectVersion"]).or_else(|| text_at(fact, &["subject", "version"])),
+                subject_repo.clone().or_else(|| source_repo.clone()),
+                source_repo.clone(),
+                source_repo,
+                source_sha,
+                source_ref,
+                subject_type,
+                subject_name,
+                text_at(fact, &["channel"]),
+                text_at(fact, &["tag"]),
+                text_at(fact, &["observedAt"]),
+                json_array_text(fact.get("requires"))?,
+                json_array_text(fact.get("provides"))?,
                 serde_json::to_string(fact)?,
             ],
         )?;
     }
+    create_matrix_views(&db, context, &zones)?;
     Ok(db)
 }
 
+fn create_matrix_views(db: &Connection, context: &MatrixContext, zones: &[String]) -> Result<()> {
+    db.execute_batch(
+        "create view zones as
+          select zone, count(*) as facts,
+                 sum(case when status in ('compatible', 'passed', 'observed', 'candidate') then 1 else 0 end) as valid,
+                 sum(case when status in ('incompatible', 'failed') then 1 else 0 end) as invalid
+          from facts
+          where zone is not null
+          group by zone;
+        create view subjects as
+          select type, component, repo, count(*) as facts,
+                 max(observed_at) as last_observed_at
+          from facts
+          where component is not null
+          group by type, component, repo;
+        create view components as
+          select zone, type, component, repo, version, status, observed_at, id
+          from facts
+          where component is not null;
+        create view requirements as
+          select f.id as fact_id, f.zone, f.type, f.component, f.repo, f.version, f.status,
+                 json_extract(item.value, '$.capability') as capability,
+                 json_extract(item.value, '$.version') as capability_version,
+                 item.value as requirement
+          from facts f, json_each(coalesce(f.requires, '[]')) item;
+        create view capabilities as
+          select f.id as fact_id, f.zone, f.type, f.component, f.repo, f.version, f.status,
+                 json_extract(item.value, '$.capability') as capability,
+                 json_extract(item.value, '$.version') as capability_version,
+                 item.value as provides
+          from facts f, json_each(coalesce(f.provides, '[]')) item;",
+    )?;
+
+    let active_where = active_context_where(context);
+    let active_zone = context
+        .zone
+        .clone()
+        .or_else(|| infer_context_zone(db, &active_where).ok().flatten());
+    let zone_where = active_zone
+        .as_deref()
+        .map(|zone| format!("zone = {}", sql_literal(zone)))
+        .unwrap_or_else(|| "0".to_string());
+    db.execute_batch(&format!(
+        "create view context as select
+           {} as zone,
+           {} as repo,
+           {} as component,
+           {} as tag,
+           {} as sha,
+           {} as ref;
+         create view active as select * from facts where {active_where};
+         create view zone as select * from facts where {zone_where};",
+        sql_literal_opt(active_zone.as_deref()),
+        sql_literal_opt(context.repo.as_deref()),
+        sql_literal_opt(context.component.as_deref()),
+        sql_literal_opt(context.tag.as_deref()),
+        sql_literal_opt(context.sha.as_deref()),
+        sql_literal_opt(context.reference.as_deref()),
+    ))?;
+
+    for zone in zones {
+        if matches!(
+            zone.as_str(),
+            "zone"
+                | "active"
+                | "facts"
+                | "context"
+                | "subjects"
+                | "components"
+                | "requirements"
+                | "capabilities"
+                | "zones"
+        ) {
+            continue;
+        }
+        db.execute_batch(&format!(
+            "create view {} as select * from facts where zone = {};",
+            quote_identifier(zone),
+            sql_literal(zone)
+        ))?;
+    }
+
+    Ok(())
+}
+
+fn active_context_where(context: &MatrixContext) -> String {
+    let mut filters = Vec::new();
+    if let Some(repo) = context.repo.as_deref() {
+        let repo = sql_literal(repo);
+        filters.push(format!(
+            "(repo = {repo} or source_repo = {repo} or source_repository = {repo})"
+        ));
+    }
+    if let Some(component) = context.component.as_deref() {
+        filters.push(format!("component = {}", sql_literal(component)));
+    }
+    if let Some(sha) = context.sha.as_deref() {
+        filters.push(format!("source_sha = {}", sql_literal(sha)));
+    }
+    if let Some(reference) = context.reference.as_deref() {
+        filters.push(format!("source_ref = {}", sql_literal(reference)));
+    }
+    if let Some(tag) = context.tag.as_deref() {
+        let tag = sql_literal(tag);
+        filters.push(format!(
+            "(tag = {tag} or version = {tag} or source_ref = {tag})"
+        ));
+    }
+    if filters.is_empty() {
+        "1".to_string()
+    } else {
+        filters.join(" and ")
+    }
+}
+
+fn infer_context_zone(db: &Connection, active_where: &str) -> Result<Option<String>> {
+    let sql = format!(
+        "select zone from facts where {active_where} and zone is not null order by observed_at desc, id asc limit 1"
+    );
+    match db.query_row(&sql, [], |row| row.get::<_, String>(0)) {
+        Ok(zone) => Ok(Some(zone)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn text_at(value: &Value, path: &[&str]) -> Option<String> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current.as_str().map(ToString::to_string)
+}
+
+fn json_array_text(value: Option<&Value>) -> Result<Option<String>> {
+    match value {
+        Some(Value::Array(_)) => Ok(Some(serde_json::to_string(value.unwrap())?)),
+        Some(Value::Null) | None => Ok(None),
+        Some(other) => Ok(Some(serde_json::to_string(&vec![other.clone()])?)),
+    }
+}
+
+fn is_sql_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    matches!(chars.next(), Some(first) if first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+fn quote_identifier(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn sql_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn sql_literal_opt(value: Option<&str>) -> String {
+    value.map(sql_literal).unwrap_or_else(|| "null".to_string())
+}
+
+fn normalize_matrix_sql(sql: &str) -> String {
+    let tokens = tokenize_sql(&sql.replace("==", "="));
+    let mut normalized = tokens.clone();
+    let comparable = [
+        "zone",
+        "kind",
+        "status",
+        "type",
+        "component",
+        "repo",
+        "version",
+        "source_repo",
+        "source_repository",
+        "subject_name",
+        "subject_type",
+    ];
+
+    let mut index = 0;
+    while index < tokens.len() {
+        let field = comparable_field_name(&tokens[index]);
+        if comparable.contains(&field.as_str())
+            && token_boundary_before(&tokens, index)
+            && token_boundary_after(&tokens, index)
+            && let Some(op_index) = next_non_ws(&tokens, index + 1)
+            && matches!(tokens[op_index].as_str(), "=" | "!=" | "<>")
+            && let Some(value_index) = next_non_ws(&tokens, op_index + 1)
+            && is_bare_sql_value(&tokens[value_index])
+        {
+            normalized[value_index] = sql_literal(&tokens[value_index]);
+            index = value_index + 1;
+            continue;
+        }
+        index += 1;
+    }
+
+    normalized.join("")
+}
+
+fn comparable_field_name(token: &str) -> String {
+    token
+        .rsplit_once('.')
+        .map(|(_, field)| field)
+        .unwrap_or(token)
+        .to_ascii_lowercase()
+}
+
+fn tokenize_sql(sql: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let chars = sql.chars().collect::<Vec<_>>();
+    let mut index = 0;
+    while index < chars.len() {
+        let current = chars[index];
+        if current.is_whitespace() {
+            let start = index;
+            while index < chars.len() && chars[index].is_whitespace() {
+                index += 1;
+            }
+            tokens.push(chars[start..index].iter().collect());
+        } else if current == '\'' || current == '"' {
+            let quote = current;
+            let start = index;
+            index += 1;
+            while index < chars.len() {
+                if chars[index] == quote {
+                    index += 1;
+                    break;
+                }
+                index += 1;
+            }
+            tokens.push(chars[start..index].iter().collect());
+        } else if is_sql_word_char(current) {
+            let start = index;
+            while index < chars.len() && is_sql_word_char(chars[index]) {
+                index += 1;
+            }
+            tokens.push(chars[start..index].iter().collect());
+        } else if index + 1 < chars.len()
+            && matches!(
+                (current, chars[index + 1]),
+                ('!', '=') | ('<', '>') | ('<', '=') | ('>', '=')
+            )
+        {
+            tokens.push(chars[index..index + 2].iter().collect());
+            index += 2;
+        } else {
+            tokens.push(current.to_string());
+            index += 1;
+        }
+    }
+    tokens
+}
+
+fn is_sql_word_char(character: char) -> bool {
+    character.is_ascii_alphanumeric()
+        || matches!(character, '_' | '-' | '@' | '.' | '/' | ':' | '#')
+}
+
+fn token_boundary_before(tokens: &[String], index: usize) -> bool {
+    index == 0
+        || tokens[index - 1].trim().is_empty()
+        || tokens[index - 1] == "."
+        || matches!(tokens[index - 1].as_str(), "(" | ",")
+}
+
+fn token_boundary_after(tokens: &[String], index: usize) -> bool {
+    tokens
+        .get(index + 1)
+        .map(|token| {
+            token.trim().is_empty() || matches!(token.as_str(), "=" | "!" | "<" | ">" | "!=" | "<>")
+        })
+        .unwrap_or(true)
+}
+
+fn next_non_ws(tokens: &[String], start: usize) -> Option<usize> {
+    (start..tokens.len()).find(|index| !tokens[*index].trim().is_empty())
+}
+
+fn is_bare_sql_value(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    !token.starts_with('\'')
+        && !token.starts_with('"')
+        && token.parse::<f64>().is_err()
+        && !matches!(
+            lower.as_str(),
+            "null"
+                | "true"
+                | "false"
+                | "select"
+                | "from"
+                | "where"
+                | "and"
+                | "or"
+                | "in"
+                | "like"
+                | "is"
+                | "not"
+        )
+}
+
 fn execute_readonly_sql(db: &Connection, sql: &str) -> Result<Value> {
+    let sql = normalize_matrix_sql(sql);
     let normalized = sql.trim().to_ascii_lowercase();
     if !(normalized.starts_with("select ")
         || normalized.starts_with("with ")
@@ -778,7 +1149,7 @@ fn execute_readonly_sql(db: &Connection, sql: &str) -> Result<Value> {
     {
         bail!("matrix query only allows read-only SELECT/WITH/EXPLAIN statements");
     }
-    let mut stmt = db.prepare(sql)?;
+    let mut stmt = db.prepare(&sql)?;
     let columns: Vec<String> = stmt
         .column_names()
         .iter()
@@ -909,7 +1280,8 @@ Matrix shell commands
 
 SQL
   End SQL statements with `;`.
-  Available tables/views: facts, zones, subjects.
+  Available tables/views: facts, active, zone, zones, subjects, components,
+  capabilities, requirements, and one view per SQL-safe zone such as odin.
 "
     );
 }
@@ -970,8 +1342,12 @@ impl MatrixCompleter {
             "/status",
             "blue",
             "by",
+            "capabilities",
+            "capability",
             "channel",
             "compatible",
+            "component",
+            "components",
             "count",
             "csv",
             "facts",
@@ -984,15 +1360,22 @@ impl MatrixCompleter {
             "limit",
             "observed_at",
             "order",
+            "provides",
             "red",
+            "repo",
+            "requirements",
+            "requires",
             "select",
             "source_repository",
+            "source_repo",
             "source_sha",
             "status",
             "subject_name",
             "subject_type",
             "subjects",
             "table",
+            "type",
+            "version",
             "where",
             "with",
             "zone",
@@ -1320,5 +1703,101 @@ mod tests {
             ]),
             "repo=example%2Fproject&level=preview"
         );
+    }
+
+    #[test]
+    fn normalizes_short_matrix_sql() {
+        assert_eq!(
+            normalize_matrix_sql("select * from zone where type==chaincode and status==failed"),
+            "select * from zone where type='chaincode' and status='failed'"
+        );
+        assert_eq!(
+            normalize_matrix_sql("select * from zone where repo==red-wiz/eos and status!=failed"),
+            "select * from zone where repo='red-wiz/eos' and status!='failed'"
+        );
+    }
+
+    #[test]
+    fn creates_contextual_zone_view() {
+        let facts = vec![
+            json!({
+                "id": "putto",
+                "track": "odin",
+                "status": "candidate",
+                "source": {"repo": "red-wiz/putto"},
+                "subject": {"type": "npm", "name": "@red-wiz/oracle-vdr", "version": "0.6.12", "repo": "red-wiz/putto"}
+            }),
+            json!({
+                "id": "did",
+                "track": "odin",
+                "status": "observed",
+                "subject": {"type": "chaincode", "name": "did_vdr_go", "version": "0.4.8", "repo": "red-wiz/hebe"}
+            }),
+            json!({
+                "id": "other",
+                "track": "sdk",
+                "status": "observed",
+                "subject": {"type": "chaincode", "name": "other", "version": "1.0.0", "repo": "example/other"}
+            }),
+        ];
+        let db = build_facts_db(
+            &facts,
+            &MatrixContext {
+                repo: Some("red-wiz/putto".to_string()),
+                ..MatrixContext::default()
+            },
+        )
+        .unwrap();
+        let result = execute_readonly_sql(
+            &db,
+            "select component, version from zone where type==chaincode order by component",
+        )
+        .unwrap();
+        assert_eq!(result["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(result["rows"][0]["component"], "did_vdr_go");
+    }
+
+    #[test]
+    fn supports_nested_capability_queries() {
+        let facts = vec![
+            json!({
+                "id": "athena",
+                "track": "odin",
+                "status": "passed",
+                "subject": {"type": "npm", "name": "@red-wiz/athena", "version": "1.2.3", "repo": "red-wiz/athena"},
+                "provides": [{"capability": "native-askar", "version": "1.2.3"}]
+            }),
+            json!({
+                "id": "eos",
+                "track": "odin",
+                "status": "candidate",
+                "subject": {"type": "service", "name": "eos", "version": "2.0.0", "repo": "red-wiz/eos"},
+                "requires": [{"capability": "native-askar", "version": "1.2.3"}]
+            }),
+        ];
+        let db = build_facts_db(
+            &facts,
+            &MatrixContext {
+                zone: Some("odin".to_string()),
+                ..MatrixContext::default()
+            },
+        )
+        .unwrap();
+        let result = execute_readonly_sql(
+            &db,
+            "select id, component from odin
+             where repo==red-wiz/eos
+               and exists (
+                 select 1 from requirements r
+                 where r.fact_id = odin.id
+                   and r.capability in (
+                     select p.capability from capabilities p
+                     where p.repo==red-wiz/athena and p.status==passed
+                   )
+               )",
+        )
+        .unwrap();
+        assert_eq!(result["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(result["rows"][0]["component"], "eos");
     }
 }
