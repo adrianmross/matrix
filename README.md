@@ -104,6 +104,10 @@ shortcuts:
 - `capabilities`: expanded `provides` capability edges.
 - `context`: the detected repo, zone, tag, ref, and SHA.
 
+`component` is the short component key, so `@red-wiz/eos` can be queried as
+`component==eos`. Use `subject_name` when you need the exact package or module
+name.
+
 Bare values in common filters can be left unquoted, so
 `type==chaincode` is normalized to `type = 'chaincode'`.
 
@@ -146,6 +150,10 @@ terminal supports it.
 
 ```text
 matrix> select id, zone, status from facts limit 10;
+matrix> .context
+matrix> .component eos
+matrix> .versions
+matrix> .use 1
 matrix> .zones
 matrix> .describe facts
 matrix> .mode json
@@ -165,6 +173,17 @@ Useful commands:
 - `.timing`: toggle query timings.
 - `.limit <n>`: change the fact fetch limit and refresh the cache.
 - `.refresh`: reload facts from the construct.
+- `.context`: show the active zone, repo, component, version, tag, ref, and SHA.
+- `.context <field> <value>`: set `zone`, `repo`, `component`, `version`,
+  `tag`, `sha`, or `ref` without leaving the REPL.
+- `.context auto`: reset to the current git repo/tag/ref/SHA.
+- `.context clear [field]`: clear one context field, or all fields.
+- `.zone`, `.repo`, `.component`, `.version`, `.tag`, `.sha`, `.ref`: shortcut
+  setters for context fields.
+- `.components`, `.versions [component]`, `.tags`: list selectable context
+  values.
+- `.use <pick>`: focus the numbered value from the last `.components`,
+  `.versions`, or `.tags` output.
 - `.zones`, `.subjects`, `.trace <subject>`: Matrix-native inspection helpers.
 - `.gate <zone> [level]`: fetch a gate decision from the construct.
 - `.explain <sql>`: run `EXPLAIN QUERY PLAN`.

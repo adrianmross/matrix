@@ -117,6 +117,8 @@ struct ContextArgs {
     #[arg(long)]
     tag: Option<String>,
     #[arg(long)]
+    version: Option<String>,
+    #[arg(long)]
     sha: Option<String>,
     #[arg(long)]
     r#ref: Option<String>,
@@ -172,6 +174,7 @@ struct MatrixContext {
     zone: Option<String>,
     repo: Option<String>,
     component: Option<String>,
+    version: Option<String>,
     tag: Option<String>,
     sha: Option<String>,
     reference: Option<String>,
@@ -396,13 +399,22 @@ async fn current(matrix: &Matrix, args: CandidateArgs) -> Result<Value> {
 
 impl MatrixContext {
     fn detect(args: ContextArgs) -> Self {
+        let repo_was_overridden = args.repo.is_some();
+        let use_git_source_context = !repo_was_overridden;
         Self {
             zone: args.zone.or_else(|| env::var("MATRIX_ZONE").ok()),
             repo: args.repo.or_else(current_repo),
             component: args.component,
-            tag: args.tag.or_else(current_exact_tag),
-            sha: args.sha.or_else(current_sha),
-            reference: args.r#ref.or_else(current_branch),
+            tag: args
+                .tag
+                .or_else(|| use_git_source_context.then(current_exact_tag).flatten()),
+            version: args.version,
+            sha: args
+                .sha
+                .or_else(|| use_git_source_context.then(current_sha).flatten()),
+            reference: args
+                .r#ref
+                .or_else(|| use_git_source_context.then(current_branch).flatten()),
         }
     }
 }
@@ -478,6 +490,8 @@ enum OutputMode {
 struct ReplSession<'a> {
     matrix: &'a Matrix,
     context: MatrixContext,
+    facts: Vec<Value>,
+    choices: Vec<ContextChoice>,
     db: Connection,
     max_facts: usize,
     fact_count: usize,
@@ -496,6 +510,8 @@ impl<'a> ReplSession<'a> {
             matrix,
             db: build_facts_db(&facts, &context)?,
             context,
+            facts,
+            choices: Vec::new(),
             max_facts,
             fact_count,
             output_mode: if matrix.json {
@@ -512,8 +528,14 @@ impl<'a> ReplSession<'a> {
     async fn refresh(&mut self) -> Result<()> {
         let facts = fetch_facts(self.matrix, self.max_facts).await?;
         self.fact_count = facts.len();
-        self.db = build_facts_db(&facts, &self.context)?;
+        self.facts = facts;
+        self.db = build_facts_db(&self.facts, &self.context)?;
         self.last_refresh = SystemTime::now();
+        Ok(())
+    }
+
+    fn rebuild_context(&mut self) -> Result<()> {
+        self.db = build_facts_db(&self.facts, &self.context)?;
         Ok(())
     }
 
@@ -641,9 +663,19 @@ impl<'a> ReplSession<'a> {
         match name {
             "red" | "red-pill" | "exit" | "quit" | "q" => return Ok(true),
             "blue" | "blue-pill" | "clear" => {
-                eprintln!("Session context cleared.");
+                self.context = MatrixContext::detect(ContextArgs::default());
+                self.rebuild_context()?;
+                eprintln!("Session context reset to auto-detected values.");
             }
             "help" | "?" => print_repl_help(),
+            "context" | "ctx" => self.handle_context_command(parts.collect::<Vec<_>>())?,
+            "zone" | "repo" | "component" | "version" | "tag" | "sha" | "ref" => {
+                self.set_context_field(name, &parts.collect::<Vec<_>>().join(" "))?;
+            }
+            "components" => self.list_components()?,
+            "versions" => self.list_versions(parts.collect::<Vec<_>>().join(" "))?,
+            "tags" => self.list_tags()?,
+            "use" => self.use_context_choice(parts.collect::<Vec<_>>())?,
             "status" => self.print_status()?,
             "tables" => self.run_sql(
                 "select name from sqlite_master where type in ('table', 'view') order by name",
@@ -760,14 +792,7 @@ impl<'a> ReplSession<'a> {
         let value = json!({
             "construct": self.matrix.construct,
             "apiPrefix": self.matrix.api_prefix,
-            "context": {
-                "zone": self.context.zone,
-                "repo": self.context.repo,
-                "component": self.context.component,
-                "tag": self.context.tag,
-                "sha": self.context.sha,
-                "ref": self.context.reference,
-            },
+            "context": self.context_json()?,
             "facts": self.fact_count,
             "maxFacts": self.max_facts,
             "mode": format!("{:?}", self.output_mode).to_ascii_lowercase(),
@@ -777,6 +802,214 @@ impl<'a> ReplSession<'a> {
         });
         print_value(&value, self.matrix.json)
     }
+
+    fn context_json(&self) -> Result<Value> {
+        let result = execute_readonly_sql(
+            &self.db,
+            "select zone, repo, component, version, tag, sha, ref from context",
+        )?;
+        Ok(result["rows"]
+            .as_array()
+            .and_then(|rows| rows.first())
+            .cloned()
+            .unwrap_or_else(|| json!({})))
+    }
+
+    fn print_context(&self) -> Result<()> {
+        print_value(&self.context_json()?, self.matrix.json)
+    }
+
+    fn handle_context_command(&mut self, args: Vec<&str>) -> Result<()> {
+        match args.as_slice() {
+            [] | ["show"] => self.print_context(),
+            ["auto"] => {
+                self.context = MatrixContext::detect(ContextArgs::default());
+                self.rebuild_context()?;
+                self.print_context()
+            }
+            ["clear"] | ["clear", "all"] => {
+                self.context = MatrixContext::default();
+                self.rebuild_context()?;
+                self.print_context()
+            }
+            ["clear", field] => {
+                self.clear_context_field(field)?;
+                self.print_context()
+            }
+            [field, rest @ ..] => self.set_context_field(field, &rest.join(" ")),
+        }
+    }
+
+    fn set_context_field(&mut self, field: &str, value: &str) -> Result<()> {
+        let value = value.trim();
+        if value.is_empty() {
+            bail!("usage: .{field} <value>");
+        }
+        match field {
+            "zone" => self.context.zone = Some(value.to_string()),
+            "repo" => {
+                self.context.repo = Some(value.to_string());
+                self.context.tag = None;
+                self.context.sha = None;
+                self.context.reference = None;
+            }
+            "component" => self.context.component = Some(value.to_string()),
+            "version" => self.context.version = Some(value.to_string()),
+            "tag" => self.context.tag = Some(value.to_string()),
+            "sha" => self.context.sha = Some(value.to_string()),
+            "ref" => self.context.reference = Some(value.to_string()),
+            _ => bail!("unknown context field {field:?}"),
+        }
+        self.rebuild_context()?;
+        self.print_context()
+    }
+
+    fn clear_context_field(&mut self, field: &str) -> Result<()> {
+        match field {
+            "zone" => self.context.zone = None,
+            "repo" => self.context.repo = None,
+            "component" => self.context.component = None,
+            "version" => self.context.version = None,
+            "tag" => self.context.tag = None,
+            "sha" => self.context.sha = None,
+            "ref" => self.context.reference = None,
+            _ => bail!("unknown context field {field:?}"),
+        }
+        self.rebuild_context()
+    }
+
+    fn list_components(&mut self) -> Result<()> {
+        let sql = format!(
+            "select row_number() over (order by max(observed_at) desc, component asc) as pick,
+                    component, repo, zone, count(*) as facts, max(observed_at) as last_observed_at
+             from components
+             where component is not null {}
+             group by component, repo, zone
+             order by last_observed_at desc, component asc
+             limit 50",
+            self.context_filter_sql("components", &["repo", "zone"])
+        );
+        self.run_choice_sql("component", "component", &sql)
+    }
+
+    fn list_versions(&mut self, component_override: String) -> Result<()> {
+        let component_filter = if component_override.trim().is_empty() {
+            String::new()
+        } else {
+            let component = sql_literal(&component_key(component_override.trim()));
+            let exact = sql_literal(component_override.trim());
+            format!(" and (component = {component} or component = {exact})")
+        };
+        let sql = format!(
+            "select row_number() over (order by max(observed_at) desc, version desc) as pick,
+                    version, component, repo, zone, status, count(*) as facts, max(observed_at) as last_observed_at
+             from components
+             where version is not null {} {}
+             group by version, component, repo, zone, status
+             order by last_observed_at desc, version desc
+             limit 50",
+            self.context_filter_sql("components", &["repo", "zone", "component"]),
+            component_filter
+        );
+        self.run_choice_sql("version", "version", &sql)
+    }
+
+    fn list_tags(&mut self) -> Result<()> {
+        let sql = format!(
+            "select row_number() over (order by max(observed_at) desc, tag desc) as pick,
+                    tag, component, repo, zone, status, count(*) as facts, max(observed_at) as last_observed_at
+             from facts
+             where tag is not null {} 
+             group by tag, component, repo, zone, status
+             order by last_observed_at desc, tag desc
+             limit 50",
+            self.context_filter_sql("facts", &["repo", "zone", "component"])
+        );
+        self.run_choice_sql("tag", "tag", &sql)
+    }
+
+    fn run_choice_sql(&mut self, field: &'static str, value_column: &str, sql: &str) -> Result<()> {
+        let result = execute_readonly_sql(&self.db, sql)?;
+        self.choices = result["rows"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|row| {
+                row.get(value_column)
+                    .and_then(Value::as_str)
+                    .map(|value| ContextChoice {
+                        field,
+                        value: value.to_string(),
+                    })
+            })
+            .collect();
+        print_query_result(&result, self.output_mode, self.expanded)?;
+        if !self.choices.is_empty() {
+            eprintln!("Use `.use <pick>` to focus one of these {} values.", field);
+        }
+        Ok(())
+    }
+
+    fn use_context_choice(&mut self, args: Vec<&str>) -> Result<()> {
+        match args.as_slice() {
+            [pick] if pick.parse::<usize>().is_ok() => {
+                let index = pick.parse::<usize>()?;
+                let choice = self
+                    .choices
+                    .get(index.saturating_sub(1))
+                    .cloned()
+                    .ok_or_else(|| anyhow!("pick {index} is not available; run `.versions`, `.tags`, or `.components` first"))?;
+                self.set_context_field(choice.field, &choice.value)
+            }
+            [field, rest @ ..] if !rest.is_empty() => {
+                self.set_context_field(field, &rest.join(" "))
+            }
+            _ => bail!("usage: .use <pick> or .use <field> <value>"),
+        }
+    }
+
+    fn context_filter_sql(&self, table: &str, fields: &[&str]) -> String {
+        let mut filters = Vec::new();
+        if fields.contains(&"zone")
+            && let Some(zone) = self.effective_zone().or_else(|| self.context.zone.clone())
+        {
+            filters.push(format!("{table}.zone = {}", sql_literal(&zone)));
+        }
+        if fields.contains(&"repo")
+            && let Some(repo) = self.context.repo.as_deref()
+        {
+            filters.push(format!("{table}.repo = {}", sql_literal(repo)));
+        }
+        if fields.contains(&"component")
+            && let Some(component) = self.context.component.as_deref()
+        {
+            let key = sql_literal(&component_key(component));
+            let exact = sql_literal(component);
+            filters.push(format!(
+                "({table}.component = {key} or {table}.component = {exact})"
+            ));
+        }
+        if filters.is_empty() {
+            String::new()
+        } else {
+            format!(" and {}", filters.join(" and "))
+        }
+    }
+
+    fn effective_zone(&self) -> Option<String> {
+        self.context_json().ok().and_then(|value| {
+            value
+                .get("zone")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ContextChoice {
+    field: &'static str,
+    value: String,
 }
 
 fn build_facts_db(facts: &[Value], context: &MatrixContext) -> Result<Connection> {
@@ -803,6 +1036,7 @@ fn build_facts_db(facts: &[Value], context: &MatrixContext) -> Result<Connection
             text_at(fact, &["subjectType"]).or_else(|| text_at(fact, &["subject", "type"]));
         let subject_name =
             text_at(fact, &["subjectName"]).or_else(|| text_at(fact, &["subject", "name"]));
+        let component = subject_name.as_deref().map(component_key);
         let subject_repo =
             text_at(fact, &["subjectRepo"]).or_else(|| text_at(fact, &["subject", "repo"]));
         let source_repo =
@@ -811,6 +1045,7 @@ fn build_facts_db(facts: &[Value], context: &MatrixContext) -> Result<Connection
             text_at(fact, &["sourceSha"]).or_else(|| text_at(fact, &["source", "sha"]));
         let source_ref =
             text_at(fact, &["sourceRef"]).or_else(|| text_at(fact, &["source", "ref"]));
+        let tag = text_at(fact, &["tag"]).or_else(|| source_ref.clone());
         db.execute(
             "insert into facts values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
             params![
@@ -819,7 +1054,7 @@ fn build_facts_db(facts: &[Value], context: &MatrixContext) -> Result<Connection
                 text_at(fact, &["kind"]),
                 text_at(fact, &["status"]),
                 subject_type.clone(),
-                subject_name.clone(),
+                component,
                 text_at(fact, &["subjectVersion"]).or_else(|| text_at(fact, &["subject", "version"])),
                 subject_repo.clone().or_else(|| source_repo.clone()),
                 source_repo.clone(),
@@ -829,7 +1064,7 @@ fn build_facts_db(facts: &[Value], context: &MatrixContext) -> Result<Connection
                 subject_type,
                 subject_name,
                 text_at(fact, &["channel"]),
-                text_at(fact, &["tag"]),
+                tag,
                 text_at(fact, &["observedAt"]),
                 json_array_text(fact.get("requires"))?,
                 json_array_text(fact.get("provides"))?,
@@ -888,6 +1123,7 @@ fn create_matrix_views(db: &Connection, context: &MatrixContext, zones: &[String
            {} as zone,
            {} as repo,
            {} as component,
+           {} as version,
            {} as tag,
            {} as sha,
            {} as ref;
@@ -896,6 +1132,7 @@ fn create_matrix_views(db: &Connection, context: &MatrixContext, zones: &[String
         sql_literal_opt(active_zone.as_deref()),
         sql_literal_opt(context.repo.as_deref()),
         sql_literal_opt(context.component.as_deref()),
+        sql_literal_opt(context.version.as_deref()),
         sql_literal_opt(context.tag.as_deref()),
         sql_literal_opt(context.sha.as_deref()),
         sql_literal_opt(context.reference.as_deref()),
@@ -935,7 +1172,12 @@ fn active_context_where(context: &MatrixContext) -> String {
         ));
     }
     if let Some(component) = context.component.as_deref() {
-        filters.push(format!("component = {}", sql_literal(component)));
+        let exact = sql_literal(component);
+        let key = sql_literal(&component_key(component));
+        filters.push(format!("(component = {key} or subject_name = {exact})"));
+    }
+    if let Some(version) = context.version.as_deref() {
+        filters.push(format!("version = {}", sql_literal(version)));
     }
     if let Some(sha) = context.sha.as_deref() {
         filters.push(format!("source_sha = {}", sql_literal(sha)));
@@ -973,6 +1215,15 @@ fn text_at(value: &Value, path: &[&str]) -> Option<String> {
         current = current.get(*key)?;
     }
     current.as_str().map(ToString::to_string)
+}
+
+fn component_key(value: &str) -> String {
+    value
+        .rsplit_once('/')
+        .map(|(_, name)| name)
+        .unwrap_or(value)
+        .trim_start_matches('@')
+        .to_string()
 }
 
 fn json_array_text(value: Option<&Value>) -> Result<Option<String>> {
@@ -1270,6 +1521,16 @@ Matrix shell commands
   .timing                   Toggle query timing
   .limit <n>                Set fact fetch limit and refresh cache
   .refresh                  Reload facts from the construct
+  .context                  Show active context
+  .context <field> <value>  Set zone, repo, component, version, tag, sha, or ref
+  .context clear [field]    Clear one context field, or all fields
+  .context auto             Reset to detected git repo, tag, ref, and sha
+  .zone/.repo/.component    Shortcut setters for common context fields
+  .version/.tag/.sha/.ref   Shortcut setters for version and source context
+  .components               List components in the current context
+  .versions [component]     List versions and remember picks for `.use`
+  .tags                     List tags/refs and remember picks for `.use`
+  .use <pick>               Focus a picked component, version, or tag
   .zones                    Summarize facts by zone
   .subjects                 Summarize facts by subject
   .trace <subject>          Show recent facts for a subject
@@ -1333,10 +1594,20 @@ impl MatrixCompleter {
             ".refresh",
             ".schema",
             ".status",
+            ".component",
+            ".components",
+            ".context",
+            ".repo",
             ".subjects",
             ".tables",
+            ".tag",
+            ".tags",
             ".timing",
             ".trace",
+            ".use",
+            ".version",
+            ".versions",
+            ".zone",
             ".zones",
             "/help",
             "/status",
@@ -1348,6 +1619,7 @@ impl MatrixCompleter {
             "compatible",
             "component",
             "components",
+            "context",
             "count",
             "csv",
             "facts",
@@ -1363,6 +1635,7 @@ impl MatrixCompleter {
             "provides",
             "red",
             "repo",
+            "ref",
             "requirements",
             "requires",
             "select",
@@ -1374,8 +1647,12 @@ impl MatrixCompleter {
             "subject_type",
             "subjects",
             "table",
+            "tag",
+            "tags",
             "type",
+            "use",
             "version",
+            "versions",
             "where",
             "with",
             "zone",
@@ -1718,6 +1995,24 @@ mod tests {
     }
 
     #[test]
+    fn derives_short_component_keys() {
+        assert_eq!(component_key("@red-wiz/eos"), "eos");
+        assert_eq!(component_key("did_vdr_go"), "did_vdr_go");
+    }
+
+    #[test]
+    fn repo_override_does_not_inherit_git_source_context() {
+        let context = MatrixContext::detect(ContextArgs {
+            repo: Some("red-wiz/eos".to_string()),
+            ..ContextArgs::default()
+        });
+        assert_eq!(context.repo.as_deref(), Some("red-wiz/eos"));
+        assert!(context.sha.is_none());
+        assert!(context.reference.is_none());
+        assert!(context.tag.is_none());
+    }
+
+    #[test]
     fn creates_contextual_zone_view() {
         let facts = vec![
             json!({
@@ -1755,6 +2050,39 @@ mod tests {
         .unwrap();
         assert_eq!(result["rows"].as_array().unwrap().len(), 1);
         assert_eq!(result["rows"][0]["component"], "did_vdr_go");
+    }
+
+    #[test]
+    fn filters_active_context_by_version_and_component_key() {
+        let facts = vec![
+            json!({
+                "id": "eos-1",
+                "track": "odin",
+                "status": "candidate",
+                "subject": {"type": "npm", "name": "@red-wiz/eos", "version": "0.19.1", "repo": "red-wiz/eos"}
+            }),
+            json!({
+                "id": "eos-2",
+                "track": "odin",
+                "status": "candidate",
+                "subject": {"type": "npm", "name": "@red-wiz/eos", "version": "0.19.2", "repo": "red-wiz/eos"}
+            }),
+        ];
+        let db = build_facts_db(
+            &facts,
+            &MatrixContext {
+                repo: Some("red-wiz/eos".to_string()),
+                component: Some("eos".to_string()),
+                version: Some("0.19.2".to_string()),
+                ..MatrixContext::default()
+            },
+        )
+        .unwrap();
+        let result =
+            execute_readonly_sql(&db, "select id, component, version from active").unwrap();
+        assert_eq!(result["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(result["rows"][0]["id"], "eos-2");
+        assert_eq!(result["rows"][0]["component"], "eos");
     }
 
     #[test]
