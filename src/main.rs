@@ -1,14 +1,22 @@
 use std::{
     env, fs,
-    io::{self, BufRead, Read, Write},
+    io::{self, Read},
     path::PathBuf,
     process::Command as ProcessCommand,
+    time::SystemTime,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
+use comfy_table::{Table, presets::UTF8_FULL};
 use directories::ProjectDirs;
+use nu_ansi_term::{Color, Style};
+use reedline::{
+    ColumnarMenu, Completer, DefaultHinter, DefaultPrompt, DefaultPromptSegment, FileBackedHistory,
+    Highlighter, MenuBuilder, Reedline, ReedlineEvent, ReedlineMenu, Signal, Span, StyledText,
+    Suggestion, default_emacs_keybindings,
+};
 use reqwest::{Method, header::CONTENT_TYPE};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -404,11 +412,319 @@ async fn ingest(matrix: &Matrix, args: IngestArgs) -> Result<Value> {
 }
 
 async fn query(matrix: &Matrix, sql: &str, max_facts: usize) -> Result<Value> {
-    let normalized = sql.trim().to_ascii_lowercase();
-    if !(normalized.starts_with("select ") || normalized.starts_with("with ")) {
-        bail!("matrix query only allows read-only SELECT/WITH statements");
-    }
     let facts = fetch_facts(matrix, max_facts).await?;
+    let db = build_facts_db(&facts)?;
+    execute_readonly_sql(&db, sql)
+}
+
+async fn enter(matrix: &Matrix) -> Result<Value> {
+    let mut repl = ReplSession::new(matrix).await?;
+    repl.run().await?;
+    Ok(json!({"status":"left"}))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputMode {
+    Table,
+    Json,
+    Csv,
+}
+
+struct ReplSession<'a> {
+    matrix: &'a Matrix,
+    db: Connection,
+    max_facts: usize,
+    fact_count: usize,
+    output_mode: OutputMode,
+    expanded: bool,
+    timing: bool,
+    last_refresh: SystemTime,
+}
+
+impl<'a> ReplSession<'a> {
+    async fn new(matrix: &'a Matrix) -> Result<Self> {
+        let max_facts = 1000;
+        let facts = fetch_facts(matrix, max_facts).await?;
+        let fact_count = facts.len();
+        Ok(Self {
+            matrix,
+            db: build_facts_db(&facts)?,
+            max_facts,
+            fact_count,
+            output_mode: if matrix.json {
+                OutputMode::Json
+            } else {
+                OutputMode::Table
+            },
+            expanded: false,
+            timing: false,
+            last_refresh: SystemTime::now(),
+        })
+    }
+
+    async fn refresh(&mut self) -> Result<()> {
+        let facts = fetch_facts(self.matrix, self.max_facts).await?;
+        self.fact_count = facts.len();
+        self.db = build_facts_db(&facts)?;
+        self.last_refresh = SystemTime::now();
+        Ok(())
+    }
+
+    async fn run(&mut self) -> Result<()> {
+        eprintln!(
+            "Matrix shell. Type SQL ending in `;`, `.help` for commands, `red` to exit, `blue` to clear."
+        );
+        eprintln!("Loaded {} facts into the local session.", self.fact_count);
+
+        let history_path = repl_history_path()?;
+        if let Some(parent) = history_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let history = Box::new(FileBackedHistory::with_file(5000, history_path)?);
+        let completion_menu = Box::new(ColumnarMenu::default().with_name("completion_menu"));
+        let mut keybindings = default_emacs_keybindings();
+        keybindings.add_binding(
+            reedline::KeyModifiers::NONE,
+            reedline::KeyCode::Tab,
+            ReedlineEvent::UntilFound(vec![
+                ReedlineEvent::Menu("completion_menu".to_string()),
+                ReedlineEvent::MenuNext,
+            ]),
+        );
+        let edit_mode = Box::new(reedline::Emacs::new(keybindings));
+        let mut line_editor = Reedline::create()
+            .with_history(history)
+            .with_completer(Box::new(MatrixCompleter::new()))
+            .with_highlighter(Box::new(MatrixHighlighter))
+            .with_hinter(Box::new(
+                DefaultHinter::default().with_style(Style::new().italic().fg(Color::LightGray)),
+            ))
+            .with_menu(ReedlineMenu::EngineCompleter(completion_menu))
+            .with_edit_mode(edit_mode);
+
+        let prompt = DefaultPrompt::new(
+            DefaultPromptSegment::Basic("matrix".to_string()),
+            DefaultPromptSegment::Empty,
+        );
+        let continuation_prompt = DefaultPrompt::new(
+            DefaultPromptSegment::Basic("...".to_string()),
+            DefaultPromptSegment::Empty,
+        );
+        let mut buffer = String::new();
+
+        loop {
+            let active_prompt = if buffer.trim().is_empty() {
+                &prompt
+            } else {
+                &continuation_prompt
+            };
+            match line_editor.read_line(active_prompt) {
+                Ok(Signal::Success(line)) => {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+
+                    if buffer.trim().is_empty() && is_repl_command(line) {
+                        if self.handle_command(line).await? {
+                            break;
+                        }
+                        continue;
+                    }
+
+                    if !buffer.is_empty() {
+                        buffer.push('\n');
+                    }
+                    buffer.push_str(line);
+
+                    if is_complete_sql(&buffer) {
+                        let sql = buffer.trim().trim_end_matches(';').trim().to_string();
+                        buffer.clear();
+                        self.run_sql(&sql)?;
+                    }
+                }
+                Ok(Signal::CtrlD) => break,
+                Ok(Signal::CtrlC) => {
+                    if buffer.is_empty() {
+                        eprintln!("Use `red` to exit.");
+                    } else {
+                        buffer.clear();
+                        eprintln!("Cleared query buffer.");
+                    }
+                }
+                Ok(Signal::HostCommand(command)) => {
+                    if self.handle_command(&command).await? {
+                        break;
+                    }
+                }
+                Ok(Signal::ExternalBreak(_)) => break,
+                Ok(_) => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        eprintln!("Wake up.");
+        Ok(())
+    }
+
+    fn run_sql(&self, sql: &str) -> Result<()> {
+        let start = SystemTime::now();
+        let result = execute_readonly_sql(&self.db, sql)?;
+        print_query_result(&result, self.output_mode, self.expanded)?;
+        if self.timing
+            && let Ok(elapsed) = start.elapsed()
+        {
+            eprintln!("Time: {:.3} ms", elapsed.as_secs_f64() * 1000.0);
+        }
+        Ok(())
+    }
+
+    async fn handle_command(&mut self, raw: &str) -> Result<bool> {
+        let command = raw.trim();
+        let command = command
+            .strip_prefix('/')
+            .or_else(|| command.strip_prefix('.'))
+            .unwrap_or(command)
+            .trim();
+        let mut parts = command.split_whitespace();
+        let Some(name) = parts.next() else {
+            return Ok(false);
+        };
+
+        match name {
+            "red" | "red-pill" | "exit" | "quit" | "q" => return Ok(true),
+            "blue" | "blue-pill" | "clear" => {
+                eprintln!("Session context cleared.");
+            }
+            "help" | "?" => print_repl_help(),
+            "status" => self.print_status()?,
+            "tables" => self.run_sql(
+                "select name from sqlite_master where type in ('table', 'view') order by name",
+            )?,
+            "schema" => {
+                let table = parts.next();
+                if let Some(table) = table {
+                    self.run_sql(&format!(
+                        "select sql from sqlite_master where name = '{}'",
+                        table.replace('\'', "''")
+                    ))?;
+                } else {
+                    self.run_sql("select name, type, sql from sqlite_master where sql is not null order by type, name")?;
+                }
+            }
+            "describe" | "desc" | "d" => {
+                let table = parts.next().unwrap_or("facts");
+                self.run_sql(&format!(
+                    "select * from pragma_table_info('{}')",
+                    table.replace('\'', "''")
+                ))?;
+            }
+            "mode" => match parts.next() {
+                Some("table") | Some("aligned") => {
+                    self.output_mode = OutputMode::Table;
+                    eprintln!("Output mode: table");
+                }
+                Some("json") => {
+                    self.output_mode = OutputMode::Json;
+                    eprintln!("Output mode: json");
+                }
+                Some("csv") => {
+                    self.output_mode = OutputMode::Csv;
+                    eprintln!("Output mode: csv");
+                }
+                Some(other) => eprintln!("Unknown mode {other:?}; expected table, json, or csv."),
+                None => eprintln!("Output mode: {:?}", self.output_mode),
+            },
+            "x" | "expanded" => {
+                self.expanded = !self.expanded;
+                eprintln!(
+                    "Expanded output: {}",
+                    if self.expanded { "on" } else { "off" }
+                );
+            }
+            "timing" => {
+                self.timing = !self.timing;
+                eprintln!("Timing: {}", if self.timing { "on" } else { "off" });
+            }
+            "limit" => match parts.next().and_then(|value| value.parse::<usize>().ok()) {
+                Some(limit) if limit > 0 => {
+                    self.max_facts = limit;
+                    self.refresh().await?;
+                    eprintln!(
+                        "Fact limit: {}; loaded {} facts.",
+                        self.max_facts, self.fact_count
+                    );
+                }
+                _ => eprintln!("Usage: .limit 2000"),
+            },
+            "refresh" => {
+                self.refresh().await?;
+                eprintln!("Refreshed {} facts.", self.fact_count);
+            }
+            "zones" => self.run_sql("select * from zones order by zone")?,
+            "subjects" => self.run_sql("select * from subjects order by subject_name")?,
+            "trace" => {
+                let subject = parts.collect::<Vec<_>>().join(" ");
+                if subject.is_empty() {
+                    eprintln!("Usage: .trace <subject-name>");
+                } else {
+                    self.run_sql(&format!(
+                        "select id, zone, kind, status, subject_name, observed_at from facts where subject_name = '{}' order by observed_at desc",
+                        subject.replace('\'', "''")
+                    ))?;
+                }
+            }
+            "gate" => {
+                let zone = parts.next();
+                let level = parts.next().unwrap_or("preview");
+                if let Some(zone) = zone {
+                    let value = self
+                        .matrix
+                        .get_fallback(
+                            &format!("/zones/{}/gates/{}", enc(zone), enc(level)),
+                            &format!("/tracks/{}/promotion-gates/{}", enc(zone), enc(level)),
+                        )
+                        .await?;
+                    print_value(&value, self.matrix.json)?;
+                } else {
+                    eprintln!("Usage: .gate <zone> [level]");
+                }
+            }
+            "explain" => {
+                let sql = parts.collect::<Vec<_>>().join(" ");
+                if sql.is_empty() {
+                    eprintln!("Usage: .explain select ...");
+                } else {
+                    self.run_sql(&format!("explain query plan {sql}"))?;
+                }
+            }
+            other => eprintln!("Unknown command {other:?}. Try `.help`."),
+        }
+
+        Ok(false)
+    }
+
+    fn print_status(&self) -> Result<()> {
+        let refreshed = self
+            .last_refresh
+            .elapsed()
+            .map(|elapsed| format!("{}s ago", elapsed.as_secs()))
+            .unwrap_or_else(|_| "unknown".to_string());
+        let value = json!({
+            "construct": self.matrix.construct,
+            "apiPrefix": self.matrix.api_prefix,
+            "facts": self.fact_count,
+            "maxFacts": self.max_facts,
+            "mode": format!("{:?}", self.output_mode).to_ascii_lowercase(),
+            "expanded": self.expanded,
+            "timing": self.timing,
+            "refreshed": refreshed,
+        });
+        print_value(&value, self.matrix.json)
+    }
+}
+
+fn build_facts_db(facts: &[Value]) -> Result<Connection> {
     let db = Connection::open_in_memory()?;
     db.execute_batch(
         "create table facts (
@@ -416,7 +732,20 @@ async fn query(matrix: &Matrix, sql: &str, max_facts: usize) -> Result<Value> {
           source_repository text, source_sha text,
           subject_type text, subject_name text, channel text,
           observed_at text, json text not null
-        );",
+        );
+        create view zones as
+          select zone, count(*) as facts,
+                 sum(case when status = 'compatible' then 1 else 0 end) as compatible,
+                 sum(case when status = 'incompatible' then 1 else 0 end) as incompatible
+          from facts
+          where zone is not null
+          group by zone;
+        create view subjects as
+          select subject_type, subject_name, count(*) as facts,
+                 max(observed_at) as last_observed_at
+          from facts
+          where subject_name is not null
+          group by subject_type, subject_name;",
     )?;
     for fact in facts {
         db.execute(
@@ -434,9 +763,20 @@ async fn query(matrix: &Matrix, sql: &str, max_facts: usize) -> Result<Value> {
                 fact.get("subjectName").and_then(Value::as_str),
                 fact.get("channel").and_then(Value::as_str),
                 fact.get("observedAt").and_then(Value::as_str),
-                serde_json::to_string(&fact)?,
+                serde_json::to_string(fact)?,
             ],
         )?;
+    }
+    Ok(db)
+}
+
+fn execute_readonly_sql(db: &Connection, sql: &str) -> Result<Value> {
+    let normalized = sql.trim().to_ascii_lowercase();
+    if !(normalized.starts_with("select ")
+        || normalized.starts_with("with ")
+        || normalized.starts_with("explain query plan "))
+    {
+        bail!("matrix query only allows read-only SELECT/WITH/EXPLAIN statements");
     }
     let mut stmt = db.prepare(sql)?;
     let columns: Vec<String> = stmt
@@ -456,41 +796,321 @@ async fn query(matrix: &Matrix, sql: &str, max_facts: usize) -> Result<Value> {
     Ok(json!({ "columns": columns, "rows": rows }))
 }
 
-async fn enter(matrix: &Matrix) -> Result<Value> {
-    eprintln!("Matrix shell. Type SQL, `red` to exit, `blue` to clear, `help` for commands.");
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
-    loop {
-        write!(stdout, "matrix> ")?;
-        stdout.flush()?;
-        let mut line = String::new();
-        if stdin.lock().read_line(&mut line)? == 0 {
-            break;
-        }
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        match line {
-            "red" | "red-pill" | "exit" | "quit" => {
-                eprintln!("Wake up.");
-                break;
-            }
-            "blue" | "blue-pill" | "clear" => {
-                eprintln!("Session context cleared.");
-                continue;
-            }
-            "help" => {
-                eprintln!("SQL: select ... from facts; commands: red, blue, help");
-                continue;
-            }
-            _ => match query(matrix, line, 1000).await {
-                Ok(value) => println!("{}", serde_json::to_string_pretty(&value)?),
-                Err(error) => eprintln!("{error:#}"),
-            },
-        }
+fn print_query_result(value: &Value, mode: OutputMode, expanded: bool) -> Result<()> {
+    match mode {
+        OutputMode::Json => println!("{}", serde_json::to_string_pretty(value)?),
+        OutputMode::Csv => print_csv_result(value)?,
+        OutputMode::Table => print_table_result(value, expanded)?,
     }
-    Ok(json!({"status":"left"}))
+    Ok(())
+}
+
+fn print_table_result(value: &Value, expanded: bool) -> Result<()> {
+    let columns = value["columns"].as_array().cloned().unwrap_or_default();
+    let rows = value["rows"].as_array().cloned().unwrap_or_default();
+    let column_names = columns
+        .iter()
+        .filter_map(Value::as_str)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+
+    if expanded {
+        for (index, row) in rows.iter().enumerate() {
+            println!("-[ RECORD {} ]-------------------------", index + 1);
+            for column in &column_names {
+                println!(
+                    "{column:<20} {}",
+                    display_cell(row.get(column).unwrap_or(&Value::Null))
+                );
+            }
+        }
+        println!("({} rows)", rows.len());
+        return Ok(());
+    }
+
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL);
+    table.set_header(column_names.clone());
+    for row in &rows {
+        table.add_row(
+            column_names
+                .iter()
+                .map(|column| display_cell(row.get(column).unwrap_or(&Value::Null)))
+                .collect::<Vec<_>>(),
+        );
+    }
+    println!("{table}");
+    println!("({} rows)", rows.len());
+    Ok(())
+}
+
+fn print_csv_result(value: &Value) -> Result<()> {
+    let columns = value["columns"].as_array().cloned().unwrap_or_default();
+    let rows = value["rows"].as_array().cloned().unwrap_or_default();
+    let column_names = columns.iter().filter_map(Value::as_str).collect::<Vec<_>>();
+    println!(
+        "{}",
+        column_names
+            .iter()
+            .map(|column| csv_escape(column))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    for row in rows {
+        println!(
+            "{}",
+            column_names
+                .iter()
+                .map(|column| csv_escape(&display_cell(row.get(*column).unwrap_or(&Value::Null))))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
+    Ok(())
+}
+
+fn display_cell(value: &Value) -> String {
+    match value {
+        Value::Null => "".to_string(),
+        Value::String(value) => value.clone(),
+        _ => value.to_string(),
+    }
+}
+
+fn csv_escape(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\n') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+fn print_repl_help() {
+    eprintln!(
+        "\
+Matrix shell commands
+  .help, /help              Show this help
+  .status, /status          Show session, construct, cache, and output state
+  .tables                   List local tables and views
+  .schema [table]           Show local SQL schema
+  .describe [table]         Show columns for a table or view
+  .mode table|json|csv      Change output format
+  .x                        Toggle expanded table output
+  .timing                   Toggle query timing
+  .limit <n>                Set fact fetch limit and refresh cache
+  .refresh                  Reload facts from the construct
+  .zones                    Summarize facts by zone
+  .subjects                 Summarize facts by subject
+  .trace <subject>          Show recent facts for a subject
+  .gate <zone> [level]      Fetch a gate decision from the construct
+  .explain <sql>            Run EXPLAIN QUERY PLAN
+  red, red-pill, .exit      Exit
+  blue, blue-pill           Clear the current session context
+
+SQL
+  End SQL statements with `;`.
+  Available tables/views: facts, zones, subjects.
+"
+    );
+}
+
+fn is_repl_command(line: &str) -> bool {
+    line.starts_with('.')
+        || line.starts_with('/')
+        || matches!(
+            line,
+            "red" | "red-pill" | "blue" | "blue-pill" | "exit" | "quit" | "help"
+        )
+}
+
+fn is_complete_sql(sql: &str) -> bool {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut previous = '\0';
+    for current in sql.chars() {
+        match current {
+            '\'' if !in_double && previous != '\\' => in_single = !in_single,
+            '"' if !in_single && previous != '\\' => in_double = !in_double,
+            ';' if !in_single && !in_double => return true,
+            _ => {}
+        }
+        previous = current;
+    }
+    false
+}
+
+fn repl_history_path() -> Result<PathBuf> {
+    let dirs = ProjectDirs::from("dev", "matrix", "matrix")
+        .ok_or_else(|| anyhow!("could not determine config directory"))?;
+    Ok(dirs.data_dir().join("repl-history.txt"))
+}
+
+struct MatrixCompleter {
+    words: Vec<String>,
+}
+
+impl MatrixCompleter {
+    fn new() -> Self {
+        let words = [
+            ".describe",
+            ".explain",
+            ".gate",
+            ".help",
+            ".limit",
+            ".mode",
+            ".refresh",
+            ".schema",
+            ".status",
+            ".subjects",
+            ".tables",
+            ".timing",
+            ".trace",
+            ".zones",
+            "/help",
+            "/status",
+            "blue",
+            "by",
+            "channel",
+            "compatible",
+            "count",
+            "csv",
+            "facts",
+            "from",
+            "group",
+            "id",
+            "incompatible",
+            "json",
+            "kind",
+            "limit",
+            "observed_at",
+            "order",
+            "red",
+            "select",
+            "source_repository",
+            "source_sha",
+            "status",
+            "subject_name",
+            "subject_type",
+            "subjects",
+            "table",
+            "where",
+            "with",
+            "zone",
+            "zones",
+        ]
+        .into_iter()
+        .map(ToString::to_string)
+        .collect();
+        Self { words }
+    }
+}
+
+impl Completer for MatrixCompleter {
+    fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
+        let safe_pos = pos.min(line.len());
+        let start = line[..safe_pos]
+            .rfind(|character: char| {
+                character.is_whitespace() || matches!(character, ',' | '(' | ')')
+            })
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let prefix = &line[start..safe_pos].to_ascii_lowercase();
+        self.words
+            .iter()
+            .filter(|word| word.starts_with(prefix))
+            .map(|word| Suggestion {
+                value: word.clone(),
+                span: Span::new(start, safe_pos),
+                append_whitespace: !word.starts_with('.')
+                    && !word.starts_with('/')
+                    && !matches!(word.as_str(), "facts" | "zones" | "subjects"),
+                ..Suggestion::default()
+            })
+            .collect()
+    }
+}
+
+struct MatrixHighlighter;
+
+impl Highlighter for MatrixHighlighter {
+    fn highlight(&self, line: &str, _cursor: usize) -> StyledText {
+        let mut text = StyledText::new();
+        let mut start = 0;
+        for (index, token) in line
+            .split_inclusive(|character: char| {
+                character.is_whitespace() || matches!(character, ',' | '(' | ')' | ';')
+            })
+            .enumerate()
+        {
+            let style = token_style(token.trim_matches(|character: char| {
+                character.is_whitespace() || matches!(character, ',' | '(' | ')' | ';')
+            }));
+            let _ = index;
+            text.push((style, line[start..start + token.len()].to_string()));
+            start += token.len();
+        }
+        if start < line.len() {
+            let token = &line[start..];
+            text.push((token_style(token), token.to_string()));
+        }
+        text
+    }
+
+    fn is_inside_string_literal(&self, line: &str, cursor: usize) -> bool {
+        let mut in_single = false;
+        for current in line[..cursor.min(line.len())].chars() {
+            if current == '\'' {
+                in_single = !in_single;
+            }
+        }
+        in_single
+    }
+}
+
+fn token_style(token: &str) -> Style {
+    let lower = token.to_ascii_lowercase();
+    if token.starts_with('.') || token.starts_with('/') {
+        Style::new().fg(Color::Cyan).bold()
+    } else if token.starts_with('\'') || token.starts_with('"') {
+        Style::new().fg(Color::Green)
+    } else if matches!(
+        lower.as_str(),
+        "select"
+            | "with"
+            | "from"
+            | "where"
+            | "group"
+            | "by"
+            | "order"
+            | "limit"
+            | "join"
+            | "left"
+            | "right"
+            | "inner"
+            | "outer"
+            | "on"
+            | "as"
+            | "and"
+            | "or"
+            | "not"
+            | "null"
+            | "is"
+            | "like"
+            | "in"
+            | "case"
+            | "when"
+            | "then"
+            | "else"
+            | "end"
+            | "explain"
+            | "pragma"
+    ) {
+        Style::new().fg(Color::Purple).bold()
+    } else if matches!(lower.as_str(), "facts" | "zones" | "subjects") {
+        Style::new().fg(Color::Yellow)
+    } else {
+        Style::default()
+    }
 }
 
 async fn doctor(matrix: &Matrix) -> Result<Value> {

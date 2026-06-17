@@ -1,0 +1,20 @@
+[package]
+name = "matrix-construct"
+version = "0.1.0"
+edition = "2024"
+description = "A generic compatibility matrix construct service."
+license = "Apache-2.0"
+repository = "https://github.com/adrianmross/matrix"
+
+[dependencies]
+anyhow = "1.0.98"
+axum = "0.8.7"
+base64 = "0.22.1"
+chrono = { version = "0.4.42", default-features = false, features = ["clock", "serde"] }
+rusqlite = { version = "0.36.0", features = ["bundled"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+sha2 = "0.10.9"
+tokio = { version = "1.45.1", features = ["macros", "rt-multi-thread", "net"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt", "json"] }
