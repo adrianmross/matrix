@@ -6,7 +6,8 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap_complete::{Shell, generate};
 use directories::ProjectDirs;
 use reqwest::{Method, header::CONTENT_TYPE};
 use rusqlite::{Connection, params};
@@ -16,8 +17,8 @@ use serde_json::{Value, json};
 #[derive(Parser)]
 #[command(name = "matrix", version, about = "Compatibility matrix CLI")]
 struct Cli {
-    #[arg(long, env = "MATRIX_ORACLE_URL", global = true)]
-    oracle: Option<String>,
+    #[arg(long, alias = "oracle", env = "MATRIX_CONSTRUCT_URL", global = true)]
+    construct: Option<String>,
     #[arg(long, env = "MATRIX_API_PREFIX", global = true)]
     api_prefix: Option<String>,
     #[arg(long, global = true)]
@@ -28,6 +29,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    Completion {
+        shell: Shell,
+    },
     Config(ConfigCommand),
     List,
     View {
@@ -118,7 +122,8 @@ struct IngestArgs {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct Config {
-    oracle: Option<String>,
+    #[serde(default, alias = "oracle", skip_serializing_if = "Option::is_none")]
+    construct: Option<String>,
     api_prefix: Option<String>,
     token: Option<String>,
 }
@@ -127,7 +132,7 @@ struct Config {
 struct Matrix {
     config_path: PathBuf,
     config: Config,
-    oracle: Option<String>,
+    construct: Option<String>,
     api_prefix: String,
     json: bool,
     client: reqwest::Client,
@@ -143,8 +148,14 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
-    let mut matrix = Matrix::load(cli.oracle, cli.api_prefix, cli.json)?;
+    if let Commands::Completion { shell } = cli.command {
+        let mut command = Cli::command();
+        generate(shell, &mut command, "matrix", &mut io::stdout());
+        return Ok(());
+    }
+    let mut matrix = Matrix::load(cli.construct, cli.api_prefix, cli.json)?;
     let output = match cli.command {
+        Commands::Completion { .. } => unreachable!("completion exits before matrix is loaded"),
         Commands::Config(command) => config_command(&mut matrix, command).await?,
         Commands::List => matrix.get("").await?,
         Commands::View { zone } => {
@@ -179,7 +190,7 @@ async fn run() -> Result<()> {
 
 impl Matrix {
     fn load(
-        oracle_override: Option<String>,
+        construct_override: Option<String>,
         prefix_override: Option<String>,
         json: bool,
     ) -> Result<Self> {
@@ -190,9 +201,10 @@ impl Matrix {
         } else {
             Config::default()
         };
-        let oracle = oracle_override
+        let construct = construct_override
+            .or_else(|| env::var("MATRIX_CONSTRUCT_URL").ok())
             .or_else(|| env::var("MATRIX_ORACLE_URL").ok())
-            .or_else(|| config.oracle.clone())
+            .or_else(|| config.construct.clone())
             .map(|value| value.trim_end_matches('/').to_string());
         let api_prefix = prefix_override
             .or_else(|| env::var("MATRIX_API_PREFIX").ok())
@@ -203,7 +215,7 @@ impl Matrix {
         Ok(Self {
             config_path,
             config,
-            oracle,
+            construct,
             api_prefix,
             json,
             client: reqwest::Client::builder()
@@ -220,10 +232,10 @@ impl Matrix {
         Ok(())
     }
 
-    fn oracle(&self) -> Result<&str> {
-        self.oracle
+    fn construct(&self) -> Result<&str> {
+        self.construct
             .as_deref()
-            .ok_or_else(|| anyhow!("no oracle configured; run `matrix config set oracle <url>` or set MATRIX_ORACLE_URL"))
+            .ok_or_else(|| anyhow!("no construct configured; run `matrix config set construct <url>` or set MATRIX_CONSTRUCT_URL"))
     }
 
     async fn get(&self, path: &str) -> Result<Value> {
@@ -241,7 +253,7 @@ impl Matrix {
     }
 
     async fn request(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {
-        let url = format!("{}{}{}", self.oracle()?, self.api_prefix, path);
+        let url = format!("{}{}{}", self.construct()?, self.api_prefix, path);
         let mut request = self.client.request(method, &url);
         if let Some(token) = env::var("MATRIX_TOKEN")
             .ok()
@@ -265,11 +277,13 @@ impl Matrix {
             .to_string();
         let text = response.text().await?;
         if status.is_success() && looks_like_html(&content_type, &text) {
-            bail!("received HTML from the oracle; authenticate or use a machine/API oracle URL");
+            bail!(
+                "received HTML from the construct; authenticate or use a machine/API construct URL"
+            );
         }
         let value = parse_response_text(&text);
         if !status.is_success() {
-            bail!("oracle {status}: {}", error_detail(&value, &text));
+            bail!("construct {status}: {}", error_detail(&value, &text));
         }
         Ok(value)
     }
@@ -279,22 +293,22 @@ async fn config_command(matrix: &mut Matrix, command: ConfigCommand) -> Result<V
     match command.command {
         ConfigSubcommand::List => Ok(json!({
             "configPath": matrix.config_path,
-            "oracle": matrix.config.oracle,
+            "construct": matrix.config.construct,
             "apiPrefix": matrix.config.api_prefix,
             "hasToken": matrix.config.token.is_some(),
         })),
         ConfigSubcommand::Get { key } => match key.as_str() {
-            "oracle" => Ok(json!({"oracle": matrix.config.oracle})),
+            "construct" | "oracle" => Ok(json!({"construct": matrix.config.construct})),
             "api-prefix" | "apiPrefix" => Ok(json!({"apiPrefix": matrix.config.api_prefix})),
             "token" => Ok(json!({"hasToken": matrix.config.token.is_some()})),
-            _ => bail!("unknown config key {key:?}; expected oracle, api-prefix, or token"),
+            _ => bail!("unknown config key {key:?}; expected construct, api-prefix, or token"),
         },
         ConfigSubcommand::Set { key, value } => {
             match key.as_str() {
-                "oracle" => matrix.config.oracle = Some(value),
+                "construct" | "oracle" => matrix.config.construct = Some(value),
                 "api-prefix" | "apiPrefix" => matrix.config.api_prefix = Some(value),
                 "token" => matrix.config.token = Some(value),
-                _ => bail!("unknown config key {key:?}; expected oracle, api-prefix, or token"),
+                _ => bail!("unknown config key {key:?}; expected construct, api-prefix, or token"),
             }
             matrix.save()?;
             Ok(json!({"saved": matrix.config_path}))
@@ -481,15 +495,15 @@ async fn enter(matrix: &Matrix) -> Result<Value> {
 }
 
 async fn doctor(matrix: &Matrix) -> Result<Value> {
-    let oracle = matrix.oracle.clone();
-    let reachable = if oracle.is_some() {
+    let construct = matrix.construct.clone();
+    let reachable = if construct.is_some() {
         matrix.get("").await.map(|_| true).unwrap_or(false)
     } else {
         false
     };
     Ok(json!({
         "configPath": matrix.config_path,
-        "oracle": oracle,
+        "construct": construct,
         "apiPrefix": matrix.api_prefix,
         "reachable": reachable,
     }))

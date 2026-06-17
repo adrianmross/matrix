@@ -9,7 +9,7 @@ CI workflows, and custom validators.
 
 ## Concepts
 
-- **oracle**: the configured Matrix API/server.
+- **construct**: the configured Matrix API/server and compatibility graph.
 - **zone**: a compatibility domain or train.
 - **level**: a promotion lane such as dev, preview, stage, or production.
 - **fact**: a normalized compatibility assertion.
@@ -20,7 +20,7 @@ CI workflows, and custom validators.
 ## Quickstart
 
 ```bash
-matrix config set oracle https://matrix.example.dev
+matrix config set construct https://matrix.example.dev
 matrix list
 matrix view sdk-runtime
 matrix current --zone sdk-runtime --level preview
@@ -28,6 +28,7 @@ matrix gate --zone sdk-runtime --level stage
 matrix trace --zone sdk-runtime --subject my-package
 matrix upload facts.json
 matrix query 'select id, zone, status, subject_name from facts limit 20'
+matrix completion zsh
 ```
 
 ## Producers
@@ -42,16 +43,16 @@ matrix ingest sbom --file bom.cdx.json
 ```
 
 Add `--upload` to submit the normalized adapter payload to the configured
-oracle.
+construct.
 
 ## Codex Plugin
 
 This repository can also be installed as a Codex plugin. The plugin does not
 bundle a server or credentials; it teaches Codex how to use the local `matrix`
-binary against the oracle you configure.
+binary against the construct you configure.
 
 ```bash
-matrix config set oracle https://matrix.example.dev
+matrix config set construct https://matrix.example.dev
 matrix doctor
 ```
 
@@ -79,15 +80,18 @@ matrix> red
 
 ```bash
 matrix config list
-matrix config set oracle https://matrix.example.dev
+matrix config set construct https://matrix.example.dev
 matrix config set api-prefix /v1/matrix
 ```
 
 Environment overrides:
 
+- `MATRIX_CONSTRUCT_URL`
 - `MATRIX_ORACLE_URL`
 - `MATRIX_API_PREFIX`
 - `MATRIX_TOKEN`
+
+`oracle` and `MATRIX_ORACLE_URL` are kept as compatibility aliases.
 
 ## Design Notes
 

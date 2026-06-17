@@ -1,6 +1,6 @@
 ---
 name: matrix
-description: Use the Matrix CLI to inspect compatibility zones, query facts, evaluate gates, trace evidence, publish producer results, or work with a configured Matrix oracle.
+description: Use the Matrix CLI to inspect compatibility zones, query facts, evaluate gates, trace evidence, publish producer results, or work with a configured Matrix construct.
 ---
 
 # Matrix
@@ -15,15 +15,16 @@ zones, promotion levels, gates, facts, traces, producer evidence, or the
 - Use `matrix --help` and command-specific `--help` output to confirm current
   flags before building unfamiliar commands.
 - Use `--json` when you need to parse command output or summarize exact fields.
-- Do not invent an oracle URL. Use `MATRIX_ORACLE_URL`, `matrix config get
-  oracle`, or a user-provided `--oracle` value.
+- Do not invent a construct URL. Use `MATRIX_CONSTRUCT_URL`, `matrix config get
+  construct`, or a user-provided `--construct` value.
 - Do not print, persist, or echo tokens. Matrix uses `MATRIX_TOKEN` or a saved
   config token for bearer authentication.
 
 ## Common Workflows
 
 - Show configured state: `matrix config list`
-- Check oracle health: `matrix doctor`
+- Install shell completions: `matrix completion <shell>`
+- Check construct health: `matrix doctor`
 - List zones: `matrix list`
 - View a zone: `matrix view <zone>`
 - Check current repo compatibility:
@@ -46,7 +47,7 @@ zones, promotion levels, gates, facts, traces, producer evidence, or the
 
 ## SQL Guidance
 
-`matrix query` builds a local read-only SQLite view over fetched oracle facts.
+`matrix query` builds a local read-only SQLite view over fetched construct facts.
 Only `SELECT` and `WITH` statements are allowed. The `facts` table includes:
 
 - `id`
