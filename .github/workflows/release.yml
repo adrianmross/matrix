@@ -1,0 +1,93 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - run: cargo test --workspace
+      - run: cargo build --release --workspace
+      - name: Package binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          archive="matrix-${version}-${{ matrix.target }}"
+          package_dir="dist/${archive}"
+          mkdir -p "${package_dir}"
+          cp target/release/matrix "${package_dir}/matrix"
+          cp target/release/matrix-construct "${package_dir}/matrix-construct"
+          cp README.md LICENSE "${package_dir}/"
+          chmod +x "${package_dir}/matrix" "${package_dir}/matrix-construct"
+          tar -C dist -czf "dist/${archive}.tar.gz" "${archive}"
+          shasum -a 256 "dist/${archive}.tar.gz" > "dist/${archive}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Create release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "Matrix ${GITHUB_REF_NAME}"
+            echo
+            echo "Artifacts include:"
+            echo
+            echo "- matrix CLI"
+            echo "- matrix-construct service"
+            echo "- SHA-256 checksums"
+          } > RELEASE_NOTES.md
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" artifacts/* --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" artifacts/* \
+              --verify-tag \
+              --title "Matrix ${GITHUB_REF_NAME}" \
+              --notes-file RELEASE_NOTES.md
+          fi

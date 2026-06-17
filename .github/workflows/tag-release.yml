@@ -1,0 +1,62 @@
+name: Tag Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to tag, without the leading v"
+        required: true
+        type: string
+      dry_run:
+        description: "Validate without pushing a tag"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Validate version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ inputs.version }}"
+          case "${version}" in
+            v*) echo "Use version without leading v, for example 0.3.1"; exit 1 ;;
+          esac
+          root_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          construct_version="$(sed -n 's/^version = "\(.*\)"/\1/p' crates/matrix-construct/Cargo.toml | head -n 1)"
+          if [[ "${root_version}" != "${version}" ]]; then
+            echo "Cargo.toml version ${root_version} does not match requested ${version}"
+            exit 1
+          fi
+          if [[ "${construct_version}" != "${version}" ]]; then
+            echo "matrix-construct version ${construct_version} does not match requested ${version}"
+            exit 1
+          fi
+          if git rev-parse "v${version}" >/dev/null 2>&1; then
+            echo "Tag v${version} already exists"
+            exit 1
+          fi
+      - run: cargo fmt --all --check
+      - run: cargo test --workspace
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Create and push tag
+        if: ${{ !inputs.dry_run }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ inputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "v${version}" -m "Release v${version}"
+          git push origin "v${version}"

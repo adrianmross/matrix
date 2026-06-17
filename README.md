@@ -33,6 +33,7 @@ CLI, while operators can deploy the construct service independently.
 ## Quickstart
 
 ```bash
+matrix --version
 matrix config set construct https://matrix.example.dev
 matrix list
 matrix view sdk-runtime
@@ -203,6 +204,27 @@ Environment overrides:
 - `MATRIX_CONSTRUCT_URL`
 - `MATRIX_API_PREFIX`
 - `MATRIX_TOKEN`
+
+## Releases
+
+`matrix --version` prints the installed CLI version. `matrix-construct
+--version` prints the service binary version.
+
+Tags drive releases:
+
+```bash
+git tag -a v0.3.1 -m "Release v0.3.1"
+git push origin v0.3.1
+```
+
+The `Release` workflow builds `matrix` and `matrix-construct` for Linux x64,
+macOS Intel, and macOS Apple Silicon, publishes tarballs, and uploads SHA-256
+checksums to the GitHub Release.
+
+The `Tag Release` workflow is the preferred path for normal releases. Run it
+with `version=0.3.1` after bumping both Cargo package versions. It validates
+formatting, tests, clippy, version alignment, and tag uniqueness before pushing
+the annotated tag.
 
 ## Design Notes
 

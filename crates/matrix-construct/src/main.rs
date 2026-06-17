@@ -68,6 +68,14 @@ struct PageInfo {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if env::args()
+        .nth(1)
+        .is_some_and(|arg| matches!(arg.as_str(), "--version" | "-V"))
+    {
+        println!("matrix-construct {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .json()
