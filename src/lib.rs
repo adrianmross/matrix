@@ -240,6 +240,8 @@ struct Config {
     api_prefix: Option<String>,
     token: Option<String>,
     sql_init: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    sql_packs: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -449,15 +451,31 @@ impl Matrix {
     }
 
     fn sql_init(&self) -> Result<Option<String>> {
-        let Some(path) = env::var("MATRIX_SQL_INIT")
+        let mut paths = Vec::new();
+        if let Some(path) = env::var("MATRIX_SQL_INIT")
             .ok()
             .or_else(|| self.config.sql_init.clone())
-        else {
+        {
+            paths.push(path);
+        }
+        if let Ok(pack_paths) = env::var("MATRIX_SQL_PACKS") {
+            paths.extend(parse_sql_pack_list(&pack_paths));
+        } else {
+            paths.extend(self.config.sql_packs.clone());
+        }
+        if paths.is_empty() {
             return Ok(None);
-        };
-        Ok(Some(fs::read_to_string(&path).with_context(|| {
-            format!("failed to read Matrix SQL init file {path}")
-        })?))
+        }
+
+        let mut sql = String::new();
+        for path in paths {
+            let pack = fs::read_to_string(&path)
+                .with_context(|| format!("failed to read Matrix SQL pack {path}"))?;
+            sql.push_str(&format!("\n-- Matrix SQL pack: {path}\n"));
+            sql.push_str(&pack);
+            sql.push('\n');
+        }
+        Ok(Some(sql))
     }
 
     async fn get(&self, path: &str) -> Result<Value> {
@@ -519,14 +537,18 @@ async fn config_command(matrix: &mut Matrix, command: ConfigCommand) -> Result<V
             "apiPrefix": matrix.config.api_prefix,
             "hasToken": matrix.config.token.is_some(),
             "sqlInit": matrix.config.sql_init,
+            "sqlPacks": matrix.config.sql_packs,
         })),
         ConfigSubcommand::Get { key } => match key.as_str() {
             "construct" => Ok(json!({"construct": matrix.config.construct})),
             "api-prefix" | "apiPrefix" => Ok(json!({"apiPrefix": matrix.config.api_prefix})),
             "token" => Ok(json!({"hasToken": matrix.config.token.is_some()})),
             "sql-init" | "sqlInit" => Ok(json!({"sqlInit": matrix.config.sql_init})),
+            "sql-pack" | "sql-packs" | "sqlPack" | "sqlPacks" => {
+                Ok(json!({"sqlPacks": matrix.config.sql_packs}))
+            }
             _ => bail!(
-                "unknown config key {key:?}; expected construct, api-prefix, token, or sql-init"
+                "unknown config key {key:?}; expected construct, api-prefix, token, sql-init, sql-pack, or sql-packs"
             ),
         },
         ConfigSubcommand::Set { key, value } => {
@@ -535,8 +557,10 @@ async fn config_command(matrix: &mut Matrix, command: ConfigCommand) -> Result<V
                 "api-prefix" | "apiPrefix" => matrix.config.api_prefix = Some(value),
                 "token" => matrix.config.token = Some(value),
                 "sql-init" | "sqlInit" => matrix.config.sql_init = Some(value),
+                "sql-pack" | "sqlPack" => matrix.config.sql_packs = vec![value],
+                "sql-packs" | "sqlPacks" => matrix.config.sql_packs = parse_sql_pack_list(&value),
                 _ => bail!(
-                    "unknown config key {key:?}; expected construct, api-prefix, token, or sql-init"
+                    "unknown config key {key:?}; expected construct, api-prefix, token, sql-init, sql-pack, or sql-packs"
                 ),
             }
             matrix.save()?;
@@ -1758,6 +1782,15 @@ fn strip_sql_line_comments(sql: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn parse_sql_pack_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(ToString::to_string)
+        .collect()
 }
 
 fn active_context_where(context: &MatrixContext) -> String {
@@ -3442,6 +3475,46 @@ mod tests {
         let result = execute_readonly_sql(&db, "select * from vdr_tuple").unwrap();
         assert_eq!(result["rows"].as_array().unwrap().len(), 1);
         assert_eq!(result["rows"][0]["component"], "did_vdr_go");
+    }
+
+    #[test]
+    fn parses_sql_pack_lists() {
+        assert_eq!(
+            parse_sql_pack_list("base.sql, odin.sql,,team.sql"),
+            vec!["base.sql", "odin.sql", "team.sql"]
+        );
+    }
+
+    #[test]
+    fn applies_sql_pack_views() {
+        let facts = vec![json!({
+            "id": "smart-contract-tuple.vdr.0.1.0",
+            "kind": "CompatibilityFact",
+            "track": "odin",
+            "status": "observed",
+            "subject": {"type": "smart-contract-tuple", "name": "vdr", "version": "0.1.0"},
+            "members": [
+                {
+                    "component": "did_vdr_go",
+                    "version": "0.4.9",
+                    "physicalChaincode": "did_vdr_go_v0_4_9"
+                }
+            ],
+            "provides": [{"capability": "smart-contract-tuple:vdr", "version": "0.1.0"}]
+        })];
+        let db = build_facts_db_with_init(
+            &facts,
+            &MatrixContext::default(),
+            Some(
+                "create view pack_members as select * from members;\n\
+                 create view pack_edges as select * from deref;",
+            ),
+        )
+        .unwrap();
+        let members = execute_readonly_sql(&db, "select component from pack_members").unwrap();
+        assert_eq!(members["rows"].as_array().unwrap().len(), 1);
+        let edges = execute_readonly_sql(&db, "select edge from pack_edges").unwrap();
+        assert_eq!(edges["rows"].as_array().unwrap().len(), 2);
     }
 
     #[test]

@@ -208,10 +208,12 @@ matrix members smart-contract-tuple.vdr.0.1.0
 matrix deref smart-contract-tuple.vdr.0.1.0
 ```
 
-Custom shortcuts can be loaded as SQLite views with `sql-init`:
+Custom shortcuts can be loaded as SQLite view packs:
 
 ```bash
 matrix config set sql-init ~/.config/matrix/init.sql
+matrix config set sql-pack ~/.config/matrix/packs/odin.sql
+matrix config set sql-packs ~/.config/matrix/packs/base.sql,~/.config/matrix/packs/odin.sql
 ```
 
 ```sql
@@ -221,9 +223,11 @@ from members
 where fact_id = 'smart-contract-tuple.vdr.0.1.0';
 ```
 
-The init file is applied to the local in-memory query database and may only
-create views. Use it for project, team, or org-specific rollups while keeping
-normal Matrix queries plain SQL.
+`sql-init` is the legacy single-file hook. `sql-pack` sets one reusable pack,
+and `sql-packs` sets an ordered comma-separated list. Pack files are applied to
+the local in-memory query database and may only create views. Use them for
+project, team, or org-specific rollups while keeping normal Matrix queries plain
+SQL. See `examples/sql-packs/vdr.sql` for a small pack.
 
 ## REPL
 
@@ -303,6 +307,7 @@ matrix config list
 matrix config set construct https://matrix.example.dev
 matrix config set api-prefix /v1/matrix
 matrix config set sql-init ~/.config/matrix/init.sql
+matrix config set sql-pack ~/.config/matrix/packs/odin.sql
 ```
 
 Environment overrides:
@@ -312,6 +317,7 @@ Environment overrides:
 - `MATRIX_TOKEN`
 - `MATRIX_OUTPUT`
 - `MATRIX_SQL_INIT`
+- `MATRIX_SQL_PACKS`, comma-separated SQL pack paths
 
 ## Releases
 
