@@ -280,6 +280,10 @@ matrix> .versions
 matrix> .use 1
 matrix> .zones
 matrix> .describe facts
+matrix> .views
+matrix> .examples
+matrix> .members smart-contract-tuple.vdr.0.1.0
+matrix> .deref smart-contract-tuple.vdr.0.1.0
 matrix> .mode json
 matrix> .mode yaml
 matrix> .refresh
@@ -291,8 +295,11 @@ Useful commands:
 
 - `.help` or `/help`: show REPL commands.
 - `.status` or `/status`: show construct, cache, output mode, and timing state.
-- `.tables`, `.schema [table]`, `.describe [table]`: inspect the local query
-  model.
+- `.tables`, `.views`, `.schema [table]`, `.describe [table]`: inspect the
+  local query model.
+- `.examples`: print copyable SQL and helper-command examples.
+- `.members <fact-id>`: show tuple members for a fact.
+- `.deref <fact-id>`: show member, requirement, and provide edges for a fact.
 - `.mode table|json|yaml|csv`: change result rendering.
 - `.x`: toggle expanded records.
 - `.timing`: toggle query timings.
@@ -314,7 +321,8 @@ Useful commands:
 - `.gate <zone> [level]`: fetch a gate decision from the construct.
 - `.explain <sql>`: run `EXPLAIN QUERY PLAN`.
 
-`red` exits. `blue` clears the current local session context.
+SQL errors print in the shell without exiting the session. `red` exits. `blue`
+clears the current local session context.
 
 ## Configuration
 

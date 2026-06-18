@@ -1108,7 +1108,9 @@ impl<'a> ReplSession<'a> {
                     if is_complete_sql(&buffer) {
                         let sql = buffer.trim().trim_end_matches(';').trim().to_string();
                         buffer.clear();
-                        self.run_sql(&sql)?;
+                        if let Err(error) = self.run_sql(&sql) {
+                            eprintln!("{error:#}");
+                        }
                     }
                 }
                 Ok(Signal::CtrlD) => break,
@@ -1176,8 +1178,8 @@ impl<'a> ReplSession<'a> {
             "tags" => self.list_tags()?,
             "use" => self.use_context_choice(parts.collect::<Vec<_>>())?,
             "status" => self.print_status()?,
-            "tables" => self.run_sql(
-                "select name from sqlite_master where type in ('table', 'view') order by name",
+            "tables" | "views" => self.run_sql(
+                "select name, type from sqlite_master where type in ('table', 'view') order by type, name",
             )?,
             "schema" => {
                 let table = parts.next();
@@ -1190,6 +1192,23 @@ impl<'a> ReplSession<'a> {
                     self.run_sql("select name, type, sql from sqlite_master where sql is not null order by type, name")?;
                 }
             }
+            "deref" => {
+                let fact_id = parts.collect::<Vec<_>>().join(" ");
+                if fact_id.is_empty() {
+                    eprintln!("Usage: .deref <fact-id>");
+                } else {
+                    self.run_sql(&fact_view_sql(&fact_id, FactView::Deref))?;
+                }
+            }
+            "members" => {
+                let fact_id = parts.collect::<Vec<_>>().join(" ");
+                if fact_id.is_empty() {
+                    eprintln!("Usage: .members <fact-id>");
+                } else {
+                    self.run_sql(&fact_view_sql(&fact_id, FactView::Members))?;
+                }
+            }
+            "examples" => print_repl_examples(),
             "describe" | "desc" | "d" => {
                 let table = parts.next().unwrap_or("facts");
                 self.run_sql(&format!(
@@ -2304,6 +2323,10 @@ Matrix shell commands
   .subjects                 Summarize facts by subject
   .trace <subject>          Show recent facts for a subject
   .gate <zone> [level]      Fetch a gate decision from the construct
+  .views                    List local tables and views
+  .deref <fact-id>          Show member/require/provide edges for a fact
+  .members <fact-id>        Show tuple members for a fact
+  .examples                 Show copyable query examples
   .explain <sql>            Run EXPLAIN QUERY PLAN
   red, red-pill, .exit      Exit
   blue, blue-pill           Clear the current session context
@@ -2315,6 +2338,33 @@ SQL
   invalid_facts, capabilities, requirements, members, deref, and one view per
   SQL-safe zone such as odin. `status = valid` expands to compatible statuses.
 "
+    );
+}
+
+#[cfg(feature = "interactive")]
+fn print_repl_examples() {
+    println!(
+        r#"Matrix SQL examples
+
+select * from current;
+
+select current_version, capability, component, version, status
+from upstream;
+
+select current_version, capability, component, version, status
+from downstream;
+
+select component, version, physical_chaincode
+from members
+where fact_id==smart-contract-tuple.vdr.0.1.0;
+
+select edge, target, target_version, physical_chaincode
+from deref
+where fact_id==smart-contract-tuple.vdr.0.1.0;
+
+.members smart-contract-tuple.vdr.0.1.0
+.deref smart-contract-tuple.vdr.0.1.0
+"#
     );
 }
 
@@ -2362,10 +2412,13 @@ impl MatrixCompleter {
     fn new() -> Self {
         let words = [
             ".describe",
+            ".deref",
+            ".examples",
             ".explain",
             ".gate",
             ".help",
             ".limit",
+            ".members",
             ".mode",
             ".refresh",
             ".schema",
@@ -2383,6 +2436,7 @@ impl MatrixCompleter {
             ".use",
             ".version",
             ".versions",
+            ".views",
             ".zone",
             ".zones",
             "/help",
