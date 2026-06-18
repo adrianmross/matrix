@@ -228,6 +228,7 @@ struct Config {
     construct: Option<String>,
     api_prefix: Option<String>,
     token: Option<String>,
+    sql_init: Option<String>,
 }
 
 #[derive(Clone)]
@@ -434,6 +435,18 @@ impl Matrix {
             .ok_or_else(|| anyhow!("no construct configured; run `matrix config set construct <url>` or set MATRIX_CONSTRUCT_URL"))
     }
 
+    fn sql_init(&self) -> Result<Option<String>> {
+        let Some(path) = env::var("MATRIX_SQL_INIT")
+            .ok()
+            .or_else(|| self.config.sql_init.clone())
+        else {
+            return Ok(None);
+        };
+        Ok(Some(fs::read_to_string(&path).with_context(|| {
+            format!("failed to read Matrix SQL init file {path}")
+        })?))
+    }
+
     async fn get(&self, path: &str) -> Result<Value> {
         self.request(Method::GET, path, None).await
     }
@@ -492,19 +505,26 @@ async fn config_command(matrix: &mut Matrix, command: ConfigCommand) -> Result<V
             "construct": matrix.config.construct,
             "apiPrefix": matrix.config.api_prefix,
             "hasToken": matrix.config.token.is_some(),
+            "sqlInit": matrix.config.sql_init,
         })),
         ConfigSubcommand::Get { key } => match key.as_str() {
             "construct" => Ok(json!({"construct": matrix.config.construct})),
             "api-prefix" | "apiPrefix" => Ok(json!({"apiPrefix": matrix.config.api_prefix})),
             "token" => Ok(json!({"hasToken": matrix.config.token.is_some()})),
-            _ => bail!("unknown config key {key:?}; expected construct, api-prefix, or token"),
+            "sql-init" | "sqlInit" => Ok(json!({"sqlInit": matrix.config.sql_init})),
+            _ => bail!(
+                "unknown config key {key:?}; expected construct, api-prefix, token, or sql-init"
+            ),
         },
         ConfigSubcommand::Set { key, value } => {
             match key.as_str() {
                 "construct" => matrix.config.construct = Some(value),
                 "api-prefix" | "apiPrefix" => matrix.config.api_prefix = Some(value),
                 "token" => matrix.config.token = Some(value),
-                _ => bail!("unknown config key {key:?}; expected construct, api-prefix, or token"),
+                "sql-init" | "sqlInit" => matrix.config.sql_init = Some(value),
+                _ => bail!(
+                    "unknown config key {key:?}; expected construct, api-prefix, token, or sql-init"
+                ),
             }
             matrix.save()?;
             Ok(json!({"saved": matrix.config_path}))
@@ -868,7 +888,8 @@ async fn ingest(matrix: &Matrix, args: IngestArgs) -> Result<Value> {
 async fn query(matrix: &Matrix, args: QueryArgs) -> Result<Value> {
     let facts = fetch_facts(matrix, args.max_facts).await?;
     let context = MatrixContext::detect(args.context);
-    let db = build_facts_db(&facts, &context)?;
+    let sql_init = matrix.sql_init()?;
+    let db = build_facts_db_with_init(&facts, &context, sql_init.as_deref())?;
     execute_readonly_sql(&db, &args.sql)
 }
 
@@ -892,6 +913,7 @@ enum OutputMode {
 struct ReplSession<'a> {
     matrix: &'a Matrix,
     context: MatrixContext,
+    sql_init: Option<String>,
     facts: Vec<Value>,
     choices: Vec<ContextChoice>,
     db: Connection,
@@ -909,10 +931,12 @@ impl<'a> ReplSession<'a> {
         let max_facts = 1000;
         let facts = fetch_facts(matrix, max_facts).await?;
         let fact_count = facts.len();
+        let sql_init = matrix.sql_init()?;
         Ok(Self {
             matrix,
-            db: build_facts_db(&facts, &context)?,
+            db: build_facts_db_with_init(&facts, &context, sql_init.as_deref())?,
             context,
+            sql_init,
             facts,
             choices: Vec::new(),
             max_facts,
@@ -933,13 +957,13 @@ impl<'a> ReplSession<'a> {
         let facts = fetch_facts(self.matrix, self.max_facts).await?;
         self.fact_count = facts.len();
         self.facts = facts;
-        self.db = build_facts_db(&self.facts, &self.context)?;
+        self.db = build_facts_db_with_init(&self.facts, &self.context, self.sql_init.as_deref())?;
         self.last_refresh = SystemTime::now();
         Ok(())
     }
 
     fn rebuild_context(&mut self) -> Result<()> {
-        self.db = build_facts_db(&self.facts, &self.context)?;
+        self.db = build_facts_db_with_init(&self.facts, &self.context, self.sql_init.as_deref())?;
         Ok(())
     }
 
@@ -1424,7 +1448,16 @@ struct ContextChoice {
     value: String,
 }
 
+#[cfg(test)]
 fn build_facts_db(facts: &[Value], context: &MatrixContext) -> Result<Connection> {
+    build_facts_db_with_init(facts, context, None)
+}
+
+fn build_facts_db_with_init(
+    facts: &[Value],
+    context: &MatrixContext,
+    sql_init: Option<&str>,
+) -> Result<Connection> {
     let db = Connection::open_in_memory()?;
     db.execute_batch(
         "create table facts (
@@ -1501,6 +1534,9 @@ fn build_facts_db(facts: &[Value], context: &MatrixContext) -> Result<Connection
         )?;
     }
     create_matrix_views(&db, context, &zones)?;
+    if let Some(sql) = sql_init {
+        apply_sql_init(&db, sql)?;
+    }
     Ok(db)
 }
 
@@ -1546,7 +1582,47 @@ fn create_matrix_views(db: &Connection, context: &MatrixContext, zones: &[String
                  json_extract(item.value, '$.capability') as capability,
                  json_extract(item.value, '$.version') as capability_version,
                  item.value as provides
-          from facts f, json_each(coalesce(f.provides, '[]')) item;",
+          from facts f, json_each(coalesce(f.provides, '[]')) item;
+        create view members as
+          select f.id as fact_id, f.zone, f.type as fact_type, f.component as fact_component,
+                 f.repo as fact_repo, f.version as fact_version, f.status as fact_status,
+                 json_extract(item.value, '$.component') as component,
+                 json_extract(item.value, '$.version') as version,
+                 json_extract(item.value, '$.logicalChaincode') as logical_chaincode,
+                 json_extract(item.value, '$.physicalChaincode') as physical_chaincode,
+                 json_extract(item.value, '$.chaincode') as chaincode,
+                 json_extract(item.value, '$.channel') as channel,
+                 json_extract(item.value, '$.network') as network,
+                 json_extract(item.value, '$.digest') as digest,
+                 json_extract(item.value, '$.services') as services,
+                 json_extract(item.value, '$.aliases') as aliases,
+                 item.value as member
+          from facts f, json_each(coalesce(json_extract(f.json, '$.fact.members'), json_extract(f.json, '$.members'), '[]')) item;
+        create view deref as
+          select 'member' as edge, fact_id, zone, fact_type, fact_component, fact_repo,
+                 fact_version, fact_status, 'component' as target_type,
+                 component as target, version as target_version, null as capability,
+                 logical_chaincode, physical_chaincode, channel, network, digest, services,
+                 member as json
+          from members
+          union all
+          select 'requires' as edge, fact_id, zone, type as fact_type, component as fact_component,
+                 repo as fact_repo, version as fact_version, status as fact_status,
+                 'capability' as target_type, capability as target,
+                 capability_version as target_version, capability,
+                 null as logical_chaincode, null as physical_chaincode, null as channel,
+                 null as network, json_extract(requirement, '$.digest') as digest,
+                 null as services, requirement as json
+          from requirements
+          union all
+          select 'provides' as edge, fact_id, zone, type as fact_type, component as fact_component,
+                 repo as fact_repo, version as fact_version, status as fact_status,
+                 'capability' as target_type, capability as target,
+                 capability_version as target_version, capability,
+                 null as logical_chaincode, null as physical_chaincode, null as channel,
+                 null as network, json_extract(provides, '$.digest') as digest,
+                 null as services, provides as json
+          from capabilities;",
     )?;
 
     let active_where = active_context_where(context);
@@ -1591,6 +1667,8 @@ fn create_matrix_views(db: &Connection, context: &MatrixContext, zones: &[String
                 | "invalid_facts"
                 | "requirements"
                 | "capabilities"
+                | "members"
+                | "deref"
                 | "zones"
         ) {
             continue;
@@ -1603,6 +1681,36 @@ fn create_matrix_views(db: &Connection, context: &MatrixContext, zones: &[String
     }
 
     Ok(())
+}
+
+fn apply_sql_init(db: &Connection, sql: &str) -> Result<()> {
+    for statement in sql.split(';') {
+        let statement = strip_sql_line_comments(statement)
+            .trim()
+            .to_ascii_lowercase();
+        if statement.is_empty() {
+            continue;
+        }
+        if !(statement.starts_with("create view ")
+            || statement.starts_with("create temp view ")
+            || statement.starts_with("create temporary view "))
+        {
+            bail!("Matrix SQL init only allows CREATE VIEW statements");
+        }
+    }
+    db.execute_batch(sql)
+        .context("failed to apply Matrix SQL init views")?;
+    Ok(())
+}
+
+fn strip_sql_line_comments(sql: &str) -> String {
+    sql.lines()
+        .filter_map(|line| {
+            let trimmed = line.trim_start();
+            (!trimmed.starts_with("--")).then_some(line)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn active_context_where(context: &MatrixContext) -> String {
@@ -1703,12 +1811,15 @@ fn normalize_matrix_sql(sql: &str) -> String {
         "status",
         "type",
         "component",
+        "capability",
         "repo",
         "version",
+        "fact_id",
         "source_repo",
         "source_repository",
         "subject_name",
         "subject_type",
+        "target",
     ];
 
     let mut index = 0;
@@ -1867,6 +1978,7 @@ fn is_bare_sql_value(token: &str) -> bool {
     let lower = token.to_ascii_lowercase();
     !token.starts_with('\'')
         && !token.starts_with('"')
+        && !is_qualified_sql_identifier(token)
         && token.parse::<f64>().is_err()
         && !matches!(
             lower.as_str(),
@@ -1883,6 +1995,13 @@ fn is_bare_sql_value(token: &str) -> bool {
                 | "is"
                 | "not"
         )
+}
+
+fn is_qualified_sql_identifier(token: &str) -> bool {
+    let Some((qualifier, field)) = token.split_once('.') else {
+        return false;
+    };
+    is_sql_identifier(qualifier) && is_sql_identifier(field) && !field.contains('.')
 }
 
 fn execute_readonly_sql(db: &Connection, sql: &str) -> Result<Value> {
@@ -2058,8 +2177,9 @@ Matrix shell commands
 SQL
   End SQL statements with `;`.
   Available tables/views: facts, active, zone, zones, subjects, components,
-  valid_facts, invalid_facts, capabilities, requirements, and one view per
-  SQL-safe zone such as odin. `status = valid` expands to compatible statuses.
+  valid_facts, invalid_facts, capabilities, requirements, members, deref, and
+  one view per SQL-safe zone such as odin. `status = valid` expands to
+  compatible statuses.
 "
     );
 }
@@ -2144,7 +2264,9 @@ impl MatrixCompleter {
             "context",
             "count",
             "csv",
+            "deref",
             "facts",
+            "fact_id",
             "from",
             "group",
             "id",
@@ -2152,6 +2274,7 @@ impl MatrixCompleter {
             "json",
             "kind",
             "limit",
+            "members",
             "observed_at",
             "accepted_at",
             "order",
@@ -2169,6 +2292,8 @@ impl MatrixCompleter {
             "subject_name",
             "subject_type",
             "subjects",
+            "target",
+            "target_version",
             "table",
             "tag",
             "tags",
@@ -2890,6 +3015,16 @@ mod tests {
             normalize_matrix_sql("select * from zone where type==chaincode and status==valid"),
             "select * from zone where type='chaincode' and status in ('compatible','passed','observed','candidate','valid','ready')"
         );
+        assert_eq!(
+            normalize_matrix_sql(
+                "select * from deref where fact_id==smart-contract-tuple.vdr.0.1.0"
+            ),
+            "select * from deref where fact_id='smart-contract-tuple.vdr.0.1.0'"
+        );
+        assert_eq!(
+            normalize_matrix_sql("select * from requirements r where r.fact_id = odin.id"),
+            "select * from requirements r where r.fact_id = odin.id"
+        );
     }
 
     #[test]
@@ -3118,5 +3253,105 @@ mod tests {
         .unwrap();
         assert_eq!(result["rows"].as_array().unwrap().len(), 1);
         assert_eq!(result["rows"][0]["component"], "eos");
+    }
+
+    #[test]
+    fn exposes_fact_dereference_views() {
+        let facts = vec![json!({
+            "id": "smart-contract-tuple.vdr.0.1.0",
+            "kind": "CompatibilityFact",
+            "track": "odin",
+            "status": "observed",
+            "subject": {
+                "type": "smart-contract-tuple",
+                "name": "vdr",
+                "version": "0.1.0",
+                "repo": "red-wiz/compatibility-matrix"
+            },
+            "members": [
+                {
+                    "component": "did_vdr_go",
+                    "version": "0.4.9",
+                    "logicalChaincode": "did_vdr_go",
+                    "physicalChaincode": "did_vdr_go_v0_4_9",
+                    "channel": "dev",
+                    "network": "obpcs",
+                    "services": ["did"]
+                }
+            ],
+            "requires": [{"capability": "chaincode:did_vdr_go", "version": "0.4.9"}],
+            "provides": [{"capability": "smart-contract-tuple:vdr", "version": "0.1.0"}]
+        })];
+        let db = build_facts_db(
+            &facts,
+            &MatrixContext {
+                zone: Some("odin".to_string()),
+                ..MatrixContext::default()
+            },
+        )
+        .unwrap();
+
+        let members = execute_readonly_sql(
+            &db,
+            "select component, version, physical_chaincode from members where fact_id==smart-contract-tuple.vdr.0.1.0",
+        )
+        .unwrap();
+        assert_eq!(members["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(members["rows"][0]["component"], "did_vdr_go");
+        assert_eq!(
+            members["rows"][0]["physical_chaincode"],
+            "did_vdr_go_v0_4_9"
+        );
+
+        let deref = execute_readonly_sql(
+            &db,
+            "select edge, target, target_version from deref where fact_id==smart-contract-tuple.vdr.0.1.0 order by edge",
+        )
+        .unwrap();
+        let rows = deref["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().any(|row| row["edge"] == "member"));
+        assert!(rows.iter().any(|row| row["edge"] == "requires"));
+        assert!(rows.iter().any(|row| row["edge"] == "provides"));
+    }
+
+    #[test]
+    fn applies_custom_sql_init_views() {
+        let facts = vec![json!({
+            "id": "smart-contract-tuple.vdr.0.1.0",
+            "kind": "CompatibilityFact",
+            "track": "odin",
+            "status": "observed",
+            "subject": {"type": "smart-contract-tuple", "name": "vdr", "version": "0.1.0"},
+            "members": [
+                {
+                    "component": "did_vdr_go",
+                    "version": "0.4.9",
+                    "physicalChaincode": "did_vdr_go_v0_4_9"
+                }
+            ]
+        })];
+        let db = build_facts_db_with_init(
+            &facts,
+            &MatrixContext::default(),
+            Some(
+                "-- Matrix local shortcuts\n\
+                 create view vdr_tuple as\n\
+                 select component, version, physical_chaincode\n\
+                 from members\n\
+                 where fact_id = 'smart-contract-tuple.vdr.0.1.0';",
+            ),
+        )
+        .unwrap();
+        let result = execute_readonly_sql(&db, "select * from vdr_tuple").unwrap();
+        assert_eq!(result["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(result["rows"][0]["component"], "did_vdr_go");
+    }
+
+    #[test]
+    fn rejects_mutating_sql_init() {
+        let result =
+            build_facts_db_with_init(&[], &MatrixContext::default(), Some("drop table facts;"));
+        assert!(result.is_err());
     }
 }

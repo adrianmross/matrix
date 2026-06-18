@@ -140,6 +140,9 @@ shortcuts:
 - `invalid_facts`: raw facts whose status is incompatible/failed/invalid/blocked.
 - `requirements`: expanded `requires` capability edges.
 - `capabilities`: expanded `provides` capability edges.
+- `members`: expanded tuple/member entries from facts with `members[]`.
+- `deref`: a rolled-up dereference view combining `members`, `requires`, and
+  `provides` edges.
 - `context`: the detected repo, zone, tag, ref, and SHA.
 
 `component` is the short component key, so `@red-wiz/eos` can be queried as
@@ -165,6 +168,19 @@ from facts
 order by accepted_at desc
 limit 25;
 
+select edge, target, target_version, physical_chaincode, channel
+from deref
+where fact_id==smart-contract-tuple.vdr.0.1.0;
+
+select component, version, physical_chaincode, services
+from members
+where fact_id==smart-contract-tuple.vdr.0.1.0;
+
+select *
+from deref
+where fact_id==smart-contract-tuple.vdr.0.1.0
+  and edge==member;
+
 select eos.id, eos.component, eos.version
 from odin eos
 where eos.repo==red-wiz/eos
@@ -181,6 +197,23 @@ where eos.repo==red-wiz/eos
       )
   );
 ```
+
+Custom shortcuts can be loaded as SQLite views with `sql-init`:
+
+```bash
+matrix config set sql-init ~/.config/matrix/init.sql
+```
+
+```sql
+create view vdr_tuple as
+select component, version, physical_chaincode, channel
+from members
+where fact_id = 'smart-contract-tuple.vdr.0.1.0';
+```
+
+The init file is applied to the local in-memory query database and may only
+create views. Use it for project, team, or org-specific rollups while keeping
+normal Matrix queries plain SQL.
 
 ## REPL
 
@@ -259,6 +292,7 @@ Useful commands:
 matrix config list
 matrix config set construct https://matrix.example.dev
 matrix config set api-prefix /v1/matrix
+matrix config set sql-init ~/.config/matrix/init.sql
 ```
 
 Environment overrides:
@@ -267,6 +301,7 @@ Environment overrides:
 - `MATRIX_API_PREFIX`
 - `MATRIX_TOKEN`
 - `MATRIX_OUTPUT`
+- `MATRIX_SQL_INIT`
 
 ## Releases
 
