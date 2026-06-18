@@ -1680,7 +1680,7 @@ fn print_table_result(value: &Value, expanded: bool) -> Result<()> {
             for column in &column_names {
                 println!(
                     "{column:<20} {}",
-                    display_cell(row.get(column).unwrap_or(&Value::Null))
+                    table_cell_value(row.get(column).unwrap_or(&Value::Null))
                 );
             }
         }
@@ -1695,7 +1695,7 @@ fn print_table_result(value: &Value, expanded: bool) -> Result<()> {
         table.add_row(
             column_names
                 .iter()
-                .map(|column| display_cell(row.get(column).unwrap_or(&Value::Null)))
+                .map(|column| table_cell_value(row.get(column).unwrap_or(&Value::Null)))
                 .collect::<Vec<_>>(),
         );
     }
@@ -1734,6 +1734,23 @@ fn display_cell(value: &Value) -> String {
         Value::Null => "".to_string(),
         Value::String(value) => value.clone(),
         _ => value.to_string(),
+    }
+}
+
+fn table_cell_value(value: &Value) -> String {
+    match value {
+        Value::Null => "".to_string(),
+        Value::String(value) => value.clone(),
+        Value::Bool(value) => {
+            if *value {
+                "yes".to_string()
+            } else {
+                "no".to_string()
+            }
+        }
+        Value::Number(value) => value.to_string(),
+        Value::Array(values) => count_label(values.len(), "item"),
+        Value::Object(object) => count_label(object.len(), "field"),
     }
 }
 
@@ -2287,13 +2304,13 @@ fn human_inline_value(value: &Value) -> String {
             }
         }
         Value::Number(value) => value.to_string(),
-        Value::Array(values) => format!(
-            "{} item{}",
-            values.len(),
-            if values.len() == 1 { "" } else { "s" }
-        ),
+        Value::Array(values) => count_label(values.len(), "item"),
         Value::Object(_) => value.to_string(),
     }
+}
+
+fn count_label(count: usize, noun: &str) -> String {
+    format!("{count} {noun}{}", if count == 1 { "" } else { "s" })
 }
 
 fn human_label(key: &str) -> String {
@@ -2341,7 +2358,7 @@ fn generic_table_text(value: &Value) -> String {
 fn object_table_text(object: &serde_json::Map<String, Value>) -> String {
     let rows = object
         .iter()
-        .map(|(key, value)| json!({"field": human_label(key), "value": human_inline_value(value)}))
+        .map(|(key, value)| json!({"field": human_label(key), "value": table_cell_value(value)}))
         .collect::<Vec<_>>();
     plain_table_result_text(&["field".to_string(), "value".to_string()], &rows)
 }
@@ -2367,7 +2384,7 @@ fn array_table_text(values: &[Value]) -> String {
 
     let rows = values
         .iter()
-        .map(|value| json!({"value": human_inline_value(value)}))
+        .map(|value| json!({"value": table_cell_value(value)}))
         .collect::<Vec<_>>();
     plain_table_result_text(&["value".to_string()], &rows)
 }
@@ -2394,7 +2411,7 @@ fn plain_table_text(column_names: &[String], rows: &[Value]) -> String {
                 .enumerate()
                 .map(|(index, column)| {
                     let cell =
-                        truncate_cell(&display_cell(row.get(column).unwrap_or(&Value::Null)));
+                        truncate_cell(&table_cell_value(row.get(column).unwrap_or(&Value::Null)));
                     widths[index] = widths[index].max(cell.len());
                     cell
                 })
@@ -2529,6 +2546,12 @@ mod tests {
             "track": "odin",
             "eligible": false,
             "blockers": [],
+            "latest": {
+                "closure": {
+                    "edges": []
+                },
+                "status": "partial"
+            },
         }));
         assert!(text.contains("+"));
         assert!(text.contains("| field"));
@@ -2539,6 +2562,9 @@ mod tests {
         assert!(text.contains("| no"));
         assert!(text.contains("| Blockers"));
         assert!(text.contains("| 0 items"));
+        assert!(text.contains("| Latest"));
+        assert!(text.contains("| 2 fields"));
+        assert!(!text.contains("{\"closure\""));
     }
 
     #[test]
