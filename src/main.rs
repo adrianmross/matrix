@@ -1027,7 +1027,10 @@ fn build_facts_db(facts: &[Value], context: &MatrixContext) -> Result<Connection
     )?;
     let mut zones = Vec::new();
     for record in facts {
-        let fact = record.get("fact").filter(|value| value.is_object()).unwrap_or(record);
+        let fact = record
+            .get("fact")
+            .filter(|value| value.is_object())
+            .unwrap_or(record);
         let zone = text_at(fact, &["track"])
             .or_else(|| text_at(record, &["track"]))
             .or_else(|| text_at(fact, &["zone"]))
@@ -1045,22 +1048,19 @@ fn build_facts_db(facts: &[Value], context: &MatrixContext) -> Result<Connection
         let component = subject_name.as_deref().map(component_key);
         let subject_repo =
             text_at(fact, &["subjectRepo"]).or_else(|| text_at(fact, &["subject", "repo"]));
-        let source_repo =
-            text_at(fact, &["sourceRepository"])
-                .or_else(|| text_at(record, &["sourceRepository"]))
-                .or_else(|| text_at(fact, &["source", "repo"]))
-                .or_else(|| text_at(record, &["source", "repo"]))
-                .or_else(|| text_at(record, &["source", "repository"]));
-        let source_sha =
-            text_at(fact, &["sourceSha"])
-                .or_else(|| text_at(record, &["sourceSha"]))
-                .or_else(|| text_at(fact, &["source", "sha"]))
-                .or_else(|| text_at(record, &["source", "sha"]));
-        let source_ref =
-            text_at(fact, &["sourceRef"])
-                .or_else(|| text_at(record, &["sourceRef"]))
-                .or_else(|| text_at(fact, &["source", "ref"]))
-                .or_else(|| text_at(record, &["source", "ref"]));
+        let source_repo = text_at(fact, &["sourceRepository"])
+            .or_else(|| text_at(record, &["sourceRepository"]))
+            .or_else(|| text_at(fact, &["source", "repo"]))
+            .or_else(|| text_at(record, &["source", "repo"]))
+            .or_else(|| text_at(record, &["source", "repository"]));
+        let source_sha = text_at(fact, &["sourceSha"])
+            .or_else(|| text_at(record, &["sourceSha"]))
+            .or_else(|| text_at(fact, &["source", "sha"]))
+            .or_else(|| text_at(record, &["source", "sha"]));
+        let source_ref = text_at(fact, &["sourceRef"])
+            .or_else(|| text_at(record, &["sourceRef"]))
+            .or_else(|| text_at(fact, &["source", "ref"]))
+            .or_else(|| text_at(record, &["source", "ref"]));
         let tag = text_at(fact, &["tag"]).or_else(|| source_ref.clone());
         db.execute(
             "insert into facts values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
