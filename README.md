@@ -56,7 +56,7 @@ matrix gate --zone sdk-runtime --level stage
 matrix trace --zone sdk-runtime --subject my-package
 matrix upload facts.json
 matrix query 'select id, zone, status, subject_name from facts limit 20'
-matrix -o json query 'select id, zone, status from facts limit 20'
+matrix query 'select id, zone, status from facts limit 20' -o json
 matrix query --zone sdk-runtime 'select * from zone where type==chaincode'
 matrix completion zsh
 ```
@@ -104,15 +104,17 @@ script or another tool needs a structured format:
 
 ```bash
 matrix doctor
-matrix -o json doctor
-matrix -o yaml list
-matrix -o csv query 'select zone, count(*) as facts from facts group by zone'
-matrix -o table query 'select id, zone, status from facts limit 10'
+matrix doctor -o json
+matrix list -o yaml
+matrix query 'select zone, count(*) as facts from facts group by zone' -o csv
+matrix query 'select id, zone, status from facts limit 10' -o table
 ```
 
 Supported output formats are `human`, `json`, `yaml`, `table`, and `csv`.
 `csv` is available for tabular query results. `MATRIX_OUTPUT` can set the
-default output format for a shell or CI step.
+default output format for a shell or CI step. `-o` / `--out` is a global option,
+so it works before or after commands; command-local placement is recommended for
+readability.
 
 ## Context Queries
 

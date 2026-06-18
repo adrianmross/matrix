@@ -2440,6 +2440,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn accepts_output_before_and_after_top_level_commands() {
+        let before = Cli::try_parse_from(["matrix", "-o", "json", "doctor"]).unwrap();
+        assert_eq!(before.output, OutputFormat::Json);
+
+        let after = Cli::try_parse_from(["matrix", "doctor", "-o", "json"]).unwrap();
+        assert_eq!(after.output, OutputFormat::Json);
+    }
+
+    #[test]
+    fn accepts_output_after_nested_commands() {
+        let cli = Cli::try_parse_from(["matrix", "config", "list", "--out", "yaml"]).unwrap();
+        assert_eq!(cli.output, OutputFormat::Yaml);
+    }
+
+    #[test]
+    fn accepts_output_after_query_sql() {
+        let cli = Cli::try_parse_from([
+            "matrix",
+            "query",
+            "select * from facts limit 1",
+            "-o",
+            "json",
+        ])
+        .unwrap();
+        assert_eq!(cli.output, OutputFormat::Json);
+    }
+
+    #[test]
     fn normalizes_github_repos() {
         assert_eq!(
             normalize_repo_url("git@github.com:example/project.git").as_deref(),

@@ -14,7 +14,9 @@ zones, promotion levels, gates, facts, traces, producer evidence, or the
 - Prefer the local `matrix` binary.
 - Use `matrix --help` and command-specific `--help` output to confirm current
   flags before building unfamiliar commands.
-- Use `--json` when you need to parse command output or summarize exact fields.
+- Use `-o json` when you need to parse command output or summarize exact
+  fields. `-o` / `--out` is global, so prefer command-local placement such as
+  `matrix doctor -o json`.
 - Do not invent a construct URL. Use `MATRIX_CONSTRUCT_URL`, `matrix config get
   construct`, or a user-provided `--construct` value.
 - Do not print, persist, or echo tokens. Matrix uses `MATRIX_TOKEN` or a saved
