@@ -1705,9 +1705,9 @@ fn apply_sql_init(db: &Connection, sql: &str) -> Result<()> {
 
 fn strip_sql_line_comments(sql: &str) -> String {
     sql.lines()
-        .filter_map(|line| {
+        .filter(|line| {
             let trimmed = line.trim_start();
-            (!trimmed.starts_with("--")).then_some(line)
+            !trimmed.starts_with("--")
         })
         .collect::<Vec<_>>()
         .join("\n")
