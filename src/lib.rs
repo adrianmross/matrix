@@ -1,8 +1,9 @@
 use std::{
     env, fs,
-    io::{self, Read},
+    io::{self, IsTerminal, Read},
     path::PathBuf,
-    process::Command as ProcessCommand,
+    process::{Command as ProcessCommand, Stdio},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -13,6 +14,10 @@ use reqwest::{Method, header::CONTENT_TYPE};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+const MATRIX_REPOSITORY: &str = "adrianmross/matrix";
+const MATRIX_HOMEBREW_FORMULA: &str = "adrianmross/tap/matrix";
+const UPDATE_CHECK_TTL: Duration = Duration::from_secs(60 * 60 * 24);
 
 #[cfg(feature = "interactive")]
 use std::time::SystemTime;
@@ -81,9 +86,18 @@ enum Commands {
     Ingest(IngestArgs),
     Query(QueryArgs),
     Enter(ContextArgs),
+    Update(UpdateCommand),
     Doctor,
     RedPill,
     BluePill,
+}
+
+#[derive(Args)]
+struct UpdateCommand {
+    #[arg(long)]
+    check: bool,
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(Args)]
@@ -246,6 +260,7 @@ pub async fn run_cli() -> Result<()> {
     }
     let output_format = OutputFormat::from_cli(cli.output, cli.json);
     let mut matrix = Matrix::load(cli.construct, cli.api_prefix, output_format)?;
+    maybe_print_update_notice(&matrix, &cli.command).await;
     let output = match cli.command {
         Commands::Completion { .. } => unreachable!("completion exits before matrix is loaded"),
         Commands::Config(command) => config_command(&mut matrix, command).await?,
@@ -272,6 +287,7 @@ pub async fn run_cli() -> Result<()> {
         Commands::Ingest(args) => ingest(&matrix, args).await?,
         Commands::Query(args) => query(&matrix, args).await?,
         Commands::Enter(context) => dispatch_enter(&matrix, context)?,
+        Commands::Update(command) => update_command(&matrix, command).await?,
         Commands::Doctor => doctor(&matrix).await?,
         Commands::RedPill => red_pill(&matrix).await?,
         Commands::BluePill => blue_pill(&matrix).await?,
@@ -494,6 +510,249 @@ async fn config_command(matrix: &mut Matrix, command: ConfigCommand) -> Result<V
             Ok(json!({"saved": matrix.config_path}))
         }
     }
+}
+
+async fn update_command(matrix: &Matrix, command: UpdateCommand) -> Result<Value> {
+    if is_homebrew_install() && command.check {
+        let current =
+            homebrew_installed_version().unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+        if let Some(latest) = homebrew_outdated_version() {
+            return Ok(json!({
+                "current": current,
+                "latest": latest,
+                "updateAvailable": true,
+                "command": "matrix update"
+            }));
+        }
+        return Ok(json!({
+            "current": current,
+            "latest": current,
+            "updateAvailable": false
+        }));
+    }
+
+    if is_homebrew_install() && !command.check {
+        run_status_command("brew", &["update"])?;
+        run_status_command("brew", &["upgrade", MATRIX_HOMEBREW_FORMULA])?;
+        clear_update_notice_cache();
+        return Ok(Value::String(
+            "Updated through Homebrew. Run `matrix --version` to confirm the installed version."
+                .to_string(),
+        ));
+    }
+
+    let latest = latest_matrix_version(&matrix.client).await?;
+    let current = env!("CARGO_PKG_VERSION");
+    let update_available = version_is_newer(current, &latest);
+
+    if command.check {
+        if update_available {
+            return Ok(json!({
+                "current": current,
+                "latest": latest,
+                "updateAvailable": true,
+                "command": "matrix update"
+            }));
+        }
+        return Ok(json!({
+            "current": current,
+            "latest": latest,
+            "updateAvailable": false
+        }));
+    }
+
+    if !update_available && !command.force {
+        return Ok(Value::String(format!(
+            "Already on latest version, {current}"
+        )));
+    }
+
+    bail!(
+        "this matrix install was not detected as Homebrew-managed; install or upgrade with: brew upgrade {MATRIX_HOMEBREW_FORMULA}"
+    );
+}
+
+async fn maybe_print_update_notice(matrix: &Matrix, command: &Commands) {
+    if matrix.output == OutputFormat::Json
+        || matches!(command, Commands::Update(_))
+        || env::var_os("MATRIX_NO_UPDATE_CHECK").is_some()
+    {
+        return;
+    }
+    if !io::stderr().is_terminal() {
+        return;
+    }
+    let Ok(cache_path) = update_notice_cache_path() else {
+        return;
+    };
+    if let Some(message) = fresh_update_notice(&cache_path) {
+        if !message.is_empty() {
+            eprintln!("{message}");
+        }
+        return;
+    }
+    let current = env!("CARGO_PKG_VERSION");
+    let message = if is_homebrew_install() {
+        homebrew_outdated_version()
+            .map(|latest| format!("Update {latest} available, run `matrix update`\n"))
+            .unwrap_or_default()
+    } else {
+        match latest_matrix_version(&matrix.client).await {
+            Ok(latest) if version_is_newer(current, &latest) => {
+                format!("Update {latest} available, run `matrix update`\n")
+            }
+            _ => String::new(),
+        }
+    };
+    if let Some(parent) = cache_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(&cache_path, &message);
+    if !message.is_empty() {
+        eprintln!("{message}");
+    }
+}
+
+async fn latest_matrix_version(client: &reqwest::Client) -> Result<String> {
+    let mut request = client
+        .get(format!(
+            "https://api.github.com/repos/{MATRIX_REPOSITORY}/releases/latest"
+        ))
+        .timeout(Duration::from_secs(3));
+    if let Some(token) = github_token() {
+        request = request.bearer_auth(token);
+    }
+    let body: Value = request.send().await?.error_for_status()?.json().await?;
+    body["tag_name"]
+        .as_str()
+        .map(normalize_version)
+        .filter(|version| !version.is_empty())
+        .ok_or_else(|| anyhow!("latest release response did not include tag_name"))
+}
+
+fn github_token() -> Option<String> {
+    ["MATRIX_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"]
+        .into_iter()
+        .find_map(|name| env::var(name).ok().filter(|value| !value.trim().is_empty()))
+}
+
+fn fresh_update_notice(path: &std::path::Path) -> Option<String> {
+    let metadata = fs::metadata(path).ok()?;
+    if metadata.modified().ok()?.elapsed().ok()? > UPDATE_CHECK_TTL {
+        return None;
+    }
+    fs::read_to_string(path).ok()
+}
+
+fn update_notice_cache_path() -> Result<PathBuf> {
+    Ok(cache_root()?.join("update_notice"))
+}
+
+fn clear_update_notice_cache() {
+    if let Ok(path) = update_notice_cache_path() {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn is_homebrew_install() -> bool {
+    let brew_has_formula = ProcessCommand::new("brew")
+        .args(["list", "--formula", "matrix"])
+        .env("HOMEBREW_NO_AUTO_UPDATE", "1")
+        .env("HOMEBREW_NO_ENV_HINTS", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !brew_has_formula {
+        return false;
+    }
+    env::current_exe()
+        .ok()
+        .and_then(|path| path.canonicalize().ok())
+        .map(|path| {
+            let text = path.to_string_lossy();
+            text.starts_with("/opt/homebrew/") || text.starts_with("/usr/local/")
+        })
+        .unwrap_or(false)
+}
+
+fn homebrew_installed_version() -> Option<String> {
+    let output = ProcessCommand::new("brew")
+        .args(["list", "--versions", "matrix"])
+        .env("HOMEBREW_NO_AUTO_UPDATE", "1")
+        .env("HOMEBREW_NO_ENV_HINTS", "1")
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    text.split_whitespace().nth(1).map(ToString::to_string)
+}
+
+fn homebrew_outdated_version() -> Option<String> {
+    let output = ProcessCommand::new("brew")
+        .args([
+            "outdated",
+            "--formula",
+            "--verbose",
+            MATRIX_HOMEBREW_FORMULA,
+        ])
+        .env("HOMEBREW_NO_AUTO_UPDATE", "1")
+        .env("HOMEBREW_NO_ENV_HINTS", "1")
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let text = String::from_utf8(output.stdout).ok()?;
+    text.lines().find_map(|line| {
+        let (_, latest) = line.split_once(" < ")?;
+        latest.split_whitespace().next().map(ToString::to_string)
+    })
+}
+
+fn run_status_command(command: &str, args: &[&str]) -> Result<()> {
+    let status = ProcessCommand::new(command)
+        .args(args)
+        .status()
+        .with_context(|| format!("failed to run {command} {}", args.join(" ")))?;
+    if !status.success() {
+        bail!("{command} {} exited with {status}", args.join(" "));
+    }
+    Ok(())
+}
+
+fn version_is_newer(current: &str, latest: &str) -> bool {
+    let current_parts = version_parts(current);
+    let latest_parts = version_parts(latest);
+    for index in 0..current_parts.len().max(latest_parts.len()) {
+        let current_part = *current_parts.get(index).unwrap_or(&0);
+        let latest_part = *latest_parts.get(index).unwrap_or(&0);
+        if latest_part > current_part {
+            return true;
+        }
+        if latest_part < current_part {
+            return false;
+        }
+    }
+    false
+}
+
+fn version_parts(version: &str) -> Vec<u64> {
+    normalize_version(version)
+        .split(['.', '-'])
+        .take_while(|part| part.chars().all(|ch| ch.is_ascii_digit()))
+        .filter_map(|part| part.parse::<u64>().ok())
+        .collect()
+}
+
+fn normalize_version(version: &str) -> String {
+    version
+        .trim()
+        .trim_start_matches('v')
+        .trim_start_matches('V')
+        .to_string()
 }
 
 async fn current(matrix: &Matrix, args: CandidateArgs) -> Result<Value> {
@@ -2111,6 +2370,12 @@ fn config_path() -> Result<PathBuf> {
     Ok(dirs.config_dir().join("config.json"))
 }
 
+fn cache_root() -> Result<PathBuf> {
+    let dirs = ProjectDirs::from("dev", "matrix", "matrix")
+        .ok_or_else(|| anyhow!("could not determine cache directory"))?;
+    Ok(dirs.cache_dir().to_path_buf())
+}
+
 fn read_stdin_string() -> Result<String> {
     let mut text = String::new();
     io::stdin().read_to_string(&mut text)?;
@@ -2601,6 +2866,14 @@ mod tests {
             ]),
             "repo=example%2Fproject&level=preview"
         );
+    }
+
+    #[test]
+    fn compares_versions_without_tag_prefix() {
+        assert!(version_is_newer("0.3.0", "v0.3.1"));
+        assert!(version_is_newer("0.3.9", "0.4.0"));
+        assert!(!version_is_newer("0.4.0", "0.3.9"));
+        assert!(!version_is_newer("1.0.0", "V1.0.0"));
     }
 
     #[test]

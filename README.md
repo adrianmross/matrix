@@ -48,6 +48,7 @@ cargo build --release --no-default-features -p matrix
 
 ```bash
 matrix --version
+matrix update --check
 matrix config set construct https://matrix.example.dev
 matrix list
 matrix view sdk-runtime
@@ -272,6 +273,19 @@ Environment overrides:
 `matrix --version` prints the installed CLI version. `matrix-enter --version`
 prints the interactive shell version. `matrix-construct --version` prints the
 service binary version.
+
+`matrix` checks GitHub Releases for a newer version once per day on interactive
+startup and prints `matrix update` when one is available. Set
+`MATRIX_NO_UPDATE_CHECK=1` to disable the notice. For the GitHub release API, it
+uses `MATRIX_GITHUB_TOKEN`, `GITHUB_TOKEN`, or `GH_TOKEN` when one is present.
+Homebrew-managed installs update through the Adrian Ross tap:
+
+```bash
+brew update
+brew upgrade adrianmross/tap/matrix
+```
+
+Use `matrix update --check` for a machine-readable release check.
 
 Tags drive releases:
 
