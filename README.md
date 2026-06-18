@@ -276,8 +276,8 @@ service binary version.
 Tags drive releases:
 
 ```bash
-git tag -a v0.3.4 -m "Release v0.3.4"
-git push origin v0.3.4
+git tag -a v0.3.5 -m "Release v0.3.5"
+git push origin v0.3.5
 ```
 
 The `Release` workflow builds `matrix`, `matrix-enter`, and `matrix-construct`
@@ -285,7 +285,7 @@ for Linux x64, macOS Intel, and macOS Apple Silicon, publishes tarballs, and
 uploads SHA-256 checksums to the GitHub Release.
 
 The `Tag Release` workflow is the preferred path for normal releases. Run it
-with `version=0.3.4` after bumping the Cargo package versions. It validates
+with `version=0.3.5` after bumping the Cargo package versions. It validates
 formatting, tests, clippy, version alignment, and tag uniqueness before pushing
 the annotated tag.
 
