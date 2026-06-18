@@ -2162,7 +2162,7 @@ fn print_value(value: &Value, output: OutputFormat) -> Result<()> {
             if is_query_result(value) {
                 print_plain_table_result(value)?;
             } else {
-                print_human_value(value);
+                print_generic_table(value);
             }
         }
         OutputFormat::Human => {
@@ -2319,14 +2319,68 @@ fn print_plain_table_result(value: &Value) -> Result<()> {
         .filter_map(Value::as_str)
         .map(ToString::to_string)
         .collect::<Vec<_>>();
-    print_plain_table(&column_names, &rows);
-    println!("({} rows)", rows.len());
+    print!("{}", plain_table_result_text(&column_names, &rows));
     Ok(())
 }
 
-fn print_plain_table(column_names: &[String], rows: &[Value]) {
+fn print_generic_table(value: &Value) {
+    print!("{}", generic_table_text(value));
+}
+
+fn generic_table_text(value: &Value) -> String {
+    match value {
+        Value::Object(object) => object_table_text(object),
+        Value::Array(values) => array_table_text(values),
+        _ => object_table_text(&serde_json::Map::from_iter([(
+            "value".to_string(),
+            value.clone(),
+        )])),
+    }
+}
+
+fn object_table_text(object: &serde_json::Map<String, Value>) -> String {
+    let rows = object
+        .iter()
+        .map(|(key, value)| json!({"field": human_label(key), "value": human_inline_value(value)}))
+        .collect::<Vec<_>>();
+    plain_table_result_text(&["field".to_string(), "value".to_string()], &rows)
+}
+
+fn array_table_text(values: &[Value]) -> String {
+    if values.is_empty() {
+        return plain_table_result_text(&["value".to_string()], &[]);
+    }
+
+    if values.iter().all(Value::is_object) {
+        let mut column_names = Vec::new();
+        for value in values {
+            if let Some(object) = value.as_object() {
+                for key in object.keys() {
+                    if !column_names.contains(key) {
+                        column_names.push(key.clone());
+                    }
+                }
+            }
+        }
+        return plain_table_result_text(&column_names, values);
+    }
+
+    let rows = values
+        .iter()
+        .map(|value| json!({"value": human_inline_value(value)}))
+        .collect::<Vec<_>>();
+    plain_table_result_text(&["value".to_string()], &rows)
+}
+
+fn plain_table_result_text(column_names: &[String], rows: &[Value]) -> String {
+    let mut text = plain_table_text(column_names, rows);
+    text.push_str(&format!("({} rows)\n", rows.len()));
+    text
+}
+
+fn plain_table_text(column_names: &[String], rows: &[Value]) -> String {
     if column_names.is_empty() {
-        return;
+        return String::new();
     }
     let mut widths = column_names
         .iter()
@@ -2347,29 +2401,31 @@ fn print_plain_table(column_names: &[String], rows: &[Value]) {
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    print_plain_separator(&widths);
-    print_plain_row(column_names, &widths);
-    print_plain_separator(&widths);
+    let mut text = String::new();
+    push_plain_separator(&mut text, &widths);
+    push_plain_row(&mut text, column_names, &widths);
+    push_plain_separator(&mut text, &widths);
     for row in rendered_rows {
-        print_plain_row(&row, &widths);
+        push_plain_row(&mut text, &row, &widths);
     }
-    print_plain_separator(&widths);
+    push_plain_separator(&mut text, &widths);
+    text
 }
 
-fn print_plain_separator(widths: &[usize]) {
-    print!("+");
+fn push_plain_separator(text: &mut String, widths: &[usize]) {
+    text.push('+');
     for width in widths {
-        print!("{}+", "-".repeat(*width + 2));
+        text.push_str(&format!("{}+", "-".repeat(*width + 2)));
     }
-    println!();
+    text.push('\n');
 }
 
-fn print_plain_row(values: &[String], widths: &[usize]) {
-    print!("|");
+fn push_plain_row(text: &mut String, values: &[String], widths: &[usize]) {
+    text.push('|');
     for (value, width) in values.iter().zip(widths) {
-        print!(" {value:<width$} |");
+        text.push_str(&format!(" {value:<width$} |"));
     }
-    println!();
+    text.push('\n');
 }
 
 fn truncate_cell(value: &str) -> String {
@@ -2465,6 +2521,37 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(cli.output, OutputFormat::Json);
+    }
+
+    #[test]
+    fn renders_objects_as_field_value_tables() {
+        let text = generic_table_text(&json!({
+            "track": "odin",
+            "eligible": false,
+            "blockers": [],
+        }));
+        assert!(text.contains("+"));
+        assert!(text.contains("| field"));
+        assert!(text.contains("| value"));
+        assert!(text.contains("| Track"));
+        assert!(text.contains("| odin"));
+        assert!(text.contains("| Eligible"));
+        assert!(text.contains("| no"));
+        assert!(text.contains("| Blockers"));
+        assert!(text.contains("| 0 items"));
+    }
+
+    #[test]
+    fn renders_object_arrays_as_tables() {
+        let text = generic_table_text(&json!([
+            {"zone": "odin", "facts": 3},
+            {"zone": "agent-admin", "facts": 2}
+        ]));
+        assert!(text.contains("| zone"));
+        assert!(text.contains("| facts"));
+        assert!(text.contains("| odin"));
+        assert!(text.contains("| agent-admin"));
+        assert!(text.contains("(2 rows)"));
     }
 
     #[test]
