@@ -1,17 +1,17 @@
 [package]
 name = "matrix"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 description = "A compatibility matrix CLI for software zones, levels, facts, gates, and traces."
 license = "Apache-2.0"
 repository = "https://github.com/adrianmross/matrix"
 
 [workspace]
-members = [".", "crates/matrix-construct"]
+members = [".", "crates/matrix-construct", "crates/matrix-enter"]
 resolver = "3"
 
 [features]
-default = ["interactive"]
+default = []
 interactive = ["dep:comfy-table", "dep:nu-ansi-term", "dep:reedline"]
 
 [dependencies]

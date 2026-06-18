@@ -1,0 +1,11 @@
+[package]
+name = "matrix-enter"
+version = "0.3.3"
+edition = "2024"
+description = "Interactive SQL shell for the Matrix compatibility CLI."
+license = "Apache-2.0"
+repository = "https://github.com/adrianmross/matrix"
+
+[dependencies]
+matrix = { path = "../..", features = ["interactive"] }
+tokio = { version = "1.45.1", features = ["macros", "rt-multi-thread"] }

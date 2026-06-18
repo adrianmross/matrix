@@ -31,7 +31,9 @@ jobs:
         with:
           key: release-${{ matrix.target }}
       - run: cargo test --workspace
-      - run: cargo build --release --workspace
+      - run: cargo build --release -p matrix --no-default-features
+      - run: cargo build --release -p matrix-enter
+      - run: cargo build --release -p matrix-construct
       - name: Package binaries
         shell: bash
         run: |
@@ -41,9 +43,10 @@ jobs:
           package_dir="dist/${archive}"
           mkdir -p "${package_dir}"
           cp target/release/matrix "${package_dir}/matrix"
+          cp target/release/matrix-enter "${package_dir}/matrix-enter"
           cp target/release/matrix-construct "${package_dir}/matrix-construct"
           cp README.md LICENSE "${package_dir}/"
-          chmod +x "${package_dir}/matrix" "${package_dir}/matrix-construct"
+          chmod +x "${package_dir}/matrix" "${package_dir}/matrix-enter" "${package_dir}/matrix-construct"
           tar -C dist -czf "dist/${archive}.tar.gz" "${archive}"
           shasum -a 256 "dist/${archive}.tar.gz" > "dist/${archive}.tar.gz.sha256"
       - uses: actions/upload-artifact@v4
@@ -74,6 +77,7 @@ jobs:
             echo "Artifacts include:"
             echo
             echo "- matrix CLI"
+            echo "- matrix-enter interactive shell"
             echo "- matrix-construct service"
             echo "- SHA-256 checksums"
           } > RELEASE_NOTES.md

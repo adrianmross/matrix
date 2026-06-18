@@ -13,16 +13,22 @@ This repository is a small monorepo with separate distributions:
 
 - `matrix`: the terminal CLI for publishing, querying, gating, and inspecting
   compatibility facts.
+- `matrix-enter`: the interactive SQL shell used by `matrix enter`.
 - `matrix-construct`: a generic HTTP service that stores facts and serves the
   Matrix API for teams that want to run their own construct.
 
 The CLI and construct are versioned from the same repository, but they should be
 packaged and released separately. Producer/CI environments can install only the
-CLI, while operators can deploy the construct service independently.
+core CLI, end users can add `matrix-enter`, and operators can deploy the
+construct service independently.
 
-The default CLI build includes the interactive SQL shell (`matrix enter`). For
-automation-only environments, build the core CLI without default features to
-omit REPL dependencies and hide the interactive command:
+`matrix enter` is a dispatcher. It starts the `matrix-enter` binary from `PATH`,
+or from `MATRIX_ENTER_BIN` when you want to point at a custom location. This
+keeps the core CLI small while still giving users the familiar `matrix enter`
+command when the shell package is installed.
+
+For automation-only environments, build the core CLI without interactive
+dependencies:
 
 ```bash
 cargo build --release --no-default-features -p matrix
@@ -161,9 +167,20 @@ where eos.repo==red-wiz/eos
 matrix enter
 ```
 
-The REPL is part of the default `interactive` feature. Core automation builds
-can omit it with `--no-default-features`; those builds keep commands such as
-`query`, `upload`, `publish`, `gate`, `trace`, and `doctor`.
+The REPL lives in the separate `matrix-enter` binary. Install it next to
+`matrix`, or point the dispatcher at it explicitly:
+
+```bash
+MATRIX_ENTER_BIN=/path/to/matrix-enter matrix enter
+```
+
+Use `matrix enter --version <version>` when you want to focus a component
+version through the dispatcher. If you invoke `matrix-enter` directly, use
+`--target-version <version>` so `matrix-enter --version` remains the binary
+version check.
+
+Core automation builds keep commands such as `query`, `upload`, `publish`,
+`gate`, `trace`, and `doctor` without linking the interactive shell libraries.
 
 Inside the shell, SQL statements can span multiple lines and execute when they
 end with `;`. The REPL keeps a local fact cache for the session, persists
@@ -230,22 +247,23 @@ Environment overrides:
 
 ## Releases
 
-`matrix --version` prints the installed CLI version. `matrix-construct
---version` prints the service binary version.
+`matrix --version` prints the installed CLI version. `matrix-enter --version`
+prints the interactive shell version. `matrix-construct --version` prints the
+service binary version.
 
 Tags drive releases:
 
 ```bash
-git tag -a v0.3.1 -m "Release v0.3.1"
-git push origin v0.3.1
+git tag -a v0.3.3 -m "Release v0.3.3"
+git push origin v0.3.3
 ```
 
-The `Release` workflow builds `matrix` and `matrix-construct` for Linux x64,
-macOS Intel, and macOS Apple Silicon, publishes tarballs, and uploads SHA-256
-checksums to the GitHub Release.
+The `Release` workflow builds `matrix`, `matrix-enter`, and `matrix-construct`
+for Linux x64, macOS Intel, and macOS Apple Silicon, publishes tarballs, and
+uploads SHA-256 checksums to the GitHub Release.
 
 The `Tag Release` workflow is the preferred path for normal releases. Run it
-with `version=0.3.1` after bumping both Cargo package versions. It validates
+with `version=0.3.3` after bumping the Cargo package versions. It validates
 formatting, tests, clippy, version alignment, and tag uniqueness before pushing
 the annotated tag.
 
