@@ -10,14 +10,18 @@ repository = "https://github.com/adrianmross/matrix"
 members = [".", "crates/matrix-construct"]
 resolver = "3"
 
+[features]
+default = ["interactive"]
+interactive = ["dep:comfy-table", "dep:nu-ansi-term", "dep:reedline"]
+
 [dependencies]
 anyhow = "1.0.98"
 clap = { version = "4.5.40", features = ["derive", "env"] }
 clap_complete = "4.5.55"
-comfy-table = "7.2.2"
+comfy-table = { version = "7.2.2", optional = true }
 directories = "6.0.0"
-nu-ansi-term = "0.50.3"
-reedline = "0.48.0"
+nu-ansi-term = { version = "0.50.3", optional = true }
+reedline = { version = "0.48.0", optional = true }
 reqwest = { version = "0.12.20", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.36.0", features = ["bundled"] }
 serde = { version = "1.0.219", features = ["derive"] }

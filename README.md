@@ -20,6 +20,14 @@ The CLI and construct are versioned from the same repository, but they should be
 packaged and released separately. Producer/CI environments can install only the
 CLI, while operators can deploy the construct service independently.
 
+The default CLI build includes the interactive SQL shell (`matrix enter`). For
+automation-only environments, build the core CLI without default features to
+omit REPL dependencies and hide the interactive command:
+
+```bash
+cargo build --release --no-default-features -p matrix
+```
+
 ## Concepts
 
 - **construct**: the configured Matrix API/server and compatibility graph.
@@ -152,6 +160,10 @@ where eos.repo==red-wiz/eos
 ```bash
 matrix enter
 ```
+
+The REPL is part of the default `interactive` feature. Core automation builds
+can omit it with `--no-default-features`; those builds keep commands such as
+`query`, `upload`, `publish`, `gate`, `trace`, and `doctor`.
 
 Inside the shell, SQL statements can span multiple lines and execute when they
 end with `;`. The REPL keeps a local fact cache for the session, persists

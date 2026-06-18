@@ -3,24 +3,30 @@ use std::{
     io::{self, Read},
     path::PathBuf,
     process::Command as ProcessCommand,
-    time::SystemTime,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
-use comfy_table::{Table, presets::UTF8_FULL};
 use directories::ProjectDirs;
+use reqwest::{Method, header::CONTENT_TYPE};
+use rusqlite::{Connection, params};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+#[cfg(feature = "interactive")]
+use std::time::SystemTime;
+
+#[cfg(feature = "interactive")]
+use comfy_table::{Table, presets::UTF8_FULL};
+#[cfg(feature = "interactive")]
 use nu_ansi_term::{Color, Style};
+#[cfg(feature = "interactive")]
 use reedline::{
     ColumnarMenu, Completer, DefaultHinter, DefaultPrompt, DefaultPromptSegment, FileBackedHistory,
     Highlighter, MenuBuilder, Reedline, ReedlineEvent, ReedlineMenu, Signal, Span, StyledText,
     Suggestion, default_emacs_keybindings,
 };
-use reqwest::{Method, header::CONTENT_TYPE};
-use rusqlite::{Connection, params};
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 
 #[derive(Parser)]
 #[command(name = "matrix", version, about = "Compatibility matrix CLI")]
@@ -57,6 +63,7 @@ enum Commands {
     Publish(UploadArgs),
     Ingest(IngestArgs),
     Query(QueryArgs),
+    #[cfg(feature = "interactive")]
     Enter(ContextArgs),
     Doctor,
     RedPill,
@@ -221,6 +228,7 @@ async fn run() -> Result<()> {
         Commands::Upload(args) | Commands::Publish(args) => upload(&matrix, args).await?,
         Commands::Ingest(args) => ingest(&matrix, args).await?,
         Commands::Query(args) => query(&matrix, args).await?,
+        #[cfg(feature = "interactive")]
         Commands::Enter(context) => enter(&matrix, context).await?,
         Commands::Doctor => doctor(&matrix).await?,
         Commands::RedPill => red_pill(&matrix).await?,
@@ -474,12 +482,14 @@ async fn query(matrix: &Matrix, args: QueryArgs) -> Result<Value> {
     execute_readonly_sql(&db, &args.sql)
 }
 
+#[cfg(feature = "interactive")]
 async fn enter(matrix: &Matrix, context: ContextArgs) -> Result<Value> {
     let mut repl = ReplSession::new(matrix, MatrixContext::detect(context)).await?;
     repl.run().await?;
     Ok(json!({"status":"left"}))
 }
 
+#[cfg(feature = "interactive")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OutputMode {
     Table,
@@ -487,6 +497,7 @@ enum OutputMode {
     Csv,
 }
 
+#[cfg(feature = "interactive")]
 struct ReplSession<'a> {
     matrix: &'a Matrix,
     context: MatrixContext,
@@ -501,6 +512,7 @@ struct ReplSession<'a> {
     last_refresh: SystemTime,
 }
 
+#[cfg(feature = "interactive")]
 impl<'a> ReplSession<'a> {
     async fn new(matrix: &'a Matrix, context: MatrixContext) -> Result<Self> {
         let max_facts = 1000;
@@ -1007,6 +1019,7 @@ impl<'a> ReplSession<'a> {
     }
 }
 
+#[cfg(feature = "interactive")]
 #[derive(Clone, Debug)]
 struct ContextChoice {
     field: &'static str,
@@ -1501,6 +1514,7 @@ fn execute_readonly_sql(db: &Connection, sql: &str) -> Result<Value> {
     Ok(json!({ "columns": columns, "rows": rows }))
 }
 
+#[cfg(feature = "interactive")]
 fn print_query_result(value: &Value, mode: OutputMode, expanded: bool) -> Result<()> {
     match mode {
         OutputMode::Json => println!("{}", serde_json::to_string_pretty(value)?),
@@ -1510,6 +1524,7 @@ fn print_query_result(value: &Value, mode: OutputMode, expanded: bool) -> Result
     Ok(())
 }
 
+#[cfg(feature = "interactive")]
 fn print_table_result(value: &Value, expanded: bool) -> Result<()> {
     let columns = value["columns"].as_array().cloned().unwrap_or_default();
     let rows = value["rows"].as_array().cloned().unwrap_or_default();
@@ -1549,6 +1564,7 @@ fn print_table_result(value: &Value, expanded: bool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "interactive")]
 fn print_csv_result(value: &Value) -> Result<()> {
     let columns = value["columns"].as_array().cloned().unwrap_or_default();
     let rows = value["rows"].as_array().cloned().unwrap_or_default();
@@ -1574,6 +1590,7 @@ fn print_csv_result(value: &Value) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "interactive")]
 fn display_cell(value: &Value) -> String {
     match value {
         Value::Null => "".to_string(),
@@ -1582,6 +1599,7 @@ fn display_cell(value: &Value) -> String {
     }
 }
 
+#[cfg(feature = "interactive")]
 fn csv_escape(value: &str) -> String {
     if value.contains(',') || value.contains('"') || value.contains('\n') {
         format!("\"{}\"", value.replace('"', "\"\""))
@@ -1590,6 +1608,7 @@ fn csv_escape(value: &str) -> String {
     }
 }
 
+#[cfg(feature = "interactive")]
 fn print_repl_help() {
     eprintln!(
         "\
@@ -1632,6 +1651,7 @@ SQL
     );
 }
 
+#[cfg(feature = "interactive")]
 fn is_repl_command(line: &str) -> bool {
     line.starts_with('.')
         || line.starts_with('/')
@@ -1641,6 +1661,7 @@ fn is_repl_command(line: &str) -> bool {
         )
 }
 
+#[cfg(feature = "interactive")]
 fn is_complete_sql(sql: &str) -> bool {
     let mut in_single = false;
     let mut in_double = false;
@@ -1657,16 +1678,19 @@ fn is_complete_sql(sql: &str) -> bool {
     false
 }
 
+#[cfg(feature = "interactive")]
 fn repl_history_path() -> Result<PathBuf> {
     let dirs = ProjectDirs::from("dev", "matrix", "matrix")
         .ok_or_else(|| anyhow!("could not determine config directory"))?;
     Ok(dirs.data_dir().join("repl-history.txt"))
 }
 
+#[cfg(feature = "interactive")]
 struct MatrixCompleter {
     words: Vec<String>,
 }
 
+#[cfg(feature = "interactive")]
 impl MatrixCompleter {
     fn new() -> Self {
         let words = [
@@ -1751,6 +1775,7 @@ impl MatrixCompleter {
     }
 }
 
+#[cfg(feature = "interactive")]
 impl Completer for MatrixCompleter {
     fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
         let safe_pos = pos.min(line.len());
@@ -1776,8 +1801,10 @@ impl Completer for MatrixCompleter {
     }
 }
 
+#[cfg(feature = "interactive")]
 struct MatrixHighlighter;
 
+#[cfg(feature = "interactive")]
 impl Highlighter for MatrixHighlighter {
     fn highlight(&self, line: &str, _cursor: usize) -> StyledText {
         let mut text = StyledText::new();
@@ -1813,6 +1840,7 @@ impl Highlighter for MatrixHighlighter {
     }
 }
 
+#[cfg(feature = "interactive")]
 fn token_style(token: &str) -> Style {
     let lower = token.to_ascii_lowercase();
     if token.starts_with('.') || token.starts_with('/') {
