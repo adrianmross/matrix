@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use directories::ProjectDirs;
 use reqwest::{Method, header::CONTENT_TYPE};
@@ -35,10 +35,27 @@ struct Cli {
     construct: Option<String>,
     #[arg(long, env = "MATRIX_API_PREFIX", global = true)]
     api_prefix: Option<String>,
-    #[arg(long, global = true)]
+    #[arg(short = 'o', long = "out", env = "MATRIX_OUTPUT", value_enum, global = true, default_value_t = OutputFormat::Human)]
+    output: OutputFormat,
+    #[arg(long, global = true, hide = true)]
     json: bool,
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum OutputFormat {
+    Human,
+    Json,
+    Yaml,
+    Table,
+    Csv,
+}
+
+impl OutputFormat {
+    fn from_cli(output: OutputFormat, json: bool) -> Self {
+        if json { Self::Json } else { output }
+    }
 }
 
 #[derive(Subcommand)]
@@ -205,7 +222,7 @@ struct Matrix {
     config: Config,
     construct: Option<String>,
     api_prefix: String,
-    json: bool,
+    output: OutputFormat,
     client: reqwest::Client,
 }
 
@@ -227,7 +244,8 @@ pub async fn run_cli() -> Result<()> {
         generate(shell, &mut command, "matrix", &mut io::stdout());
         return Ok(());
     }
-    let mut matrix = Matrix::load(cli.construct, cli.api_prefix, cli.json)?;
+    let output_format = OutputFormat::from_cli(cli.output, cli.json);
+    let mut matrix = Matrix::load(cli.construct, cli.api_prefix, output_format)?;
     let output = match cli.command {
         Commands::Completion { .. } => unreachable!("completion exits before matrix is loaded"),
         Commands::Config(command) => config_command(&mut matrix, command).await?,
@@ -258,7 +276,7 @@ pub async fn run_cli() -> Result<()> {
         Commands::RedPill => red_pill(&matrix).await?,
         Commands::BluePill => blue_pill(&matrix).await?,
     };
-    print_value(&output, matrix.json)?;
+    print_value(&output, matrix.output)?;
     Ok(())
 }
 
@@ -275,16 +293,19 @@ pub async fn run_enter_cli() -> Result<()> {
         construct: Option<String>,
         #[arg(long, env = "MATRIX_API_PREFIX")]
         api_prefix: Option<String>,
-        #[arg(long)]
+        #[arg(short = 'o', long = "out", env = "MATRIX_OUTPUT", value_enum, default_value_t = OutputFormat::Human)]
+        output: OutputFormat,
+        #[arg(long, hide = true)]
         json: bool,
         #[command(flatten)]
         context: EnterContextArgs,
     }
 
     let cli = EnterCli::parse();
-    let matrix = Matrix::load(cli.construct, cli.api_prefix, cli.json)?;
+    let output_format = OutputFormat::from_cli(cli.output, cli.json);
+    let matrix = Matrix::load(cli.construct, cli.api_prefix, output_format)?;
     let output = enter(&matrix, cli.context.into()).await?;
-    print_value(&output, matrix.json)?;
+    print_value(&output, matrix.output)?;
     Ok(())
 }
 
@@ -296,8 +317,20 @@ fn dispatch_enter(matrix: &Matrix, context: ContextArgs) -> Result<Value> {
         command.arg("--construct").arg(construct);
     }
     command.arg("--api-prefix").arg(&matrix.api_prefix);
-    if matrix.json {
-        command.arg("--json");
+    match matrix.output {
+        OutputFormat::Json => {
+            command.arg("-o").arg("json");
+        }
+        OutputFormat::Yaml => {
+            command.arg("-o").arg("yaml");
+        }
+        OutputFormat::Table => {
+            command.arg("-o").arg("table");
+        }
+        OutputFormat::Csv => {
+            command.arg("-o").arg("csv");
+        }
+        OutputFormat::Human => {}
     }
     append_context_args(&mut command, &context);
 
@@ -340,7 +373,7 @@ impl Matrix {
     fn load(
         construct_override: Option<String>,
         prefix_override: Option<String>,
-        json: bool,
+        output: OutputFormat,
     ) -> Result<Self> {
         let config_path = config_path()?;
         let config = if config_path.exists() {
@@ -364,7 +397,7 @@ impl Matrix {
             config,
             construct,
             api_prefix,
-            json,
+            output,
             client: reqwest::Client::builder()
                 .user_agent(concat!("matrix/", env!("CARGO_PKG_VERSION")))
                 .build()?,
@@ -592,6 +625,7 @@ async fn enter(matrix: &Matrix, context: ContextArgs) -> Result<Value> {
 enum OutputMode {
     Table,
     Json,
+    Yaml,
     Csv,
 }
 
@@ -624,10 +658,11 @@ impl<'a> ReplSession<'a> {
             choices: Vec::new(),
             max_facts,
             fact_count,
-            output_mode: if matrix.json {
-                OutputMode::Json
-            } else {
-                OutputMode::Table
+            output_mode: match matrix.output {
+                OutputFormat::Json => OutputMode::Json,
+                OutputFormat::Yaml => OutputMode::Yaml,
+                OutputFormat::Csv => OutputMode::Csv,
+                OutputFormat::Human | OutputFormat::Table => OutputMode::Table,
             },
             expanded: false,
             timing: false,
@@ -817,11 +852,17 @@ impl<'a> ReplSession<'a> {
                     self.output_mode = OutputMode::Json;
                     eprintln!("Output mode: json");
                 }
+                Some("yaml") | Some("yml") => {
+                    self.output_mode = OutputMode::Yaml;
+                    eprintln!("Output mode: yaml");
+                }
                 Some("csv") => {
                     self.output_mode = OutputMode::Csv;
                     eprintln!("Output mode: csv");
                 }
-                Some(other) => eprintln!("Unknown mode {other:?}; expected table, json, or csv."),
+                Some(other) => {
+                    eprintln!("Unknown mode {other:?}; expected table, json, yaml, or csv.")
+                }
                 None => eprintln!("Output mode: {:?}", self.output_mode),
             },
             "x" | "expanded" => {
@@ -874,7 +915,7 @@ impl<'a> ReplSession<'a> {
                             &format!("/tracks/{}/promotion-gates/{}", enc(zone), enc(level)),
                         )
                         .await?;
-                    print_value(&value, self.matrix.json)?;
+                    print_value(&value, self.matrix.output)?;
                 } else {
                     eprintln!("Usage: .gate <zone> [level]");
                 }
@@ -910,7 +951,7 @@ impl<'a> ReplSession<'a> {
             "timing": self.timing,
             "refreshed": refreshed,
         });
-        print_value(&value, self.matrix.json)
+        print_value(&value, self.matrix.output)
     }
 
     fn context_json(&self) -> Result<Value> {
@@ -926,7 +967,7 @@ impl<'a> ReplSession<'a> {
     }
 
     fn print_context(&self) -> Result<()> {
-        print_value(&self.context_json()?, self.matrix.json)
+        print_value(&self.context_json()?, self.matrix.output)
     }
 
     fn handle_context_command(&mut self, args: Vec<&str>) -> Result<()> {
@@ -1616,6 +1657,7 @@ fn execute_readonly_sql(db: &Connection, sql: &str) -> Result<Value> {
 fn print_query_result(value: &Value, mode: OutputMode, expanded: bool) -> Result<()> {
     match mode {
         OutputMode::Json => println!("{}", serde_json::to_string_pretty(value)?),
+        OutputMode::Yaml => print_yaml(value)?,
         OutputMode::Csv => print_csv_result(value)?,
         OutputMode::Table => print_table_result(value, expanded)?,
     }
@@ -1662,7 +1704,6 @@ fn print_table_result(value: &Value, expanded: bool) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "interactive")]
 fn print_csv_result(value: &Value) -> Result<()> {
     let columns = value["columns"].as_array().cloned().unwrap_or_default();
     let rows = value["rows"].as_array().cloned().unwrap_or_default();
@@ -1688,7 +1729,6 @@ fn print_csv_result(value: &Value) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "interactive")]
 fn display_cell(value: &Value) -> String {
     match value {
         Value::Null => "".to_string(),
@@ -1697,7 +1737,6 @@ fn display_cell(value: &Value) -> String {
     }
 }
 
-#[cfg(feature = "interactive")]
 fn csv_escape(value: &str) -> String {
     if value.contains(',') || value.contains('"') || value.contains('\n') {
         format!("\"{}\"", value.replace('"', "\"\""))
@@ -1716,7 +1755,7 @@ Matrix shell commands
   .tables                   List local tables and views
   .schema [table]           Show local SQL schema
   .describe [table]         Show columns for a table or view
-  .mode table|json|csv      Change output format
+  .mode table|json|yaml|csv Change output format
   .x                        Toggle expanded table output
   .timing                   Toggle query timing
   .limit <n>                Set fact fetch limit and refresh cache
@@ -2108,13 +2147,242 @@ fn sqlite_value_to_json(value: rusqlite::types::ValueRef<'_>) -> Value {
     }
 }
 
-fn print_value(value: &Value, json_output: bool) -> Result<()> {
-    if json_output || !value.is_string() {
-        println!("{}", serde_json::to_string_pretty(value)?);
-    } else if let Some(text) = value.as_str() {
-        println!("{text}");
+fn print_value(value: &Value, output: OutputFormat) -> Result<()> {
+    match output {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(value)?),
+        OutputFormat::Yaml => print_yaml(value)?,
+        OutputFormat::Csv => {
+            if is_query_result(value) {
+                print_csv_result(value)?;
+            } else {
+                bail!("csv output is only available for tabular query results");
+            }
+        }
+        OutputFormat::Table => {
+            if is_query_result(value) {
+                print_plain_table_result(value)?;
+            } else {
+                print_human_value(value);
+            }
+        }
+        OutputFormat::Human => {
+            if is_query_result(value) {
+                print_plain_table_result(value)?;
+            } else {
+                print_human_value(value);
+            }
+        }
     }
     Ok(())
+}
+
+fn print_yaml(value: &Value) -> Result<()> {
+    print!("{}", serde_yaml::to_string(value)?);
+    Ok(())
+}
+
+fn is_query_result(value: &Value) -> bool {
+    value.get("columns").is_some_and(Value::is_array)
+        && value.get("rows").is_some_and(Value::is_array)
+}
+
+fn print_human_value(value: &Value) {
+    match value {
+        Value::Null => println!("No data."),
+        Value::String(text) => println!("{text}"),
+        Value::Bool(value) => println!("{}", if *value { "yes" } else { "no" }),
+        Value::Number(value) => println!("{value}"),
+        Value::Array(values) => print_human_array(values),
+        Value::Object(object) => print_human_object(object),
+    }
+}
+
+fn print_human_array(values: &[Value]) {
+    if values.is_empty() {
+        println!("No items.");
+        return;
+    }
+    for value in values {
+        match value {
+            Value::String(text) => println!("- {text}"),
+            Value::Number(number) => println!("- {number}"),
+            Value::Bool(value) => println!("- {}", if *value { "yes" } else { "no" }),
+            Value::Null => println!("-"),
+            other => println!("- {}", human_inline_value(other)),
+        }
+    }
+}
+
+fn print_human_object(object: &serde_json::Map<String, Value>) {
+    if let Some(saved) = object.get("saved").and_then(Value::as_str) {
+        println!("Saved {saved}");
+        return;
+    }
+    if let Some(accepted) = object.get("accepted").and_then(Value::as_u64) {
+        println!(
+            "Accepted {accepted} fact{}.",
+            if accepted == 1 { "" } else { "s" }
+        );
+        return;
+    }
+    if let Some(zones) = object.get("zones").and_then(Value::as_array) {
+        println!("Zones");
+        if zones.is_empty() {
+            println!("  none");
+        } else {
+            for zone in zones {
+                println!("  {}", human_inline_value(zone));
+            }
+        }
+        if let Some(generated_at) = object.get("generatedAt").and_then(Value::as_str) {
+            println!("Generated: {generated_at}");
+        }
+        return;
+    }
+    if object.contains_key("configPath")
+        || object.contains_key("construct")
+        || object.contains_key("apiPrefix")
+        || object.contains_key("reachable")
+    {
+        println!("Matrix");
+        print_object_field(object, "configPath", "Config");
+        print_object_field(object, "construct", "Construct");
+        print_object_field(object, "apiPrefix", "API prefix");
+        print_object_field(object, "hasToken", "Token");
+        print_object_field(object, "reachable", "Reachable");
+        return;
+    }
+    if let (Some(zone), Some(level), Some(gate)) = (
+        object.get("zone").and_then(Value::as_str),
+        object.get("level").and_then(Value::as_str),
+        object.get("gate").and_then(Value::as_object),
+    ) {
+        println!("Gate: {zone} / {level}");
+        print_object_field(gate, "status", "Status");
+        print_object_field(gate, "eligible", "Eligible");
+        print_object_field(gate, "failedFacts", "Failed facts");
+        print_object_field(gate, "totalFacts", "Total facts");
+        return;
+    }
+    for (key, value) in object {
+        println!("{}: {}", human_label(key), human_inline_value(value));
+    }
+}
+
+fn print_object_field(object: &serde_json::Map<String, Value>, key: &str, label: &str) {
+    if let Some(value) = object.get(key) {
+        println!("{label}: {}", human_inline_value(value));
+    }
+}
+
+fn human_inline_value(value: &Value) -> String {
+    match value {
+        Value::Null => "-".to_string(),
+        Value::String(value) => value.clone(),
+        Value::Bool(value) => {
+            if *value {
+                "yes".to_string()
+            } else {
+                "no".to_string()
+            }
+        }
+        Value::Number(value) => value.to_string(),
+        Value::Array(values) => format!(
+            "{} item{}",
+            values.len(),
+            if values.len() == 1 { "" } else { "s" }
+        ),
+        Value::Object(_) => value.to_string(),
+    }
+}
+
+fn human_label(key: &str) -> String {
+    let mut label = String::new();
+    for (index, character) in key.chars().enumerate() {
+        if index > 0 && character.is_ascii_uppercase() {
+            label.push(' ');
+        }
+        label.push(character);
+    }
+    let mut chars = label.chars();
+    match chars.next() {
+        Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+        None => label,
+    }
+}
+
+fn print_plain_table_result(value: &Value) -> Result<()> {
+    let columns = value["columns"].as_array().cloned().unwrap_or_default();
+    let rows = value["rows"].as_array().cloned().unwrap_or_default();
+    let column_names = columns
+        .iter()
+        .filter_map(Value::as_str)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    print_plain_table(&column_names, &rows);
+    println!("({} rows)", rows.len());
+    Ok(())
+}
+
+fn print_plain_table(column_names: &[String], rows: &[Value]) {
+    if column_names.is_empty() {
+        return;
+    }
+    let mut widths = column_names
+        .iter()
+        .map(|column| column.len())
+        .collect::<Vec<_>>();
+    let rendered_rows = rows
+        .iter()
+        .map(|row| {
+            column_names
+                .iter()
+                .enumerate()
+                .map(|(index, column)| {
+                    let cell =
+                        truncate_cell(&display_cell(row.get(column).unwrap_or(&Value::Null)));
+                    widths[index] = widths[index].max(cell.len());
+                    cell
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    print_plain_separator(&widths);
+    print_plain_row(column_names, &widths);
+    print_plain_separator(&widths);
+    for row in rendered_rows {
+        print_plain_row(&row, &widths);
+    }
+    print_plain_separator(&widths);
+}
+
+fn print_plain_separator(widths: &[usize]) {
+    print!("+");
+    for width in widths {
+        print!("{}+", "-".repeat(*width + 2));
+    }
+    println!();
+}
+
+fn print_plain_row(values: &[String], widths: &[usize]) {
+    print!("|");
+    for (value, width) in values.iter().zip(widths) {
+        print!(" {value:<width$} |");
+    }
+    println!();
+}
+
+fn truncate_cell(value: &str) -> String {
+    const MAX_CELL_WIDTH: usize = 80;
+    if value.len() <= MAX_CELL_WIDTH {
+        value.replace('\n', "\\n")
+    } else {
+        format!(
+            "{}...",
+            value.chars().take(MAX_CELL_WIDTH - 3).collect::<String>()
+        )
+        .replace('\n', "\\n")
+    }
 }
 
 fn query_string(values: Vec<(&str, String)>) -> String {

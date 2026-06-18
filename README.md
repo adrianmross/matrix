@@ -56,6 +56,7 @@ matrix gate --zone sdk-runtime --level stage
 matrix trace --zone sdk-runtime --subject my-package
 matrix upload facts.json
 matrix query 'select id, zone, status, subject_name from facts limit 20'
+matrix -o json query 'select id, zone, status from facts limit 20'
 matrix query --zone sdk-runtime 'select * from zone where type==chaincode'
 matrix completion zsh
 ```
@@ -92,9 +93,26 @@ matrix config set construct https://matrix.example.dev
 matrix doctor
 ```
 
-The plugin skill prefers `--json` for automation, uses `matrix query` for
+The plugin skill prefers `-o json` for automation, uses `matrix query` for
 read-only SQL over compatibility facts, and uses `matrix upload` or
 `matrix ingest --upload` for producer evidence.
+
+## Output
+
+Matrix defaults to human-friendly terminal output. Use `-o` / `--out` when a
+script or another tool needs a structured format:
+
+```bash
+matrix doctor
+matrix -o json doctor
+matrix -o yaml list
+matrix -o csv query 'select zone, count(*) as facts from facts group by zone'
+matrix -o table query 'select id, zone, status from facts limit 10'
+```
+
+Supported output formats are `human`, `json`, `yaml`, `table`, and `csv`.
+`csv` is available for tabular query results. `MATRIX_OUTPUT` can set the
+default output format for a shell or CI step.
 
 ## Context Queries
 
@@ -197,6 +215,7 @@ matrix> .use 1
 matrix> .zones
 matrix> .describe facts
 matrix> .mode json
+matrix> .mode yaml
 matrix> .refresh
 matrix> blue
 matrix> red
@@ -208,7 +227,7 @@ Useful commands:
 - `.status` or `/status`: show construct, cache, output mode, and timing state.
 - `.tables`, `.schema [table]`, `.describe [table]`: inspect the local query
   model.
-- `.mode table|json|csv`: change result rendering.
+- `.mode table|json|yaml|csv`: change result rendering.
 - `.x`: toggle expanded records.
 - `.timing`: toggle query timings.
 - `.limit <n>`: change the fact fetch limit and refresh the cache.
@@ -244,6 +263,7 @@ Environment overrides:
 - `MATRIX_CONSTRUCT_URL`
 - `MATRIX_API_PREFIX`
 - `MATRIX_TOKEN`
+- `MATRIX_OUTPUT`
 
 ## Releases
 
@@ -254,8 +274,8 @@ service binary version.
 Tags drive releases:
 
 ```bash
-git tag -a v0.3.3 -m "Release v0.3.3"
-git push origin v0.3.3
+git tag -a v0.3.4 -m "Release v0.3.4"
+git push origin v0.3.4
 ```
 
 The `Release` workflow builds `matrix`, `matrix-enter`, and `matrix-construct`
@@ -263,7 +283,7 @@ for Linux x64, macOS Intel, and macOS Apple Silicon, publishes tarballs, and
 uploads SHA-256 checksums to the GitHub Release.
 
 The `Tag Release` workflow is the preferred path for normal releases. Run it
-with `version=0.3.3` after bumping the Cargo package versions. It validates
+with `version=0.3.4` after bumping the Cargo package versions. It validates
 formatting, tests, clippy, version alignment, and tag uniqueness before pushing
 the annotated tag.
 
