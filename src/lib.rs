@@ -84,6 +84,8 @@ enum Commands {
     Upload(UploadArgs),
     Publish(UploadArgs),
     Ingest(IngestArgs),
+    Deref(FactQueryArgs),
+    Members(FactQueryArgs),
     Query(QueryArgs),
     Enter(ContextArgs),
     Update(UpdateCommand),
@@ -204,6 +206,15 @@ struct QueryArgs {
     context: ContextArgs,
 }
 
+#[derive(Args)]
+struct FactQueryArgs {
+    fact_id: String,
+    #[arg(long, default_value_t = 1000)]
+    max_facts: usize,
+    #[command(flatten)]
+    context: ContextArgs,
+}
+
 #[derive(Args, Clone)]
 struct UploadArgs {
     file: Option<PathBuf>,
@@ -286,6 +297,8 @@ pub async fn run_cli() -> Result<()> {
         Commands::Trace(args) => trace(&matrix, args).await?,
         Commands::Upload(args) | Commands::Publish(args) => upload(&matrix, args).await?,
         Commands::Ingest(args) => ingest(&matrix, args).await?,
+        Commands::Deref(args) => fact_view_query(&matrix, args, FactView::Deref).await?,
+        Commands::Members(args) => fact_view_query(&matrix, args, FactView::Members).await?,
         Commands::Query(args) => query(&matrix, args).await?,
         Commands::Enter(context) => dispatch_enter(&matrix, context)?,
         Commands::Update(command) => update_command(&matrix, command).await?,
@@ -891,6 +904,40 @@ async fn query(matrix: &Matrix, args: QueryArgs) -> Result<Value> {
     let sql_init = matrix.sql_init()?;
     let db = build_facts_db_with_init(&facts, &context, sql_init.as_deref())?;
     execute_readonly_sql(&db, &args.sql)
+}
+
+#[derive(Clone, Copy)]
+enum FactView {
+    Deref,
+    Members,
+}
+
+async fn fact_view_query(matrix: &Matrix, args: FactQueryArgs, view: FactView) -> Result<Value> {
+    let facts = fetch_facts(matrix, args.max_facts).await?;
+    let context = MatrixContext::detect(args.context);
+    let sql_init = matrix.sql_init()?;
+    let db = build_facts_db_with_init(&facts, &context, sql_init.as_deref())?;
+    let sql = fact_view_sql(&args.fact_id, view);
+    execute_readonly_sql(&db, &sql)
+}
+
+fn fact_view_sql(fact_id: &str, view: FactView) -> String {
+    let fact_id = sql_literal(fact_id);
+    match view {
+        FactView::Deref => format!(
+            "select edge, target, target_version, physical_chaincode, channel, network
+             from deref
+             where fact_id = {fact_id}
+             order by case edge when 'member' then 0 when 'requires' then 1 when 'provides' then 2 else 3 end,
+                      target"
+        ),
+        FactView::Members => format!(
+            "select component, version, physical_chaincode, channel, network, services
+             from members
+             where fact_id = {fact_id}
+             order by component"
+        ),
+    }
 }
 
 #[cfg(feature = "interactive")]
@@ -2931,6 +2978,41 @@ mod tests {
     }
 
     #[test]
+    fn accepts_fact_view_commands() {
+        let members = Cli::try_parse_from([
+            "matrix",
+            "members",
+            "smart-contract-tuple.vdr.0.1.0",
+            "-o",
+            "json",
+        ])
+        .unwrap();
+        assert_eq!(members.output, OutputFormat::Json);
+        match members.command {
+            Commands::Members(args) => {
+                assert_eq!(args.fact_id, "smart-contract-tuple.vdr.0.1.0");
+            }
+            _ => panic!("expected members command"),
+        }
+
+        let deref = Cli::try_parse_from([
+            "matrix",
+            "deref",
+            "smart-contract-tuple.vdr.0.1.0",
+            "--max-facts",
+            "10000",
+        ])
+        .unwrap();
+        match deref.command {
+            Commands::Deref(args) => {
+                assert_eq!(args.fact_id, "smart-contract-tuple.vdr.0.1.0");
+                assert_eq!(args.max_facts, 10000);
+            }
+            _ => panic!("expected deref command"),
+        }
+    }
+
+    #[test]
     fn renders_objects_as_field_value_tables() {
         let text = generic_table_text(&json!({
             "track": "odin",
@@ -3313,6 +3395,20 @@ mod tests {
         assert!(rows.iter().any(|row| row["edge"] == "member"));
         assert!(rows.iter().any(|row| row["edge"] == "requires"));
         assert!(rows.iter().any(|row| row["edge"] == "provides"));
+
+        let command_members = execute_readonly_sql(
+            &db,
+            &fact_view_sql("smart-contract-tuple.vdr.0.1.0", FactView::Members),
+        )
+        .unwrap();
+        assert_eq!(command_members["rows"].as_array().unwrap().len(), 1);
+
+        let command_deref = execute_readonly_sql(
+            &db,
+            &fact_view_sql("smart-contract-tuple.vdr.0.1.0", FactView::Deref),
+        )
+        .unwrap();
+        assert_eq!(command_deref["rows"].as_array().unwrap().len(), 3);
     }
 
     #[test]

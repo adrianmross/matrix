@@ -59,6 +59,8 @@ matrix upload facts.json
 matrix query 'select id, zone, status, subject_name from facts limit 20'
 matrix query 'select id, zone, status from facts limit 20' -o json
 matrix query --zone sdk-runtime 'select * from zone where type==chaincode'
+matrix members smart-contract-tuple.vdr.0.1.0
+matrix deref smart-contract-tuple.vdr.0.1.0
 matrix completion zsh
 ```
 
@@ -196,6 +198,14 @@ where eos.repo==red-wiz/eos
         limit 1
       )
   );
+```
+
+For the common case of dereferencing a single fact, use commands instead of
+writing SQL:
+
+```bash
+matrix members smart-contract-tuple.vdr.0.1.0
+matrix deref smart-contract-tuple.vdr.0.1.0
 ```
 
 Custom shortcuts can be loaded as SQLite views with `sql-init`:
