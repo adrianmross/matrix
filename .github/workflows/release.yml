@@ -1,6 +1,12 @@
 name: Release
 
 on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v0.3.3"
+        required: true
+        type: string
   push:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
@@ -38,7 +44,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
+          release_tag="${{ inputs.tag || github.ref_name }}"
+          version="${release_tag#v}"
           archive="matrix-${version}-${{ matrix.target }}"
           package_dir="dist/${archive}"
           mkdir -p "${package_dir}"
@@ -71,8 +78,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          release_tag="${{ inputs.tag || github.ref_name }}"
           {
-            echo "Matrix ${GITHUB_REF_NAME}"
+            echo "Matrix ${release_tag}"
             echo
             echo "Artifacts include:"
             echo
@@ -87,11 +95,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            gh release upload "${GITHUB_REF_NAME}" artifacts/* --clobber
+          release_tag="${{ inputs.tag || github.ref_name }}"
+          if gh release view "${release_tag}" >/dev/null 2>&1; then
+            gh release upload "${release_tag}" artifacts/* --clobber
           else
-            gh release create "${GITHUB_REF_NAME}" artifacts/* \
+            gh release create "${release_tag}" artifacts/* \
               --verify-tag \
-              --title "Matrix ${GITHUB_REF_NAME}" \
+              --title "Matrix ${release_tag}" \
               --notes-file RELEASE_NOTES.md
           fi

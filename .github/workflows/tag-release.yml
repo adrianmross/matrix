@@ -14,6 +14,7 @@ on:
         type: boolean
 
 permissions:
+  actions: write
   contents: write
 
 jobs:
@@ -65,3 +66,12 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "v${version}" -m "Release v${version}"
           git push origin "v${version}"
+      - name: Trigger release
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ inputs.version }}"
+          gh workflow run release.yml --ref main -f tag="v${version}"
