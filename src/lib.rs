@@ -1715,7 +1715,57 @@ fn create_matrix_views(db: &Connection, context: &MatrixContext, zones: &[String
            {} as sha,
            {} as ref;
          create view active as select * from facts where {active_where};
-         create view zone as select * from facts where {zone_where};",
+         create view current as select * from active;
+         create view zone as select * from facts where {zone_where};
+         create view upstream as
+           select min(r.fact_id) as current_fact_id,
+                  r.zone as current_zone,
+                  r.component as current_component,
+                  r.repo as current_repo,
+                  r.version as current_version,
+                  r.capability,
+                  r.capability_version,
+                  min(p.fact_id) as provider_fact_id,
+                  p.zone,
+                  p.type,
+                  p.component,
+                  p.repo,
+                  p.version,
+                  p.status,
+                  min(p.provides) as provides
+           from requirements r
+           join active a on a.id = r.fact_id
+           left join capabilities p
+             on p.capability = r.capability
+            and (r.capability_version is null or p.capability_version = r.capability_version)
+           group by r.zone, r.component, r.repo, r.version, r.capability, r.capability_version,
+                    p.zone, p.type, p.component, p.repo, p.version, p.status;
+         create view downstream as
+           select min(p.fact_id) as current_fact_id,
+                  p.zone as current_zone,
+                  p.component as current_component,
+                  p.repo as current_repo,
+                  p.version as current_version,
+                  p.capability,
+                  p.capability_version,
+                  min(r.fact_id) as dependent_fact_id,
+                  r.zone,
+                  r.type,
+                  r.component,
+                  r.repo,
+                  r.version,
+                  r.status,
+                  min(r.requirement) as requirement
+           from capabilities p
+           join active a on a.id = p.fact_id
+           left join requirements r
+             on r.capability = p.capability
+            and (p.capability_version is null or r.capability_version = p.capability_version)
+           group by p.zone, p.component, p.repo, p.version, p.capability, p.capability_version,
+                    r.zone, r.type, r.component, r.repo, r.version, r.status;
+         create view compatible_with_current as
+           select distinct * from downstream
+           where status in ('compatible', 'passed', 'observed', 'candidate', 'valid', 'ready');",
         sql_literal_opt(active_zone.as_deref()),
         sql_literal_opt(context.repo.as_deref()),
         sql_literal_opt(context.component.as_deref()),
@@ -1730,6 +1780,10 @@ fn create_matrix_views(db: &Connection, context: &MatrixContext, zones: &[String
             zone.as_str(),
             "zone"
                 | "active"
+                | "current"
+                | "upstream"
+                | "downstream"
+                | "compatible_with_current"
                 | "facts"
                 | "context"
                 | "subjects"
@@ -2257,9 +2311,9 @@ Matrix shell commands
 SQL
   End SQL statements with `;`.
   Available tables/views: facts, active, zone, zones, subjects, components,
-  valid_facts, invalid_facts, capabilities, requirements, members, deref, and
-  one view per SQL-safe zone such as odin. `status = valid` expands to
-  compatible statuses.
+  current, upstream, downstream, compatible_with_current, valid_facts,
+  invalid_facts, capabilities, requirements, members, deref, and one view per
+  SQL-safe zone such as odin. `status = valid` expands to compatible statuses.
 "
     );
 }
@@ -2339,12 +2393,15 @@ impl MatrixCompleter {
             "capability",
             "channel",
             "compatible",
+            "compatible_with_current",
             "component",
             "components",
             "context",
             "count",
             "csv",
+            "current",
             "deref",
+            "downstream",
             "facts",
             "fact_id",
             "from",
@@ -2378,6 +2435,7 @@ impl MatrixCompleter {
             "tag",
             "tags",
             "type",
+            "upstream",
             "use",
             "version",
             "versions",
@@ -3368,6 +3426,56 @@ mod tests {
         .unwrap();
         assert_eq!(result["rows"].as_array().unwrap().len(), 1);
         assert_eq!(result["rows"][0]["component"], "eos");
+    }
+
+    #[test]
+    fn exposes_context_aware_dependency_views() {
+        let facts = vec![
+            json!({
+                "id": "athena",
+                "track": "odin",
+                "status": "passed",
+                "subject": {"type": "npm", "name": "@red-wiz/athena", "version": "1.2.3", "repo": "red-wiz/athena"},
+                "provides": [{"capability": "native-askar", "version": "1.2.3"}]
+            }),
+            json!({
+                "id": "eos",
+                "track": "odin",
+                "status": "candidate",
+                "subject": {"type": "service", "name": "eos", "version": "2.0.0", "repo": "red-wiz/eos"},
+                "requires": [{"capability": "native-askar", "version": "1.2.3"}]
+            }),
+        ];
+
+        let eos_db = build_facts_db(
+            &facts,
+            &MatrixContext {
+                repo: Some("red-wiz/eos".to_string()),
+                ..MatrixContext::default()
+            },
+        )
+        .unwrap();
+        let upstream =
+            execute_readonly_sql(&eos_db, "select component, version from upstream").unwrap();
+        assert_eq!(upstream["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(upstream["rows"][0]["component"], "athena");
+
+        let athena_db = build_facts_db(
+            &facts,
+            &MatrixContext {
+                repo: Some("red-wiz/athena".to_string()),
+                ..MatrixContext::default()
+            },
+        )
+        .unwrap();
+        let downstream = execute_readonly_sql(
+            &athena_db,
+            "select component, version, status from compatible_with_current",
+        )
+        .unwrap();
+        assert_eq!(downstream["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(downstream["rows"][0]["component"], "eos");
+        assert_eq!(downstream["rows"][0]["status"], "candidate");
     }
 
     #[test]

@@ -137,6 +137,11 @@ shortcuts:
 - `zone`: facts for the active or inferred zone.
 - SQL-safe zone names, such as `odin`: facts for that zone.
 - `active`: facts matching the detected or overridden repo/component context.
+- `current`: alias of `active` for context-aware SQL.
+- `upstream`: capabilities required by the current context, joined to providers.
+- `downstream`: facts that require capabilities provided by the current context.
+- `compatible_with_current`: valid downstream facts compatible with the current
+  context.
 - `components`: flattened component facts.
 - `valid_facts`: raw facts whose status is compatible/passed/observed/candidate.
 - `invalid_facts`: raw facts whose status is incompatible/failed/invalid/blocked.
@@ -182,6 +187,17 @@ select *
 from deref
 where fact_id==smart-contract-tuple.vdr.0.1.0
   and edge==member;
+
+select * from current;
+
+select current_version, capability, component, version, status
+from upstream;
+
+select current_version, capability, component, version, status
+from downstream;
+
+select component, version, status
+from compatible_with_current;
 
 select eos.id, eos.component, eos.version
 from odin eos
