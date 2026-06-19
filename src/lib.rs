@@ -2187,7 +2187,7 @@ fn execute_readonly_sql(db: &Connection, sql: &str) -> Result<Value> {
 #[cfg(feature = "interactive")]
 fn print_query_result(value: &Value, mode: OutputMode, expanded: bool) -> Result<()> {
     match mode {
-        OutputMode::Json => println!("{}", serde_json::to_string_pretty(value)?),
+        OutputMode::Json => print_json(value)?,
         OutputMode::Yaml => print_yaml(value)?,
         OutputMode::Csv => print_csv_result(value)?,
         OutputMode::Table => print_table_result(value, expanded)?,
@@ -2794,7 +2794,7 @@ fn sqlite_value_to_json(value: rusqlite::types::ValueRef<'_>) -> Value {
 
 fn print_value(value: &Value, output: OutputFormat) -> Result<()> {
     match output {
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(value)?),
+        OutputFormat::Json => print_json(value)?,
         OutputFormat::Yaml => print_yaml(value)?,
         OutputFormat::Csv => {
             if is_query_result(value) {
@@ -2821,9 +2821,19 @@ fn print_value(value: &Value, output: OutputFormat) -> Result<()> {
     Ok(())
 }
 
+fn print_json(value: &Value) -> Result<()> {
+    let output = if is_query_result(value) {
+        query_rows(value)
+    } else {
+        value.clone()
+    };
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
 fn print_yaml(value: &Value) -> Result<()> {
     let output = if is_query_result(value) {
-        yaml_query_rows(value)
+        query_rows(value)
     } else {
         value.clone()
     };
@@ -2836,28 +2846,28 @@ fn is_query_result(value: &Value) -> bool {
         && value.get("rows").is_some_and(Value::is_array)
 }
 
-fn yaml_query_rows(value: &Value) -> Value {
+fn query_rows(value: &Value) -> Value {
     Value::Array(
         value["rows"]
             .as_array()
             .cloned()
             .unwrap_or_default()
             .into_iter()
-            .map(normalize_yaml_value)
+            .map(normalize_structured_value)
             .collect(),
     )
 }
 
-fn normalize_yaml_value(value: Value) -> Value {
+fn normalize_structured_value(value: Value) -> Value {
     match value {
         Value::String(text) => parse_nested_json_string(&text).unwrap_or(Value::String(text)),
         Value::Array(values) => {
-            Value::Array(values.into_iter().map(normalize_yaml_value).collect())
+            Value::Array(values.into_iter().map(normalize_structured_value).collect())
         }
         Value::Object(object) => Value::Object(
             object
                 .into_iter()
-                .map(|(key, value)| (key, normalize_yaml_value(value)))
+                .map(|(key, value)| (key, normalize_structured_value(value)))
                 .collect(),
         ),
         other => other,
@@ -3319,7 +3329,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_query_yaml_as_rows() {
+    fn renders_query_structured_outputs_as_rows() {
         let value = json!({
             "columns": ["component", "services"],
             "rows": [
@@ -3327,7 +3337,16 @@ mod tests {
                 {"component": "csr_vdr_go", "services": "[\"anoncreds\",\"csr\"]"}
             ]
         });
-        let yaml = serde_yaml::to_string(&yaml_query_rows(&value)).unwrap();
+        let rows = query_rows(&value);
+        assert_eq!(
+            rows,
+            json!([
+                {"component": "did_vdr_go", "services": ["did"]},
+                {"component": "csr_vdr_go", "services": ["anoncreds", "csr"]}
+            ])
+        );
+
+        let yaml = serde_yaml::to_string(&rows).unwrap();
         assert!(yaml.starts_with("- component: did_vdr_go"));
         assert!(yaml.contains("services:\n  - did"));
         assert!(yaml.contains("- component: csr_vdr_go"));
@@ -3335,6 +3354,13 @@ mod tests {
         assert!(!yaml.contains("columns:"));
         assert!(!yaml.contains("rows:"));
         assert!(!yaml.contains("'[\""));
+
+        let json = serde_json::to_string_pretty(&rows).unwrap();
+        assert!(json.starts_with("["));
+        assert!(json.contains("\"services\": ["));
+        assert!(!json.contains("\"columns\""));
+        assert!(!json.contains("\"rows\""));
+        assert!(!json.contains("\"[\\\""));
     }
 
     #[test]
