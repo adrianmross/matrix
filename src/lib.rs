@@ -974,6 +974,7 @@ async fn enter(matrix: &Matrix, context: ContextArgs) -> Result<Value> {
 #[cfg(feature = "interactive")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OutputMode {
+    Human,
     Table,
     Json,
     Yaml,
@@ -1016,7 +1017,8 @@ impl<'a> ReplSession<'a> {
                 OutputFormat::Json => OutputMode::Json,
                 OutputFormat::Yaml => OutputMode::Yaml,
                 OutputFormat::Csv => OutputMode::Csv,
-                OutputFormat::Human | OutputFormat::Table => OutputMode::Table,
+                OutputFormat::Human => OutputMode::Human,
+                OutputFormat::Table => OutputMode::Table,
             },
             expanded: false,
             timing: false,
@@ -1217,6 +1219,10 @@ impl<'a> ReplSession<'a> {
                 ))?;
             }
             "mode" => match parts.next() {
+                Some("human") => {
+                    self.output_mode = OutputMode::Human;
+                    eprintln!("Output mode: human");
+                }
                 Some("table") | Some("aligned") => {
                     self.output_mode = OutputMode::Table;
                     eprintln!("Output mode: table");
@@ -1234,7 +1240,7 @@ impl<'a> ReplSession<'a> {
                     eprintln!("Output mode: csv");
                 }
                 Some(other) => {
-                    eprintln!("Unknown mode {other:?}; expected table, json, yaml, or csv.")
+                    eprintln!("Unknown mode {other:?}; expected human, table, json, yaml, or csv.")
                 }
                 None => eprintln!("Output mode: {:?}", self.output_mode),
             },
@@ -2187,6 +2193,7 @@ fn execute_readonly_sql(db: &Connection, sql: &str) -> Result<Value> {
 #[cfg(feature = "interactive")]
 fn print_query_result(value: &Value, mode: OutputMode, expanded: bool) -> Result<()> {
     match mode {
+        OutputMode::Human => print_human_query_result(value)?,
         OutputMode::Json => print_json(value)?,
         OutputMode::Yaml => print_yaml(value)?,
         OutputMode::Csv => print_csv_result(value)?,
@@ -2351,7 +2358,8 @@ Matrix shell commands
   .tables                   List local tables and views
   .schema [table]           Show local SQL schema
   .describe [table]         Show columns for a table or view
-  .mode table|json|yaml|csv Change output format
+  .mode human|table|json|yaml|csv
+                            Change output format
   .x                        Toggle expanded table output
   .timing                   Toggle query timing
   .limit <n>                Set fact fetch limit and refresh cache
@@ -2814,7 +2822,7 @@ fn print_value(value: &Value, output: OutputFormat) -> Result<()> {
         }
         OutputFormat::Human => {
             if is_query_result(value) {
-                print_plain_table_result(value)?;
+                print_human_query_result(value)?;
             } else {
                 print_human_value(value);
             }
@@ -2892,6 +2900,90 @@ fn print_human_value(value: &Value) {
         Value::Number(value) => println!("{value}"),
         Value::Array(values) => print_human_array(values),
         Value::Object(object) => print_human_object(object),
+    }
+}
+
+fn print_human_query_result(value: &Value) -> Result<()> {
+    print!("{}", human_query_result_text(value));
+    Ok(())
+}
+
+fn human_query_result_text(value: &Value) -> String {
+    let columns = value["columns"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|value| value.as_str().map(ToString::to_string))
+        .collect::<Vec<_>>();
+    let rows = query_rows(value).as_array().cloned().unwrap_or_default();
+
+    if rows.is_empty() {
+        return "No rows.\n".to_string();
+    }
+
+    let mut text = format!(
+        "{} row{}\n",
+        rows.len(),
+        if rows.len() == 1 { "" } else { "s" }
+    );
+    for (index, row) in rows.iter().enumerate() {
+        let Some(object) = row.as_object() else {
+            text.push_str(&format!("- {}\n", human_inline_value(row)));
+            continue;
+        };
+        let (title, title_keys) = human_query_row_title(object, &columns, index);
+        text.push_str(&format!("- {title}\n"));
+        for column in &columns {
+            if title_keys.iter().any(|key| key == column) {
+                continue;
+            }
+            let Some(value) = object.get(column) else {
+                continue;
+            };
+            text.push_str(&format!(
+                "  {}: {}\n",
+                human_label(column),
+                human_inline_value(value)
+            ));
+        }
+    }
+    text
+}
+
+fn human_query_row_title(
+    object: &serde_json::Map<String, Value>,
+    columns: &[String],
+    index: usize,
+) -> (String, Vec<String>) {
+    if let Some(component) = object.get("component").and_then(non_empty_human_value) {
+        if let Some(version) = object.get("version").and_then(non_empty_human_value) {
+            return (
+                format!("{component} {version}"),
+                vec!["component".to_string(), "version".to_string()],
+            );
+        }
+        return (component, vec!["component".to_string()]);
+    }
+    for key in ["name", "id", "fact_id", "zone", "repo"] {
+        if let Some(value) = object.get(key).and_then(non_empty_human_value) {
+            return (value, vec![key.to_string()]);
+        }
+    }
+    for column in columns {
+        if let Some(value) = object.get(column).and_then(non_empty_human_value) {
+            return (value, vec![column.clone()]);
+        }
+    }
+    (format!("row {}", index + 1), Vec::new())
+}
+
+fn non_empty_human_value(value: &Value) -> Option<String> {
+    let rendered = human_inline_value(value);
+    if rendered.is_empty() || rendered == "-" {
+        None
+    } else {
+        Some(rendered)
     }
 }
 
@@ -2997,11 +3089,18 @@ fn count_label(count: usize, noun: &str) -> String {
 fn human_label(key: &str) -> String {
     let mut label = String::new();
     for (index, character) in key.chars().enumerate() {
-        if index > 0 && character.is_ascii_uppercase() {
+        if character == '_' || character == '-' {
+            if !label.ends_with(' ') {
+                label.push(' ');
+            }
+            continue;
+        }
+        if index > 0 && character.is_ascii_uppercase() && !label.ends_with(' ') {
             label.push(' ');
         }
         label.push(character);
     }
+    let label = label.trim().to_string();
     let mut chars = label.chars();
     match chars.next() {
         Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
@@ -3319,6 +3418,35 @@ mod tests {
         assert!(text.contains("sha256:735ce2ccadf47e3098ab3c0c6ac682ff"));
         assert!(text.contains("..."));
         assert!(!text.contains("9f93a4d5b9e72"));
+    }
+
+    #[test]
+    fn renders_query_human_output_as_records() {
+        let text = human_query_result_text(&json!({
+            "columns": ["component", "version", "physical_chaincode", "services"],
+            "rows": [
+                {
+                    "component": "did_vdr_go",
+                    "version": "0.4.9",
+                    "physical_chaincode": "did_vdr_go_v0_4_9",
+                    "services": "[\"did\"]"
+                },
+                {
+                    "component": "csr_vdr_go",
+                    "version": "0.2.7",
+                    "physical_chaincode": "csr_vdr_go_v0_2_7",
+                    "services": "[\"anoncreds\",\"csr\"]"
+                }
+            ]
+        }));
+        assert!(text.starts_with("2 rows\n"));
+        assert!(text.contains("- did_vdr_go 0.4.9\n"));
+        assert!(text.contains("  Physical chaincode: did_vdr_go_v0_4_9\n"));
+        assert!(text.contains("  Services: did\n"));
+        assert!(text.contains("- csr_vdr_go 0.2.7\n"));
+        assert!(text.contains("  Services: anoncreds, csr\n"));
+        assert!(!text.contains("+"));
+        assert!(!text.contains("[\"anoncreds\""));
     }
 
     #[test]

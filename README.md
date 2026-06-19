@@ -114,11 +114,12 @@ matrix query 'select id, zone, status from facts limit 10' -o table
 ```
 
 Supported output formats are `human`, `json`, `yaml`, `table`, and `csv`.
-For tabular query results, `json` and `yaml` emit row arrays. `table`, `human`,
-and `csv` use the result columns for rendering, with nested arrays converted to
-readable cell text. `MATRIX_OUTPUT` can set the default output format for a shell
-or CI step. `-o` / `--out` is a global option, so it works before or after
-commands; command-local placement is recommended for readability.
+For tabular query results, `human` emits compact readable records, `json` and
+`yaml` emit row arrays, and `table` / `csv` use the result columns for rendering.
+Nested arrays are converted to readable cell text in terminal-oriented formats.
+`MATRIX_OUTPUT` can set the default output format for a shell or CI step. `-o` /
+`--out` is a global option, so it works before or after commands; command-local
+placement is recommended for readability.
 
 ## Context Queries
 
