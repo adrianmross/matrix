@@ -365,8 +365,8 @@ Use `matrix update --check` for a machine-readable release check.
 Tags drive releases:
 
 ```bash
-git tag -a v0.3.6 -m "Release v0.3.6"
-git push origin v0.3.6
+git tag -a v0.3.7 -m "Release v0.3.7"
+git push origin v0.3.7
 ```
 
 The `Release` workflow builds `matrix`, `matrix-enter`, and `matrix-construct`
@@ -374,7 +374,7 @@ for Linux x64, macOS Intel, and macOS Apple Silicon, publishes tarballs, and
 uploads SHA-256 checksums to the GitHub Release.
 
 The `Tag Release` workflow is the preferred path for normal releases. Run it
-with `version=0.3.6` after bumping the Cargo package versions. It validates
+with `version=0.3.7` after bumping the Cargo package versions. It validates
 formatting, tests, clippy, version alignment, and tag uniqueness before pushing
 the annotated tag.
 
