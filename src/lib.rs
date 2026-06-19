@@ -2271,6 +2271,57 @@ fn display_cell(value: &Value) -> String {
 fn table_cell_value(value: &Value) -> String {
     match value {
         Value::Null => "".to_string(),
+        Value::String(value) => compact_json_text(value).unwrap_or_else(|| value.clone()),
+        Value::Bool(value) => {
+            if *value {
+                "yes".to_string()
+            } else {
+                "no".to_string()
+            }
+        }
+        Value::Number(value) => value.to_string(),
+        Value::Array(values) => compact_array_value(values),
+        Value::Object(object) => count_label(object.len(), "field"),
+    }
+}
+
+fn compact_json_text(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if !(trimmed.starts_with('[') || trimmed.starts_with('{')) {
+        return None;
+    }
+    let parsed = serde_json::from_str::<Value>(trimmed).ok()?;
+    Some(match parsed {
+        Value::Array(values) => compact_array_value(&values),
+        Value::Object(object) => count_label(object.len(), "field"),
+        other => table_cell_value(&other),
+    })
+}
+
+fn compact_array_value(values: &[Value]) -> String {
+    if values.is_empty() {
+        return count_label(0, "item");
+    }
+    if values.iter().all(is_scalar_value) {
+        return values
+            .iter()
+            .map(scalar_cell_value)
+            .collect::<Vec<_>>()
+            .join(", ");
+    }
+    count_label(values.len(), "item")
+}
+
+fn is_scalar_value(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Null | Value::String(_) | Value::Bool(_) | Value::Number(_)
+    )
+}
+
+fn scalar_cell_value(value: &Value) -> String {
+    match value {
+        Value::Null => "-".to_string(),
         Value::String(value) => value.clone(),
         Value::Bool(value) => {
             if *value {
@@ -2280,8 +2331,7 @@ fn table_cell_value(value: &Value) -> String {
             }
         }
         Value::Number(value) => value.to_string(),
-        Value::Array(values) => count_label(values.len(), "item"),
-        Value::Object(object) => count_label(object.len(), "field"),
+        Value::Array(_) | Value::Object(_) => table_cell_value(value),
     }
 }
 
@@ -2877,7 +2927,7 @@ fn print_object_field(object: &serde_json::Map<String, Value>, key: &str, label:
 fn human_inline_value(value: &Value) -> String {
     match value {
         Value::Null => "-".to_string(),
-        Value::String(value) => value.clone(),
+        Value::String(value) => compact_json_text(value).unwrap_or_else(|| value.clone()),
         Value::Bool(value) => {
             if *value {
                 "yes".to_string()
@@ -2886,7 +2936,7 @@ fn human_inline_value(value: &Value) -> String {
             }
         }
         Value::Number(value) => value.to_string(),
-        Value::Array(values) => count_label(values.len(), "item"),
+        Value::Array(values) => compact_array_value(values),
         Value::Object(_) => value.to_string(),
     }
 }
@@ -3028,7 +3078,7 @@ fn push_plain_row(text: &mut String, values: &[String], widths: &[usize]) {
 }
 
 fn truncate_cell(value: &str) -> String {
-    const MAX_CELL_WIDTH: usize = 80;
+    const MAX_CELL_WIDTH: usize = 56;
     if value.len() <= MAX_CELL_WIDTH {
         value.replace('\n', "\\n")
     } else {
@@ -3195,6 +3245,40 @@ mod tests {
         assert!(text.contains("| odin"));
         assert!(text.contains("| agent-admin"));
         assert!(text.contains("(2 rows)"));
+    }
+
+    #[test]
+    fn renders_nested_scalar_fields_compactly() {
+        let text = generic_table_text(&json!([
+            {
+                "component": "did_vdr_go",
+                "services": ["did"],
+                "aliases": ["did", "vdr"],
+                "digest": "sha256:735ce2ccadf47e3098ab3c0c6ac682ff0573e214a4decb1ee2f9f93a4d5b9e72"
+            },
+            {
+                "component": "csr_vdr_go",
+                "services": "[\"anoncreds\",\"csr\",\"query\",\"vc\"]",
+                "aliases": []
+            }
+        ]));
+        assert!(text.contains("| did_vdr_go"));
+        assert!(text.contains("| did"));
+        assert!(text.contains("| did, vdr"));
+        assert!(text.contains("| anoncreds, csr, query, vc"));
+        assert!(!text.contains("[\"anoncreds\""));
+        assert!(text.contains("sha256:735ce2ccadf47e3098ab3c0c6ac682ff"));
+        assert!(text.contains("..."));
+        assert!(!text.contains("9f93a4d5b9e72"));
+    }
+
+    #[test]
+    fn leaves_csv_cells_machine_stable() {
+        assert_eq!(display_cell(&json!(["did", "vdr"])), "[\"did\",\"vdr\"]");
+        assert_eq!(
+            display_cell(&json!({"requires": ["a", "b"]})),
+            "{\"requires\":[\"a\",\"b\"]}"
+        );
     }
 
     #[test]
