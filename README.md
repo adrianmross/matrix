@@ -238,12 +238,19 @@ matrix tags --repo red-wiz/putto
 matrix upstream --repo red-wiz/putto --version v0.6.3
 matrix downstream --repo red-wiz/athena --version v1.2.0
 matrix compatible --repo red-wiz/putto --version v0.6.3
+matrix compare red-wiz/eos --repo red-wiz/putto --version v0.6.3
+matrix why eos --repo red-wiz/putto --version v0.6.3
 ```
 
 By default, component and version browsing hides repo-level `application` SBOM
 subjects and dependency-only subjects such as `@credo-ts/core`. Use `--all`,
 `--type`, `--include-applications`, or `--include-dependencies` when you need
 the full evidence inventory.
+
+`compare` and `why` compare the current context to a target component, subject,
+or repo. They report both directions: facts where the current context requires
+the target, and facts where the target requires something provided by the
+current context. Use `--target-version` to pin the target side.
 
 Custom shortcuts can be loaded as SQLite view packs:
 
@@ -305,6 +312,8 @@ matrix> .views
 matrix> .examples
 matrix> .members smart-contract-tuple.vdr.0.1.0
 matrix> .deref smart-contract-tuple.vdr.0.1.0
+matrix> .compare eos
+matrix> .why red-wiz/eos --target-version 0.19.2
 matrix> .mode json
 matrix> .mode yaml
 matrix> .refresh
@@ -321,6 +330,8 @@ Useful commands:
 - `.examples`: print copyable SQL and helper-command examples.
 - `.members <fact-id>`: show tuple members for a fact.
 - `.deref <fact-id>`: show member, requirement, and provide edges for a fact.
+- `.compare <target>` or `.why <target>`: compare the active context to a
+  target component, subject, or repo.
 - `.mode human|table|json|yaml|csv`: change result rendering.
 - `.x`: toggle expanded records.
 - `.timing`: toggle query timings.

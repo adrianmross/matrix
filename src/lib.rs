@@ -92,6 +92,8 @@ enum Commands {
     Upstream(ListQueryArgs),
     Downstream(ListQueryArgs),
     Compatible(ListQueryArgs),
+    Compare(CompareArgs),
+    Why(CompareArgs),
     Query(QueryArgs),
     Enter(ContextArgs),
     Update(UpdateCommand),
@@ -260,6 +262,19 @@ struct VersionQueryArgs {
 }
 
 #[derive(Args, Clone)]
+struct CompareArgs {
+    target: String,
+    #[arg(long)]
+    target_version: Option<String>,
+    #[arg(long, default_value_t = 1000)]
+    max_facts: usize,
+    #[arg(long, default_value_t = 50)]
+    limit: usize,
+    #[command(flatten)]
+    context: ContextArgs,
+}
+
+#[derive(Args, Clone)]
 struct UploadArgs {
     file: Option<PathBuf>,
     #[arg(long)]
@@ -357,6 +372,7 @@ pub async fn run_cli() -> Result<()> {
         Commands::Compatible(args) => {
             context_view_query(&matrix, args, ContextView::Compatible).await?
         }
+        Commands::Compare(args) | Commands::Why(args) => compare_query(&matrix, args).await?,
         Commands::Query(args) => query(&matrix, args).await?,
         Commands::Enter(context) => dispatch_enter(&matrix, context)?,
         Commands::Update(command) => update_command(&matrix, command).await?,
@@ -1080,6 +1096,13 @@ async fn context_view_query(
     execute_readonly_sql(&db, &sql)
 }
 
+async fn compare_query(matrix: &Matrix, args: CompareArgs) -> Result<Value> {
+    let context = MatrixContext::detect(args.context);
+    let db = query_db(matrix, args.max_facts, &context).await?;
+    let sql = compare_query_sql(&args.target, args.target_version.as_deref(), args.limit);
+    execute_readonly_sql(&db, &sql)
+}
+
 async fn query_db(
     matrix: &Matrix,
     max_facts: usize,
@@ -1219,6 +1242,33 @@ fn parse_component_query_options(args: Vec<&str>) -> Result<(ComponentQueryOptio
     Ok((options, rest))
 }
 
+#[cfg(feature = "interactive")]
+fn parse_compare_repl_args(args: Vec<&str>) -> Result<(String, Option<String>)> {
+    let mut target = Vec::new();
+    let mut target_version = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index] {
+            "--target-version" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    bail!("--target-version requires a value");
+                };
+                target_version = Some((*value).to_string());
+            }
+            value if value.starts_with("--target-version=") => {
+                target_version = Some(value.trim_start_matches("--target-version=").to_string());
+            }
+            value => target.push(value.to_string()),
+        }
+        index += 1;
+    }
+    if target.is_empty() {
+        bail!("usage: .compare <component|repo|subject> [--target-version <version>]");
+    }
+    Ok((target.join(" "), target_version))
+}
+
 fn tags_query_sql(db: &Connection, context: &MatrixContext, limit: usize) -> String {
     format!(
         "select row_number() over (order by max(observed_at) desc, tag desc) as pick,
@@ -1258,6 +1308,43 @@ fn context_view_sql(view: ContextView, limit: usize) -> String {
              limit {limit}"
         ),
     }
+}
+
+fn compare_query_sql(target: &str, target_version: Option<&str>, limit: usize) -> String {
+    let limit = limit.max(1);
+    let upstream_target = target_match_sql("u", target, target_version);
+    let downstream_target = target_match_sql("d", target, target_version);
+    format!(
+        "select 'current_requires_target' as relationship,
+                current_component, current_version,
+                component as target_component, version as target_version,
+                subject_name as target_subject, repo as target_repo, zone as target_zone, status,
+                capability, capability_version
+         from upstream u
+         where {upstream_target}
+         union all
+         select 'target_requires_current' as relationship,
+                current_component, current_version,
+                component as target_component, version as target_version,
+                subject_name as target_subject, repo as target_repo, zone as target_zone, status,
+                capability, capability_version
+         from downstream d
+         where {downstream_target}
+         order by relationship, capability, target_component, target_version
+         limit {limit}"
+    )
+}
+
+fn target_match_sql(alias: &str, target: &str, target_version: Option<&str>) -> String {
+    let exact = sql_literal(target);
+    let key = sql_literal(&component_key(target));
+    let mut clauses = vec![format!(
+        "({alias}.component = {key} or {alias}.subject_name = {exact} or {alias}.repo = {exact})"
+    )];
+    if let Some(version) = target_version {
+        clauses.push(format!("{alias}.version = {}", sql_literal(version)));
+    }
+    clauses.join(" and ")
 }
 
 fn context_filter_sql(
@@ -1544,6 +1631,15 @@ impl<'a> ReplSession<'a> {
                     eprintln!("Usage: .members <fact-id>");
                 } else {
                     self.run_sql(&fact_view_sql(&fact_id, FactView::Members))?;
+                }
+            }
+            "compare" | "why" => {
+                let args = parts.collect::<Vec<_>>();
+                if args.is_empty() {
+                    eprintln!("Usage: .{name} <component|repo|subject> [--target-version <version>]");
+                } else {
+                    let (target, target_version) = parse_compare_repl_args(args)?;
+                    self.run_sql(&compare_query_sql(&target, target_version.as_deref(), 50))?;
                 }
             }
             "examples" => print_repl_examples(),
@@ -1992,13 +2088,13 @@ fn create_matrix_views(db: &Connection, context: &MatrixContext, zones: &[String
           select * from facts
           where status in ('incompatible', 'failed', 'invalid', 'blocked');
         create view requirements as
-          select f.id as fact_id, f.zone, f.type, f.component, f.repo, f.version, f.status,
+          select f.id as fact_id, f.zone, f.type, f.component, f.subject_name, f.repo, f.version, f.status,
                  json_extract(item.value, '$.capability') as capability,
                  json_extract(item.value, '$.version') as capability_version,
                  item.value as requirement
           from facts f, json_each(coalesce(f.requires, '[]')) item;
         create view capabilities as
-          select f.id as fact_id, f.zone, f.type, f.component, f.repo, f.version, f.status,
+          select f.id as fact_id, f.zone, f.type, f.component, f.subject_name, f.repo, f.version, f.status,
                  json_extract(item.value, '$.capability') as capability,
                  json_extract(item.value, '$.version') as capability_version,
                  item.value as provides
@@ -2078,6 +2174,7 @@ fn create_matrix_views(db: &Connection, context: &MatrixContext, zones: &[String
                   p.zone,
                   p.type,
                   p.component,
+                  p.subject_name,
                   p.repo,
                   p.version,
                   p.status,
@@ -2088,7 +2185,7 @@ fn create_matrix_views(db: &Connection, context: &MatrixContext, zones: &[String
              on p.capability = r.capability
             and (r.capability_version is null or p.capability_version = r.capability_version)
            group by r.zone, r.component, r.repo, r.version, r.capability, r.capability_version,
-                    p.zone, p.type, p.component, p.repo, p.version, p.status;
+                    p.zone, p.type, p.component, p.subject_name, p.repo, p.version, p.status;
          create view downstream as
            select min(p.fact_id) as current_fact_id,
                   p.zone as current_zone,
@@ -2101,6 +2198,7 @@ fn create_matrix_views(db: &Connection, context: &MatrixContext, zones: &[String
                   r.zone,
                   r.type,
                   r.component,
+                  r.subject_name,
                   r.repo,
                   r.version,
                   r.status,
@@ -2111,7 +2209,7 @@ fn create_matrix_views(db: &Connection, context: &MatrixContext, zones: &[String
              on r.capability = p.capability
             and (p.capability_version is null or r.capability_version = p.capability_version)
            group by p.zone, p.component, p.repo, p.version, p.capability, p.capability_version,
-                    r.zone, r.type, r.component, r.repo, r.version, r.status;
+                    r.zone, r.type, r.component, r.subject_name, r.repo, r.version, r.status;
          create view compatible_with_current as
            select distinct * from downstream
            where status in ('compatible', 'passed', 'observed', 'candidate', 'valid', 'ready');",
@@ -2707,6 +2805,8 @@ Matrix shell commands
   .views                    List local tables and views
   .deref <fact-id>          Show member/require/provide edges for a fact
   .members <fact-id>        Show tuple members for a fact
+  .compare <target>         Compare active context to a component/repo/subject
+  .why <target>             Alias for .compare
   .examples                 Show copyable query examples
   .explain <sql>            Run EXPLAIN QUERY PLAN
   red, red-pill, .exit      Exit
@@ -2747,6 +2847,8 @@ where fact_id==smart-contract-tuple.vdr.0.1.0;
 
 .members smart-contract-tuple.vdr.0.1.0
 .deref smart-contract-tuple.vdr.0.1.0
+.compare eos
+.why red-wiz/eos --target-version 0.19.2
 "#
     );
 }
@@ -2808,6 +2910,7 @@ impl MatrixCompleter {
             ".status",
             ".component",
             ".components",
+            ".compare",
             ".context",
             ".repo",
             ".subjects",
@@ -2820,6 +2923,7 @@ impl MatrixCompleter {
             ".version",
             ".versions",
             ".views",
+            ".why",
             ".zone",
             ".zones",
             "/help",
@@ -2833,6 +2937,7 @@ impl MatrixCompleter {
             "compatible_with_current",
             "component",
             "components",
+            "compare",
             "context",
             "count",
             "csv",
@@ -2877,6 +2982,7 @@ impl MatrixCompleter {
             "version",
             "versions",
             "where",
+            "why",
             "with",
             "zone",
             "zones",
@@ -3246,7 +3352,7 @@ fn human_query_result_text(value: &Value) -> String {
     let rows = query_rows(value).as_array().cloned().unwrap_or_default();
 
     if rows.is_empty() {
-        return "No rows.\n".to_string();
+        return "No rows.\nTry `matrix components`, `matrix versions`, or `matrix query 'select * from context'` to inspect the active context.\n".to_string();
     }
 
     let mut text = format!(
@@ -3735,6 +3841,28 @@ mod tests {
             }
             _ => panic!("expected components command"),
         }
+
+        let compare = Cli::try_parse_from([
+            "matrix",
+            "compare",
+            "red-wiz/eos",
+            "--repo",
+            "red-wiz/putto",
+            "--version",
+            "v0.6.3",
+            "--target-version",
+            "0.19.2",
+        ])
+        .unwrap();
+        match compare.command {
+            Commands::Compare(args) => {
+                assert_eq!(args.target, "red-wiz/eos");
+                assert_eq!(args.context.repo.as_deref(), Some("red-wiz/putto"));
+                assert_eq!(args.context.version.as_deref(), Some("v0.6.3"));
+                assert_eq!(args.target_version.as_deref(), Some("0.19.2"));
+            }
+            _ => panic!("expected compare command"),
+        }
     }
 
     #[test]
@@ -4092,6 +4220,24 @@ mod tests {
         let compatible =
             execute_readonly_sql(&db, &context_view_sql(ContextView::Compatible, 10)).unwrap();
         assert_eq!(compatible["rows"][0]["component"], "eos");
+
+        let compare_eos =
+            execute_readonly_sql(&db, &compare_query_sql("red-wiz/eos", None, 10)).unwrap();
+        assert_eq!(
+            compare_eos["rows"][0]["relationship"],
+            "target_requires_current"
+        );
+        assert_eq!(compare_eos["rows"][0]["target_component"], "eos");
+        assert_eq!(compare_eos["rows"][0]["capability"], "cap.putto");
+
+        let compare_athena =
+            execute_readonly_sql(&db, &compare_query_sql("athena", Some("v1.2.0"), 10)).unwrap();
+        assert_eq!(
+            compare_athena["rows"][0]["relationship"],
+            "current_requires_target"
+        );
+        assert_eq!(compare_athena["rows"][0]["target_subject"], "athena");
+        assert_eq!(compare_athena["rows"][0]["capability"], "cap.athena");
     }
 
     #[test]
