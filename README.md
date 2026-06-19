@@ -232,11 +232,18 @@ view names:
 ```bash
 matrix components --zone odin
 matrix versions putto --repo red-wiz/putto
+matrix components --repo red-wiz/putto --all
+matrix components --repo red-wiz/troy --type npm-dependency
 matrix tags --repo red-wiz/putto
 matrix upstream --repo red-wiz/putto --version v0.6.3
 matrix downstream --repo red-wiz/athena --version v1.2.0
 matrix compatible --repo red-wiz/putto --version v0.6.3
 ```
+
+By default, component and version browsing hides repo-level `application` SBOM
+subjects and dependency-only subjects such as `@credo-ts/core`. Use `--all`,
+`--type`, `--include-applications`, or `--include-dependencies` when you need
+the full evidence inventory.
 
 Custom shortcuts can be loaded as SQLite view packs:
 
@@ -328,7 +335,8 @@ Useful commands:
 - `.zone`, `.repo`, `.component`, `.version`, `.tag`, `.sha`, `.ref`: shortcut
   setters for context fields.
 - `.components`, `.versions [component]`, `.tags`: list selectable context
-  values.
+  values. `.components` and `.versions` accept `--all`, `--type <type>`,
+  `--include-applications`, and `--include-dependencies`.
 - `.use <pick>`: focus the numbered value from the last `.components`,
   `.versions`, or `.tags` output.
 - `.zones`, `.subjects`, `.trace <subject>`: Matrix-native inspection helpers.

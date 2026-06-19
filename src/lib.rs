@@ -227,6 +227,14 @@ struct ListQueryArgs {
     max_facts: usize,
     #[arg(long, default_value_t = 50)]
     limit: usize,
+    #[arg(long)]
+    all: bool,
+    #[arg(long = "type")]
+    type_filter: Option<String>,
+    #[arg(long)]
+    include_applications: bool,
+    #[arg(long)]
+    include_dependencies: bool,
     #[command(flatten)]
     context: ContextArgs,
 }
@@ -239,6 +247,14 @@ struct VersionQueryArgs {
     max_facts: usize,
     #[arg(long, default_value_t = 50)]
     limit: usize,
+    #[arg(long)]
+    all: bool,
+    #[arg(long = "type")]
+    type_filter: Option<String>,
+    #[arg(long)]
+    include_applications: bool,
+    #[arg(long)]
+    include_dependencies: bool,
     #[command(flatten)]
     context: ContextArgs,
 }
@@ -1025,16 +1041,24 @@ enum ContextView {
 }
 
 async fn list_components_query(matrix: &Matrix, args: ListQueryArgs) -> Result<Value> {
+    let options = args.component_options();
     let context = MatrixContext::detect_browsing(args.context);
     let db = query_db(matrix, args.max_facts, &context).await?;
-    let sql = components_query_sql(&db, &context, args.limit);
+    let sql = components_query_sql(&db, &context, options, args.limit);
     execute_readonly_sql(&db, &sql)
 }
 
 async fn list_versions_query(matrix: &Matrix, args: VersionQueryArgs) -> Result<Value> {
+    let options = args.component_options();
     let context = MatrixContext::detect_browsing(args.context);
     let db = query_db(matrix, args.max_facts, &context).await?;
-    let sql = versions_query_sql(&db, &context, args.component_filter.as_deref(), args.limit);
+    let sql = versions_query_sql(
+        &db,
+        &context,
+        args.component_filter.as_deref(),
+        options,
+        args.limit,
+    );
     execute_readonly_sql(&db, &sql)
 }
 
@@ -1066,16 +1090,52 @@ async fn query_db(
     build_facts_db_with_init(&facts, context, sql_init.as_deref())
 }
 
-fn components_query_sql(db: &Connection, context: &MatrixContext, limit: usize) -> String {
+#[derive(Clone, Debug, Default)]
+struct ComponentQueryOptions {
+    all: bool,
+    type_filter: Option<String>,
+    include_applications: bool,
+    include_dependencies: bool,
+}
+
+impl ListQueryArgs {
+    fn component_options(&self) -> ComponentQueryOptions {
+        ComponentQueryOptions {
+            all: self.all,
+            type_filter: self.type_filter.clone(),
+            include_applications: self.include_applications,
+            include_dependencies: self.include_dependencies,
+        }
+    }
+}
+
+impl VersionQueryArgs {
+    fn component_options(&self) -> ComponentQueryOptions {
+        ComponentQueryOptions {
+            all: self.all,
+            type_filter: self.type_filter.clone(),
+            include_applications: self.include_applications,
+            include_dependencies: self.include_dependencies,
+        }
+    }
+}
+
+fn components_query_sql(
+    db: &Connection,
+    context: &MatrixContext,
+    options: ComponentQueryOptions,
+    limit: usize,
+) -> String {
     format!(
-        "select row_number() over (order by max(observed_at) desc, component asc) as pick,
-                component, repo, zone, count(*) as facts, max(observed_at) as last_observed_at
+        "select row_number() over (order by max(observed_at) desc, component asc, subject_name asc) as pick,
+                component, subject_name, type, repo, zone, count(*) as facts, max(observed_at) as last_observed_at
          from components
-         where component is not null and component != '' {}
-         group by component, repo, zone
-         order by last_observed_at desc, component asc
+         where component is not null and component != '' {} {}
+         group by component, subject_name, type, repo, zone
+         order by last_observed_at desc, component asc, subject_name asc
          limit {}",
         context_filter_sql(db, context, "components", &["repo", "zone"]),
+        component_subject_filter_sql(&options),
         limit.max(1)
     )
 }
@@ -1084,6 +1144,7 @@ fn versions_query_sql(
     db: &Connection,
     context: &MatrixContext,
     component_override: Option<&str>,
+    options: ComponentQueryOptions,
     limit: usize,
 ) -> String {
     let component_filter = component_override
@@ -1097,16 +1158,65 @@ fn versions_query_sql(
         .unwrap_or_default();
     format!(
         "select row_number() over (order by max(observed_at) desc, version desc) as pick,
-                version, component, repo, zone, status, count(*) as facts, max(observed_at) as last_observed_at
+                version, component, subject_name, type, repo, zone, status, count(*) as facts, max(observed_at) as last_observed_at
          from components
-         where version is not null and component is not null and component != '' {} {}
-         group by version, component, repo, zone, status
+         where version is not null and component is not null and component != '' {} {} {}
+         group by version, component, subject_name, type, repo, zone, status
          order by last_observed_at desc, version desc
          limit {}",
         context_filter_sql(db, context, "components", &["repo", "zone", "component"]),
         component_filter,
+        component_subject_filter_sql(&options),
         limit.max(1)
     )
+}
+
+fn component_subject_filter_sql(options: &ComponentQueryOptions) -> String {
+    if let Some(subject_type) = options.type_filter.as_deref() {
+        return format!(" and type = {}", sql_literal(subject_type));
+    }
+    if options.all {
+        return String::new();
+    }
+    let mut filters = Vec::new();
+    if !options.include_applications {
+        filters.push("(type is null or type != 'application')".to_string());
+    }
+    if !options.include_dependencies {
+        filters.push("(type is null or lower(type) not like '%dependency%')".to_string());
+    }
+    if filters.is_empty() {
+        String::new()
+    } else {
+        format!(" and {}", filters.join(" and "))
+    }
+}
+
+#[cfg(feature = "interactive")]
+fn parse_component_query_options(args: Vec<&str>) -> Result<(ComponentQueryOptions, Vec<String>)> {
+    let mut options = ComponentQueryOptions::default();
+    let mut rest = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index] {
+            "--all" => options.all = true,
+            "--include-applications" | "--applications" => options.include_applications = true,
+            "--include-dependencies" | "--dependencies" => options.include_dependencies = true,
+            "--type" | "-t" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    bail!("--type requires a value");
+                };
+                options.type_filter = Some((*value).to_string());
+            }
+            value if value.starts_with("--type=") => {
+                options.type_filter = Some(value.trim_start_matches("--type=").to_string());
+            }
+            value => rest.push(value.to_string()),
+        }
+        index += 1;
+    }
+    Ok((options, rest))
 }
 
 fn tags_query_sql(db: &Connection, context: &MatrixContext, limit: usize) -> String {
@@ -1401,8 +1511,8 @@ impl<'a> ReplSession<'a> {
             "zone" | "repo" | "component" | "version" | "tag" | "sha" | "ref" => {
                 self.set_context_field(name, &parts.collect::<Vec<_>>().join(" "))?;
             }
-            "components" => self.list_components()?,
-            "versions" => self.list_versions(parts.collect::<Vec<_>>().join(" "))?,
+            "components" => self.list_components(parts.collect::<Vec<_>>())?,
+            "versions" => self.list_versions(parts.collect::<Vec<_>>())?,
             "tags" => self.list_tags()?,
             "use" => self.use_context_choice(parts.collect::<Vec<_>>())?,
             "status" => self.print_status()?,
@@ -1635,38 +1745,26 @@ impl<'a> ReplSession<'a> {
         self.rebuild_context()
     }
 
-    fn list_components(&mut self) -> Result<()> {
-        let sql = format!(
-            "select row_number() over (order by max(observed_at) desc, component asc) as pick,
-                    component, repo, zone, count(*) as facts, max(observed_at) as last_observed_at
-             from components
-             where component is not null {}
-             group by component, repo, zone
-             order by last_observed_at desc, component asc
-             limit 50",
-            self.context_filter_sql("components", &["repo", "zone"])
-        );
+    fn list_components(&mut self, args: Vec<&str>) -> Result<()> {
+        let (options, rest) = parse_component_query_options(args)?;
+        if !rest.is_empty() {
+            bail!(
+                "usage: .components [--all] [--type <type>] [--include-applications] [--include-dependencies]"
+            );
+        }
+        let sql = components_query_sql(&self.db, &self.context, options, 50);
         self.run_choice_sql("component", "component", &sql)
     }
 
-    fn list_versions(&mut self, component_override: String) -> Result<()> {
-        let component_filter = if component_override.trim().is_empty() {
-            String::new()
-        } else {
-            let component = sql_literal(&component_key(component_override.trim()));
-            let exact = sql_literal(component_override.trim());
-            format!(" and (component = {component} or component = {exact})")
-        };
-        let sql = format!(
-            "select row_number() over (order by max(observed_at) desc, version desc) as pick,
-                    version, component, repo, zone, status, count(*) as facts, max(observed_at) as last_observed_at
-             from components
-             where version is not null {} {}
-             group by version, component, repo, zone, status
-             order by last_observed_at desc, version desc
-             limit 50",
-            self.context_filter_sql("components", &["repo", "zone", "component"]),
-            component_filter
+    fn list_versions(&mut self, args: Vec<&str>) -> Result<()> {
+        let (options, rest) = parse_component_query_options(args)?;
+        let component_override = (!rest.is_empty()).then(|| rest.join(" "));
+        let sql = versions_query_sql(
+            &self.db,
+            &self.context,
+            component_override.as_deref(),
+            options,
+            50,
         );
         self.run_choice_sql("version", "version", &sql)
     }
@@ -1878,7 +1976,7 @@ fn create_matrix_views(db: &Connection, context: &MatrixContext, zones: &[String
           where component is not null
           group by type, component, repo;
         create view components as
-          select zone, type, component, repo, version, status,
+          select zone, type, component, subject_name, repo, version, status,
                  case
                    when status in ('compatible', 'passed', 'observed', 'candidate', 'valid', 'ready') then 'valid'
                    when status in ('incompatible', 'failed', 'invalid', 'blocked') then 'invalid'
@@ -2597,8 +2695,9 @@ Matrix shell commands
   .context auto             Reset to detected git repo, tag, ref, and sha
   .zone/.repo/.component    Shortcut setters for common context fields
   .version/.tag/.sha/.ref   Shortcut setters for version and source context
-  .components               List components in the current context
-  .versions [component]     List versions and remember picks for `.use`
+  .components [filters]     List primary components in the current context
+  .versions [filters] [component]
+                            List primary versions and remember picks for `.use`
   .tags                     List tags/refs and remember picks for `.use`
   .use <pick>               Focus a picked component, version, or tag
   .zones                    Summarize facts by zone
@@ -2619,6 +2718,8 @@ SQL
   current, upstream, downstream, compatible_with_current, valid_facts,
   invalid_facts, capabilities, requirements, members, deref, and one view per
   SQL-safe zone such as odin. `status = valid` expands to compatible statuses.
+  Component filters: --all, --type <type>, --include-applications,
+  --include-dependencies.
 "
     );
 }
@@ -3616,6 +3717,24 @@ mod tests {
             }
             _ => panic!("expected versions command"),
         }
+
+        let dependencies = Cli::try_parse_from([
+            "matrix",
+            "components",
+            "--repo",
+            "red-wiz/troy",
+            "--include-dependencies",
+            "--type",
+            "npm-dependency",
+        ])
+        .unwrap();
+        match dependencies.command {
+            Commands::Components(args) => {
+                assert!(args.include_dependencies);
+                assert_eq!(args.type_filter.as_deref(), Some("npm-dependency"));
+            }
+            _ => panic!("expected components command"),
+        }
     }
 
     #[test]
@@ -3945,14 +4064,25 @@ mod tests {
         });
         let db = build_facts_db_with_init(&facts, &context, None).unwrap();
 
-        let components =
-            execute_readonly_sql(&db, &components_query_sql(&db, &context, 10)).unwrap();
+        let components = execute_readonly_sql(
+            &db,
+            &components_query_sql(&db, &context, ComponentQueryOptions::default(), 10),
+        )
+        .unwrap();
         assert_eq!(components["rows"].as_array().unwrap().len(), 1);
         assert_eq!(components["rows"][0]["component"], "putto");
 
-        let versions =
-            execute_readonly_sql(&db, &versions_query_sql(&db, &context, Some("putto"), 10))
-                .unwrap();
+        let versions = execute_readonly_sql(
+            &db,
+            &versions_query_sql(
+                &db,
+                &context,
+                Some("putto"),
+                ComponentQueryOptions::default(),
+                10,
+            ),
+        )
+        .unwrap();
         assert_eq!(versions["rows"][0]["version"], "v0.6.3");
 
         let upstream =
@@ -3962,6 +4092,71 @@ mod tests {
         let compatible =
             execute_readonly_sql(&db, &context_view_sql(ContextView::Compatible, 10)).unwrap();
         assert_eq!(compatible["rows"][0]["component"], "eos");
+    }
+
+    #[test]
+    fn filters_dependency_subjects_from_default_component_views() {
+        let facts = vec![json!({
+            "id": "dep-core",
+            "zone": "odin",
+            "status": "observed",
+            "subject": {
+                "type": "npm-dependency",
+                "name": "@credo-ts/core",
+                "version": "0.6.3",
+                "repo": "red-wiz/troy"
+            },
+            "observedAt": "2026-06-18T00:00:00Z"
+        })];
+        let context = MatrixContext::detect(ContextArgs {
+            repo: Some("red-wiz/troy".to_string()),
+            ..ContextArgs::default()
+        });
+        let db = build_facts_db_with_init(&facts, &context, None).unwrap();
+
+        let default_components = execute_readonly_sql(
+            &db,
+            &components_query_sql(&db, &context, ComponentQueryOptions::default(), 10),
+        )
+        .unwrap();
+        assert!(default_components["rows"].as_array().unwrap().is_empty());
+
+        let dependency_components = execute_readonly_sql(
+            &db,
+            &components_query_sql(
+                &db,
+                &context,
+                ComponentQueryOptions {
+                    include_dependencies: true,
+                    ..ComponentQueryOptions::default()
+                },
+                10,
+            ),
+        )
+        .unwrap();
+        assert_eq!(dependency_components["rows"][0]["component"], "core");
+        assert_eq!(
+            dependency_components["rows"][0]["subject_name"],
+            "@credo-ts/core"
+        );
+
+        let typed_components = execute_readonly_sql(
+            &db,
+            &components_query_sql(
+                &db,
+                &context,
+                ComponentQueryOptions {
+                    type_filter: Some("npm-dependency".to_string()),
+                    ..ComponentQueryOptions::default()
+                },
+                10,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            typed_components["rows"][0]["subject_name"],
+            "@credo-ts/core"
+        );
     }
 
     #[test]
