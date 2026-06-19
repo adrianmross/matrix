@@ -2286,11 +2286,7 @@ fn table_cell_value(value: &Value) -> String {
 }
 
 fn compact_json_text(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    if !(trimmed.starts_with('[') || trimmed.starts_with('{')) {
-        return None;
-    }
-    let parsed = serde_json::from_str::<Value>(trimmed).ok()?;
+    let parsed = parse_nested_json_string(value)?;
     Some(match parsed {
         Value::Array(values) => compact_array_value(&values),
         Value::Object(object) => count_label(object.len(), "field"),
@@ -2826,13 +2822,54 @@ fn print_value(value: &Value, output: OutputFormat) -> Result<()> {
 }
 
 fn print_yaml(value: &Value) -> Result<()> {
-    print!("{}", serde_yaml::to_string(value)?);
+    let output = if is_query_result(value) {
+        yaml_query_rows(value)
+    } else {
+        value.clone()
+    };
+    print!("{}", serde_yaml::to_string(&output)?);
     Ok(())
 }
 
 fn is_query_result(value: &Value) -> bool {
     value.get("columns").is_some_and(Value::is_array)
         && value.get("rows").is_some_and(Value::is_array)
+}
+
+fn yaml_query_rows(value: &Value) -> Value {
+    Value::Array(
+        value["rows"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(normalize_yaml_value)
+            .collect(),
+    )
+}
+
+fn normalize_yaml_value(value: Value) -> Value {
+    match value {
+        Value::String(text) => parse_nested_json_string(&text).unwrap_or(Value::String(text)),
+        Value::Array(values) => {
+            Value::Array(values.into_iter().map(normalize_yaml_value).collect())
+        }
+        Value::Object(object) => Value::Object(
+            object
+                .into_iter()
+                .map(|(key, value)| (key, normalize_yaml_value(value)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+fn parse_nested_json_string(text: &str) -> Option<Value> {
+    let trimmed = text.trim();
+    if !(trimmed.starts_with('[') || trimmed.starts_with('{')) {
+        return None;
+    }
+    serde_json::from_str::<Value>(trimmed).ok()
 }
 
 fn print_human_value(value: &Value) {
@@ -3279,6 +3316,25 @@ mod tests {
             display_cell(&json!({"requires": ["a", "b"]})),
             "{\"requires\":[\"a\",\"b\"]}"
         );
+    }
+
+    #[test]
+    fn renders_query_yaml_as_rows() {
+        let value = json!({
+            "columns": ["component", "services"],
+            "rows": [
+                {"component": "did_vdr_go", "services": "[\"did\"]"},
+                {"component": "csr_vdr_go", "services": "[\"anoncreds\",\"csr\"]"}
+            ]
+        });
+        let yaml = serde_yaml::to_string(&yaml_query_rows(&value)).unwrap();
+        assert!(yaml.starts_with("- component: did_vdr_go"));
+        assert!(yaml.contains("services:\n  - did"));
+        assert!(yaml.contains("- component: csr_vdr_go"));
+        assert!(yaml.contains("  - anoncreds\n  - csr"));
+        assert!(!yaml.contains("columns:"));
+        assert!(!yaml.contains("rows:"));
+        assert!(!yaml.contains("'[\""));
     }
 
     #[test]
