@@ -1150,15 +1150,16 @@ fn components_query_sql(
     limit: usize,
 ) -> String {
     format!(
-        "select row_number() over (order by max(observed_at) desc, component asc, subject_name asc) as pick,
-                component, subject_name, type, repo, zone, count(*) as facts, max(observed_at) as last_observed_at
+        "select row_number() over (order by max(observed_at) desc, canonical_component asc, subject_name asc) as pick,
+                component, canonical_component, subject_name, identity, subject_class,
+                type, repo, zone, count(*) as facts, max(observed_at) as last_observed_at
          from components
          where component is not null and component != '' {} {}
-         group by component, subject_name, type, repo, zone
-         order by last_observed_at desc, component asc, subject_name asc
+         group by component, canonical_component, subject_name, identity, subject_class, type, repo, zone
+         order by last_observed_at desc, canonical_component asc, subject_name asc
          limit {}",
         context_filter_sql(db, context, "components", &["repo", "zone"]),
-        component_subject_filter_sql(&options),
+        component_subject_filter_sql(&options, context.component.is_some()),
         limit.max(1)
     )
 }
@@ -1173,28 +1174,28 @@ fn versions_query_sql(
     let component_filter = component_override
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(|value| {
-            let component = sql_literal(&component_key(value));
-            let exact = sql_literal(value);
-            format!(" and (component = {component} or component = {exact})")
-        })
+        .map(|value| format!(" and {}", identity_match_sql(Some("components"), value)))
         .unwrap_or_default();
     format!(
         "select row_number() over (order by max(observed_at) desc, version desc) as pick,
-                version, component, subject_name, type, repo, zone, status, count(*) as facts, max(observed_at) as last_observed_at
+                version, component, canonical_component, subject_name, identity, subject_class,
+                type, repo, zone, status, count(*) as facts, max(observed_at) as last_observed_at
          from components
          where version is not null and component is not null and component != '' {} {} {}
-         group by version, component, subject_name, type, repo, zone, status
+         group by version, component, canonical_component, subject_name, identity, subject_class, type, repo, zone, status
          order by last_observed_at desc, version desc
          limit {}",
         context_filter_sql(db, context, "components", &["repo", "zone", "component"]),
         component_filter,
-        component_subject_filter_sql(&options),
+        component_subject_filter_sql(&options, context.component.is_some()),
         limit.max(1)
     )
 }
 
-fn component_subject_filter_sql(options: &ComponentQueryOptions) -> String {
+fn component_subject_filter_sql(
+    options: &ComponentQueryOptions,
+    include_focused_application: bool,
+) -> String {
     if let Some(subject_type) = options.type_filter.as_deref() {
         return format!(" and type = {}", sql_literal(subject_type));
     }
@@ -1202,11 +1203,11 @@ fn component_subject_filter_sql(options: &ComponentQueryOptions) -> String {
         return String::new();
     }
     let mut filters = Vec::new();
-    if !options.include_applications {
-        filters.push("(type is null or type != 'application')".to_string());
+    if !options.include_applications && !include_focused_application {
+        filters.push("(subject_class is null or subject_class != 'application')".to_string());
     }
     if !options.include_dependencies {
-        filters.push("(type is null or lower(type) not like '%dependency%')".to_string());
+        filters.push("(subject_class is null or subject_class != 'dependency')".to_string());
     }
     if filters.is_empty() {
         String::new()
@@ -1318,7 +1319,9 @@ fn compare_query_sql(target: &str, target_version: Option<&str>, limit: usize) -
         "select 'current_requires_target' as relationship,
                 current_component, current_version,
                 component as target_component, version as target_version,
-                subject_name as target_subject, repo as target_repo, zone as target_zone, status,
+                canonical_component as target_canonical_component,
+                identity as target_identity, subject_name as target_subject,
+                repo as target_repo, zone as target_zone, status,
                 capability, capability_version
          from upstream u
          where {upstream_target}
@@ -1326,7 +1329,9 @@ fn compare_query_sql(target: &str, target_version: Option<&str>, limit: usize) -
          select 'target_requires_current' as relationship,
                 current_component, current_version,
                 component as target_component, version as target_version,
-                subject_name as target_subject, repo as target_repo, zone as target_zone, status,
+                canonical_component as target_canonical_component,
+                identity as target_identity, subject_name as target_subject,
+                repo as target_repo, zone as target_zone, status,
                 capability, capability_version
          from downstream d
          where {downstream_target}
@@ -1336,15 +1341,44 @@ fn compare_query_sql(target: &str, target_version: Option<&str>, limit: usize) -
 }
 
 fn target_match_sql(alias: &str, target: &str, target_version: Option<&str>) -> String {
-    let exact = sql_literal(target);
-    let key = sql_literal(&component_key(target));
-    let mut clauses = vec![format!(
-        "({alias}.component = {key} or {alias}.subject_name = {exact} or {alias}.repo = {exact})"
-    )];
+    let mut clauses = vec![identity_match_sql(Some(alias), target)];
     if let Some(version) = target_version {
         clauses.push(format!("{alias}.version = {}", sql_literal(version)));
     }
     clauses.join(" and ")
+}
+
+fn identity_match_sql(table: Option<&str>, target: &str) -> String {
+    let target = target.trim();
+    let exact = sql_literal(target);
+    let key = sql_literal(&component_key(target));
+    let (identity, component, subject_name, repo) = if let Some(table) = table {
+        (
+            format!("{table}.identity"),
+            format!("{table}.component"),
+            format!("{table}.subject_name"),
+            format!("{table}.repo"),
+        )
+    } else {
+        (
+            "facts.identity".to_string(),
+            "facts.component".to_string(),
+            "facts.subject_name".to_string(),
+            "facts.repo".to_string(),
+        )
+    };
+    format!(
+        "({component} = {key}
+          or {component} = {exact}
+          or {subject_name} = {exact}
+          or {repo} = {exact}
+          or {identity} = {exact}
+          or exists (
+            select 1 from identity_aliases matrix_alias
+            where matrix_alias.identity = {identity}
+              and (matrix_alias.alias = {exact} or matrix_alias.alias = {key})
+          ))"
+    )
 }
 
 fn context_filter_sql(
@@ -1367,11 +1401,7 @@ fn context_filter_sql(
     if fields.contains(&"component")
         && let Some(component) = context.component.as_deref()
     {
-        let key = sql_literal(&component_key(component));
-        let exact = sql_literal(component);
-        filters.push(format!(
-            "({table}.component = {key} or {table}.component = {exact})"
-        ));
+        filters.push(identity_match_sql(Some(table), component));
     }
     if filters.is_empty() {
         String::new()
@@ -1934,11 +1964,7 @@ impl<'a> ReplSession<'a> {
         if fields.contains(&"component")
             && let Some(component) = self.context.component.as_deref()
         {
-            let key = sql_literal(&component_key(component));
-            let exact = sql_literal(component);
-            filters.push(format!(
-                "({table}.component = {key} or {table}.component = {exact})"
-            ));
+            filters.push(identity_match_sql(Some(table), component));
         }
         if filters.is_empty() {
             String::new()
@@ -1978,11 +2004,12 @@ fn build_facts_db_with_init(
     db.execute_batch(
         "create table facts (
           id text, zone text, kind text, status text,
-          type text, component text, version text, repo text,
+          type text, component text, canonical_component text, identity text,
+          subject_class text, version text, repo text,
           source_repository text, source_repo text, source_sha text, source_ref text,
           subject_type text, subject_name text, channel text,
           tag text, observed_at text, accepted_at text,
-          requires text, provides text, json text not null
+          requires text, provides text, aliases text, json text not null
         );",
     )?;
     let mut zones = Vec::new();
@@ -2008,6 +2035,28 @@ fn build_facts_db_with_init(
         let component = subject_name.as_deref().map(component_key);
         let subject_repo =
             text_at(fact, &["subjectRepo"]).or_else(|| text_at(fact, &["subject", "repo"]));
+        let canonical_component = text_at(fact, &["canonicalComponent"])
+            .or_else(|| text_at(fact, &["subject", "canonicalComponent"]))
+            .or_else(|| component.clone());
+        let subject_class = subject_class(subject_type.as_deref());
+        let identity = text_at(fact, &["identity"])
+            .or_else(|| text_at(fact, &["canonicalId"]))
+            .or_else(|| text_at(fact, &["subject", "identity"]))
+            .or_else(|| text_at(fact, &["subject", "id"]))
+            .or_else(|| {
+                subject_identity(
+                    subject_type.as_deref(),
+                    subject_name.as_deref(),
+                    subject_repo.as_deref(),
+                )
+            });
+        let aliases = subject_aliases_json(
+            fact,
+            subject_name.as_deref(),
+            component.as_deref(),
+            subject_repo.as_deref(),
+            identity.as_deref(),
+        )?;
         let source_repo = text_at(fact, &["sourceRepository"])
             .or_else(|| text_at(record, &["sourceRepository"]))
             .or_else(|| text_at(fact, &["source", "repo"]))
@@ -2023,7 +2072,7 @@ fn build_facts_db_with_init(
             .or_else(|| text_at(record, &["source", "ref"]));
         let tag = text_at(fact, &["tag"]).or_else(|| source_ref.clone());
         db.execute(
-            "insert into facts values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+            "insert into facts values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
             params![
                 text_at(fact, &["id"]).or_else(|| text_at(record, &["id"])),
                 zone,
@@ -2031,6 +2080,9 @@ fn build_facts_db_with_init(
                 text_at(fact, &["status"]),
                 subject_type.clone(),
                 component,
+                canonical_component,
+                identity,
+                subject_class,
                 text_at(fact, &["subjectVersion"]).or_else(|| text_at(fact, &["subject", "version"])),
                 subject_repo.clone().or_else(|| source_repo.clone()),
                 source_repo.clone(),
@@ -2045,6 +2097,7 @@ fn build_facts_db_with_init(
                 text_at(record, &["acceptedAt"]).or_else(|| text_at(fact, &["acceptedAt"])),
                 json_array_text(fact.get("requires"))?,
                 json_array_text(fact.get("provides"))?,
+                aliases,
                 serde_json::to_string(record)?,
             ],
         )?;
@@ -2066,13 +2119,14 @@ fn create_matrix_views(db: &Connection, context: &MatrixContext, zones: &[String
           where zone is not null
           group by zone;
         create view subjects as
-          select type, component, repo, count(*) as facts,
+          select type, component, canonical_component, identity, subject_class, repo, count(*) as facts,
                  max(observed_at) as last_observed_at
           from facts
           where component is not null
-          group by type, component, repo;
+          group by type, component, canonical_component, identity, subject_class, repo;
         create view components as
-          select zone, type, component, subject_name, repo, version, status,
+          select zone, type, subject_class, component, canonical_component, identity,
+                 subject_name, repo, version, status,
                  case
                    when status in ('compatible', 'passed', 'observed', 'candidate', 'valid', 'ready') then 'valid'
                    when status in ('incompatible', 'failed', 'invalid', 'blocked') then 'invalid'
@@ -2081,6 +2135,38 @@ fn create_matrix_views(db: &Connection, context: &MatrixContext, zones: &[String
                  observed_at, accepted_at, id
           from facts
           where component is not null;
+        create view identities as
+          select identity, canonical_component, subject_class,
+                 min(type) as type,
+                 min(subject_name) as subject_name,
+                 min(repo) as repo,
+                 count(*) as facts,
+                 max(observed_at) as last_observed_at
+          from facts
+          where identity is not null
+          group by identity, canonical_component, subject_class;
+        create view identity_aliases as
+          select distinct identity, canonical_component, subject_class, type,
+                 subject_name, repo, subject_name as alias, 'subject_name' as alias_kind
+          from facts
+          where identity is not null and subject_name is not null and subject_name != ''
+          union
+          select distinct identity, canonical_component, subject_class, type,
+                 subject_name, repo, component as alias, 'component' as alias_kind
+          from facts
+          where identity is not null and component is not null and component != ''
+          union
+          select distinct identity, canonical_component, subject_class, type,
+                 subject_name, repo, repo as alias, 'repo' as alias_kind
+          from facts
+          where identity is not null and repo is not null and repo != ''
+          union
+          select distinct f.identity, f.canonical_component, f.subject_class, f.type,
+                 f.subject_name, f.repo, item.value as alias,
+                 'alias' as alias_kind
+          from facts f, json_each(coalesce(f.aliases, '[]')) item
+          where f.identity is not null and item.value is not null
+            and item.value != '';
         create view valid_facts as
           select * from facts
           where status in ('compatible', 'passed', 'observed', 'candidate', 'valid', 'ready');
@@ -2088,13 +2174,15 @@ fn create_matrix_views(db: &Connection, context: &MatrixContext, zones: &[String
           select * from facts
           where status in ('incompatible', 'failed', 'invalid', 'blocked');
         create view requirements as
-          select f.id as fact_id, f.zone, f.type, f.component, f.subject_name, f.repo, f.version, f.status,
+          select f.id as fact_id, f.zone, f.type, f.subject_class, f.component,
+                 f.canonical_component, f.identity, f.subject_name, f.repo, f.version, f.status,
                  json_extract(item.value, '$.capability') as capability,
                  json_extract(item.value, '$.version') as capability_version,
                  item.value as requirement
           from facts f, json_each(coalesce(f.requires, '[]')) item;
         create view capabilities as
-          select f.id as fact_id, f.zone, f.type, f.component, f.subject_name, f.repo, f.version, f.status,
+          select f.id as fact_id, f.zone, f.type, f.subject_class, f.component,
+                 f.canonical_component, f.identity, f.subject_name, f.repo, f.version, f.status,
                  json_extract(item.value, '$.capability') as capability,
                  json_extract(item.value, '$.version') as capability_version,
                  item.value as provides
@@ -2173,7 +2261,10 @@ fn create_matrix_views(db: &Connection, context: &MatrixContext, zones: &[String
                   min(p.fact_id) as provider_fact_id,
                   p.zone,
                   p.type,
+                  p.subject_class,
                   p.component,
+                  p.canonical_component,
+                  p.identity,
                   p.subject_name,
                   p.repo,
                   p.version,
@@ -2185,7 +2276,8 @@ fn create_matrix_views(db: &Connection, context: &MatrixContext, zones: &[String
              on p.capability = r.capability
             and (r.capability_version is null or p.capability_version = r.capability_version)
            group by r.zone, r.component, r.repo, r.version, r.capability, r.capability_version,
-                    p.zone, p.type, p.component, p.subject_name, p.repo, p.version, p.status;
+                    p.zone, p.type, p.subject_class, p.component, p.canonical_component,
+                    p.identity, p.subject_name, p.repo, p.version, p.status;
          create view downstream as
            select min(p.fact_id) as current_fact_id,
                   p.zone as current_zone,
@@ -2197,7 +2289,10 @@ fn create_matrix_views(db: &Connection, context: &MatrixContext, zones: &[String
                   min(r.fact_id) as dependent_fact_id,
                   r.zone,
                   r.type,
+                  r.subject_class,
                   r.component,
+                  r.canonical_component,
+                  r.identity,
                   r.subject_name,
                   r.repo,
                   r.version,
@@ -2209,7 +2304,8 @@ fn create_matrix_views(db: &Connection, context: &MatrixContext, zones: &[String
              on r.capability = p.capability
             and (p.capability_version is null or r.capability_version = p.capability_version)
            group by p.zone, p.component, p.repo, p.version, p.capability, p.capability_version,
-                    r.zone, r.type, r.component, r.subject_name, r.repo, r.version, r.status;
+                    r.zone, r.type, r.subject_class, r.component, r.canonical_component,
+                    r.identity, r.subject_name, r.repo, r.version, r.status;
          create view compatible_with_current as
            select distinct * from downstream
            where status in ('compatible', 'passed', 'observed', 'candidate', 'valid', 'ready');",
@@ -2235,6 +2331,8 @@ fn create_matrix_views(db: &Connection, context: &MatrixContext, zones: &[String
                 | "context"
                 | "subjects"
                 | "components"
+                | "identities"
+                | "identity_aliases"
                 | "valid_facts"
                 | "invalid_facts"
                 | "requirements"
@@ -2303,9 +2401,7 @@ fn active_context_where(context: &MatrixContext) -> String {
         ));
     }
     if let Some(component) = context.component.as_deref() {
-        let exact = sql_literal(component);
-        let key = sql_literal(&component_key(component));
-        filters.push(format!("(component = {key} or subject_name = {exact})"));
+        filters.push(identity_match_sql(None, component));
     }
     if let Some(version) = context.version.as_deref() {
         filters.push(format!("version = {}", sql_literal(version)));
@@ -2355,6 +2451,96 @@ fn component_key(value: &str) -> String {
         .unwrap_or(value)
         .trim_start_matches('@')
         .to_string()
+}
+
+fn subject_class(subject_type: Option<&str>) -> Option<String> {
+    let subject_type = subject_type?;
+    let normalized = subject_type.to_ascii_lowercase();
+    if matches!(
+        normalized.as_str(),
+        "app" | "application" | "repo" | "repository" | "sbom"
+    ) {
+        Some("application".to_string())
+    } else if normalized.contains("dependency") {
+        Some("dependency".to_string())
+    } else {
+        Some("component".to_string())
+    }
+}
+
+fn subject_identity(
+    subject_type: Option<&str>,
+    subject_name: Option<&str>,
+    repo: Option<&str>,
+) -> Option<String> {
+    let subject_type = subject_type
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("component")
+        .to_ascii_lowercase();
+    let subject_name = subject_name?.trim();
+    if subject_name.is_empty() {
+        return None;
+    }
+    if matches!(
+        subject_type.as_str(),
+        "app" | "application" | "repo" | "repository" | "sbom"
+    ) && let Some(repo) = repo.filter(|value| !value.trim().is_empty())
+    {
+        return Some(format!(
+            "{subject_type}:{}",
+            repo.trim().to_ascii_lowercase()
+        ));
+    }
+    Some(format!(
+        "{subject_type}:{}",
+        subject_name.to_ascii_lowercase()
+    ))
+}
+
+fn subject_aliases_json(
+    fact: &Value,
+    subject_name: Option<&str>,
+    component: Option<&str>,
+    repo: Option<&str>,
+    identity: Option<&str>,
+) -> Result<Option<String>> {
+    let mut aliases = std::collections::BTreeSet::new();
+    for value in [subject_name, component, repo, identity]
+        .into_iter()
+        .flatten()
+    {
+        add_alias(&mut aliases, value);
+    }
+    collect_aliases(fact.get("aliases"), &mut aliases);
+    collect_aliases(fact.pointer("/subject/aliases"), &mut aliases);
+    if aliases.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(serde_json::to_string(
+            &aliases.into_iter().collect::<Vec<_>>(),
+        )?))
+    }
+}
+
+fn collect_aliases(value: Option<&Value>, aliases: &mut std::collections::BTreeSet<String>) {
+    match value {
+        Some(Value::Array(items)) => {
+            for item in items {
+                if let Some(alias) = item.as_str() {
+                    add_alias(aliases, alias);
+                }
+            }
+        }
+        Some(Value::String(alias)) => add_alias(aliases, alias),
+        _ => {}
+    }
+}
+
+fn add_alias(aliases: &mut std::collections::BTreeSet<String>, alias: &str) {
+    let alias = alias.trim();
+    if !alias.is_empty() {
+        aliases.insert(alias.to_string());
+    }
 }
 
 fn json_array_text(value: Option<&Value>) -> Result<Option<String>> {
@@ -2815,9 +3001,10 @@ Matrix shell commands
 SQL
   End SQL statements with `;`.
   Available tables/views: facts, active, zone, zones, subjects, components,
-  current, upstream, downstream, compatible_with_current, valid_facts,
-  invalid_facts, capabilities, requirements, members, deref, and one view per
-  SQL-safe zone such as odin. `status = valid` expands to compatible statuses.
+  identities, identity_aliases, current, upstream, downstream,
+  compatible_with_current, valid_facts, invalid_facts, capabilities,
+  requirements, members, deref, and one view per SQL-safe zone such as odin.
+  `status = valid` expands to compatible statuses.
   Component filters: --all, --type <type>, --include-applications,
   --include-dependencies.
 "
@@ -4303,6 +4490,60 @@ mod tests {
             typed_components["rows"][0]["subject_name"],
             "@credo-ts/core"
         );
+    }
+
+    #[test]
+    fn exposes_canonical_identity_and_alias_matching() {
+        let facts = vec![json!({
+            "id": "dep-core",
+            "zone": "odin",
+            "status": "observed",
+            "subject": {
+                "type": "npm-dependency",
+                "name": "@credo-ts/core",
+                "version": "0.6.3",
+                "repo": "red-wiz/troy",
+                "aliases": ["credo-core"]
+            },
+            "observedAt": "2026-06-18T00:00:00Z"
+        })];
+        let context = MatrixContext {
+            component: Some("credo-core".to_string()),
+            ..MatrixContext::default()
+        };
+        let db = build_facts_db_with_init(&facts, &context, None).unwrap();
+
+        let identities = execute_readonly_sql(
+            &db,
+            "select identity, canonical_component, subject_class from identities",
+        )
+        .unwrap();
+        assert_eq!(
+            identities["rows"][0]["identity"],
+            "npm-dependency:@credo-ts/core"
+        );
+        assert_eq!(identities["rows"][0]["canonical_component"], "core");
+        assert_eq!(identities["rows"][0]["subject_class"], "dependency");
+
+        let aliases = execute_readonly_sql(
+            &db,
+            "select alias from identity_aliases where identity = 'npm-dependency:@credo-ts/core' order by alias",
+        )
+        .unwrap();
+        let alias_values = aliases["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["alias"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(alias_values.contains(&"@credo-ts/core"));
+        assert!(alias_values.contains(&"core"));
+        assert!(alias_values.contains(&"credo-core"));
+
+        let active =
+            execute_readonly_sql(&db, "select subject_name, identity from active").unwrap();
+        assert_eq!(active["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(active["rows"][0]["subject_name"], "@credo-ts/core");
     }
 
     #[test]
