@@ -81,6 +81,8 @@ enum Commands {
         level: String,
     },
     Trace(TraceArgs),
+    History(HistoryArgs),
+    Supersedes(HistoryArgs),
     Upload(UploadArgs),
     Publish(UploadArgs),
     Ingest(IngestArgs),
@@ -150,6 +152,13 @@ struct TraceArgs {
     #[arg(long)]
     id: Option<String>,
     #[arg(long, default_value_t = 50)]
+    limit: usize,
+}
+
+#[derive(Args)]
+struct HistoryArgs {
+    fact_id: String,
+    #[arg(long, default_value_t = 25)]
     limit: usize,
 }
 
@@ -356,6 +365,7 @@ pub async fn run_cli() -> Result<()> {
                 .await?
         }
         Commands::Trace(args) => trace(&matrix, args).await?,
+        Commands::History(args) | Commands::Supersedes(args) => history(&matrix, args).await?,
         Commands::Upload(args) | Commands::Publish(args) => upload(&matrix, args).await?,
         Commands::Ingest(args) => ingest(&matrix, args).await?,
         Commands::Deref(args) => fact_view_query(&matrix, args, FactView::Deref).await?,
@@ -986,6 +996,16 @@ async fn trace(matrix: &Matrix, args: TraceArgs) -> Result<Value> {
         "trace": facts,
         "hint": "Use matrix red-pill for a deeper diagnostic bundle."
     }))
+}
+
+async fn history(matrix: &Matrix, args: HistoryArgs) -> Result<Value> {
+    matrix
+        .get(&format!(
+            "/facts/{}/history?limit={}",
+            enc(&args.fact_id),
+            args.limit.max(1)
+        ))
+        .await
 }
 
 async fn upload(matrix: &Matrix, args: UploadArgs) -> Result<Value> {
@@ -1661,6 +1681,18 @@ impl<'a> ReplSession<'a> {
                     eprintln!("Usage: .members <fact-id>");
                 } else {
                     self.run_sql(&fact_view_sql(&fact_id, FactView::Members))?;
+                }
+            }
+            "history" | "supersedes" => {
+                let fact_id = parts.collect::<Vec<_>>().join(" ");
+                if fact_id.is_empty() {
+                    eprintln!("Usage: .{name} <fact-id>");
+                } else {
+                    let value = self
+                        .matrix
+                        .get(&format!("/facts/{}/history?limit=25", enc(&fact_id)))
+                        .await?;
+                    print_value(&value, self.matrix.output)?;
                 }
             }
             "compare" | "why" => {
@@ -2991,6 +3023,7 @@ Matrix shell commands
   .views                    List local tables and views
   .deref <fact-id>          Show member/require/provide edges for a fact
   .members <fact-id>        Show tuple members for a fact
+  .history <fact-id>        Show accepted revisions for a fact
   .compare <target>         Compare active context to a component/repo/subject
   .why <target>             Alias for .compare
   .examples                 Show copyable query examples
@@ -3089,6 +3122,7 @@ impl MatrixCompleter {
             ".explain",
             ".gate",
             ".help",
+            ".history",
             ".limit",
             ".members",
             ".mode",
@@ -3135,6 +3169,7 @@ impl MatrixCompleter {
             "fact_id",
             "from",
             "group",
+            "history",
             "id",
             "incompatible",
             "json",
@@ -3624,6 +3659,10 @@ fn print_human_array(values: &[Value]) {
 }
 
 fn print_human_object(object: &serde_json::Map<String, Value>) {
+    if object.contains_key("factId") && object.contains_key("events") {
+        print_fact_history_human(object);
+        return;
+    }
     if let Some(saved) = object.get("saved").and_then(Value::as_str) {
         println!("Saved {saved}");
         return;
@@ -3679,9 +3718,67 @@ fn print_human_object(object: &serde_json::Map<String, Value>) {
     }
 }
 
+fn print_fact_history_human(object: &serde_json::Map<String, Value>) {
+    print!("{}", fact_history_human_text(object));
+}
+
+fn fact_history_human_text(object: &serde_json::Map<String, Value>) -> String {
+    let fact_id = object
+        .get("factId")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let events = object
+        .get("events")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut text = format!("Fact history: {fact_id}\n");
+    if events.is_empty() {
+        text.push_str("  no revisions\n");
+        return text;
+    }
+    for event in events {
+        let Some(event) = event.as_object() else {
+            continue;
+        };
+        let revision = event
+            .get("revision")
+            .map(human_inline_value)
+            .unwrap_or_else(|| "?".to_string());
+        let status = event
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let accepted_at = event
+            .get("acceptedAt")
+            .and_then(Value::as_str)
+            .unwrap_or("-");
+        text.push_str(&format!("- r{revision} {status} accepted {accepted_at}\n"));
+        push_object_field(&mut text, event, "eventId", "  Event");
+        push_object_field(&mut text, event, "contentHash", "  Hash");
+        push_object_field(&mut text, event, "sourceRepository", "  Source repo");
+        push_object_field(&mut text, event, "sourceSha", "  Source SHA");
+        push_object_field(&mut text, event, "sourceRef", "  Source ref");
+        push_object_field(&mut text, event, "supersededAt", "  Superseded at");
+        push_object_field(&mut text, event, "supersededBy", "  Superseded by");
+    }
+    text
+}
+
 fn print_object_field(object: &serde_json::Map<String, Value>, key: &str, label: &str) {
     if let Some(value) = object.get(key) {
         println!("{label}: {}", human_inline_value(value));
+    }
+}
+
+fn push_object_field(
+    text: &mut String,
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+    label: &str,
+) {
+    if let Some(value) = object.get(key) {
+        text.push_str(&format!("{label}: {}\n", human_inline_value(value)));
     }
 }
 
@@ -3976,6 +4073,38 @@ mod tests {
     }
 
     #[test]
+    fn accepts_history_commands() {
+        let history = Cli::try_parse_from([
+            "matrix",
+            "history",
+            "release-bundle.api.1.0.0",
+            "--limit",
+            "10",
+            "-o",
+            "json",
+        ])
+        .unwrap();
+        assert_eq!(history.output, OutputFormat::Json);
+        match history.command {
+            Commands::History(args) => {
+                assert_eq!(args.fact_id, "release-bundle.api.1.0.0");
+                assert_eq!(args.limit, 10);
+            }
+            _ => panic!("expected history command"),
+        }
+
+        let supersedes =
+            Cli::try_parse_from(["matrix", "supersedes", "release-bundle.api.1.0.0"]).unwrap();
+        match supersedes.command {
+            Commands::Supersedes(args) => {
+                assert_eq!(args.fact_id, "release-bundle.api.1.0.0");
+                assert_eq!(args.limit, 25);
+            }
+            _ => panic!("expected supersedes command"),
+        }
+    }
+
+    #[test]
     fn accepts_context_view_commands() {
         let compatible = Cli::try_parse_from([
             "matrix",
@@ -4120,6 +4249,40 @@ mod tests {
         assert!(text.contains("sha256:735ce2ccadf47e3098ab3c0c6ac682ff"));
         assert!(text.contains("..."));
         assert!(!text.contains("9f93a4d5b9e72"));
+    }
+
+    #[test]
+    fn renders_fact_history_as_audit_records() {
+        let value = json!({
+            "factId": "release-bundle.api.1.0.0",
+            "events": [
+                {
+                    "eventId": "event.current",
+                    "revision": 2,
+                    "acceptedAt": "2026-06-19T16:00:00Z",
+                    "contentHash": "sha256:new",
+                    "sourceRepository": "example/api",
+                    "sourceSha": "222",
+                    "status": "current"
+                },
+                {
+                    "eventId": "event.old",
+                    "revision": 1,
+                    "acceptedAt": "2026-06-19T15:00:00Z",
+                    "contentHash": "sha256:old",
+                    "sourceRepository": "example/api",
+                    "sourceSha": "111",
+                    "status": "superseded",
+                    "supersededBy": "event.current",
+                    "supersededAt": "2026-06-19T16:00:00Z"
+                }
+            ]
+        });
+        let text = fact_history_human_text(value.as_object().unwrap());
+        assert!(text.contains("Fact history: release-bundle.api.1.0.0"));
+        assert!(text.contains("- r2 current accepted 2026-06-19T16:00:00Z"));
+        assert!(text.contains("- r1 superseded accepted 2026-06-19T15:00:00Z"));
+        assert!(text.contains("Superseded by: event.current"));
     }
 
     #[test]

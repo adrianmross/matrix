@@ -52,6 +52,7 @@ matrix gate --zone runtime --level stage
 matrix trace --zone runtime --subject payments-api
 matrix upload facts.json
 matrix query 'select id, zone, status, subject_name from facts limit 20'
+matrix history release-bundle.api.1.0.0
 matrix enter
 ```
 

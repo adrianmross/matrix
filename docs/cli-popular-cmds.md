@@ -64,6 +64,8 @@ matrix query 'select alias, identity from identity_aliases order by alias limit 
 ```bash
 matrix members release-bundle.api.1.0.0
 matrix deref release-bundle.api.1.0.0
+matrix history release-bundle.api.1.0.0
+matrix supersedes release-bundle.api.1.0.0 -o json
 matrix query 'select component, version, runtime from members where fact_id==release-bundle.api.1.0.0'
 ```
 

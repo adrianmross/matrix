@@ -125,6 +125,7 @@ Some facts describe a tuple, bundle, or aggregate of other members. Use
 ```bash
 matrix members release-bundle.api.1.0.0
 matrix deref release-bundle.api.1.0.0
+matrix history release-bundle.api.1.0.0
 ```
 
 ```sql
@@ -136,6 +137,30 @@ select edge, target, target_version, runtime, platform
 from deref
 where fact_id==release-bundle.api.1.0.0;
 ```
+
+## Fact History
+
+Facts use stable IDs for logical compatibility records. When a producer submits
+the same ID again, the construct keeps the latest body in `facts` and appends an
+immutable accepted event. Use history commands to inspect prior accepted bodies:
+
+```bash
+matrix history release-bundle.api.1.0.0
+matrix supersedes release-bundle.api.1.0.0 -o json
+```
+
+The default output shows revision number, accepted time, content hash, source
+repository/SHA/ref, and whether each revision is `current` or `superseded`.
+Structured output returns the construct event objects, including `eventId`,
+`factId`, `revision`, `acceptedAt`, `contentHash`, `supersededBy`,
+`supersededAt`, and the preserved `fact` body.
+
+Producer guidance:
+
+- Reuse `fact.id` for the same logical assertion or tuple across updates.
+- Change `fact.id` when the assertion is a new logical record.
+- Treat construct `eventId` values as immutable audit IDs assigned by the
+  server, not as producer-supplied IDs.
 
 ## Context-Aware Views
 

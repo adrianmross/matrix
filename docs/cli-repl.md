@@ -60,6 +60,8 @@ clears the current local session context.
 - `.examples`: print copyable SQL and helper-command examples.
 - `.members <fact-id>`: show tuple members for a fact.
 - `.deref <fact-id>`: show member, requirement, and provide edges for a fact.
+- `.history <fact-id>`: show accepted revisions and supersession metadata for a
+  fact.
 - `.compare <target>` or `.why <target>`: compare the active context to a
   target component, subject, or repo.
 - `.mode human|table|json|yaml|csv`: change result rendering.
@@ -102,4 +104,11 @@ where fact_id==release-bundle.api.1.0.0;
 select edge, target, target_version, runtime, platform
 from deref
 where fact_id==release-bundle.api.1.0.0;
+```
+
+History comes from the construct audit endpoint rather than the local session
+cache:
+
+```text
+.history release-bundle.api.1.0.0
 ```
