@@ -3003,7 +3003,7 @@ SQL
   Available tables/views: facts, active, zone, zones, subjects, components,
   identities, identity_aliases, current, upstream, downstream,
   compatible_with_current, valid_facts, invalid_facts, capabilities,
-  requirements, members, deref, and one view per SQL-safe zone such as odin.
+  requirements, members, deref, and one view per SQL-safe zone such as runtime.
   `status = valid` expands to compatible statuses.
   Component filters: --all, --type <type>, --include-applications,
   --include-dependencies.
@@ -3024,18 +3024,18 @@ from upstream;
 select current_version, capability, component, version, status
 from downstream;
 
-select component, version, physical_chaincode
+select component, version, runtime, platform
 from members
-where fact_id==smart-contract-tuple.vdr.0.1.0;
+where fact_id==release-bundle.api.1.0.0;
 
-select edge, target, target_version, physical_chaincode
+select edge, target, target_version, runtime, platform
 from deref
-where fact_id==smart-contract-tuple.vdr.0.1.0;
+where fact_id==release-bundle.api.1.0.0;
 
-.members smart-contract-tuple.vdr.0.1.0
-.deref smart-contract-tuple.vdr.0.1.0
-.compare eos
-.why red-wiz/eos --target-version 0.19.2
+.members release-bundle.api.1.0.0
+.deref release-bundle.api.1.0.0
+.compare ledger-service
+.why example/ledger-service --target-version v2.4.0
 "#
     );
 }
@@ -3945,7 +3945,7 @@ mod tests {
         let members = Cli::try_parse_from([
             "matrix",
             "members",
-            "smart-contract-tuple.vdr.0.1.0",
+            "release-bundle.api.1.0.0",
             "-o",
             "json",
         ])
@@ -3953,7 +3953,7 @@ mod tests {
         assert_eq!(members.output, OutputFormat::Json);
         match members.command {
             Commands::Members(args) => {
-                assert_eq!(args.fact_id, "smart-contract-tuple.vdr.0.1.0");
+                assert_eq!(args.fact_id, "release-bundle.api.1.0.0");
             }
             _ => panic!("expected members command"),
         }
@@ -3961,14 +3961,14 @@ mod tests {
         let deref = Cli::try_parse_from([
             "matrix",
             "deref",
-            "smart-contract-tuple.vdr.0.1.0",
+            "release-bundle.api.1.0.0",
             "--max-facts",
             "10000",
         ])
         .unwrap();
         match deref.command {
             Commands::Deref(args) => {
-                assert_eq!(args.fact_id, "smart-contract-tuple.vdr.0.1.0");
+                assert_eq!(args.fact_id, "release-bundle.api.1.0.0");
                 assert_eq!(args.max_facts, 10000);
             }
             _ => panic!("expected deref command"),
@@ -3981,7 +3981,7 @@ mod tests {
             "matrix",
             "compatible",
             "--repo",
-            "red-wiz/putto",
+            "example/payments-api",
             "--version",
             "v0.6.3",
             "--limit",
@@ -3993,20 +3993,25 @@ mod tests {
         assert_eq!(compatible.output, OutputFormat::Json);
         match compatible.command {
             Commands::Compatible(args) => {
-                assert_eq!(args.context.repo.as_deref(), Some("red-wiz/putto"));
+                assert_eq!(args.context.repo.as_deref(), Some("example/payments-api"));
                 assert_eq!(args.context.version.as_deref(), Some("v0.6.3"));
                 assert_eq!(args.limit, 25);
             }
             _ => panic!("expected compatible command"),
         }
 
-        let versions =
-            Cli::try_parse_from(["matrix", "versions", "putto", "--repo", "red-wiz/putto"])
-                .unwrap();
+        let versions = Cli::try_parse_from([
+            "matrix",
+            "versions",
+            "payments-api",
+            "--repo",
+            "example/payments-api",
+        ])
+        .unwrap();
         match versions.command {
             Commands::Versions(args) => {
-                assert_eq!(args.component_filter.as_deref(), Some("putto"));
-                assert_eq!(args.context.repo.as_deref(), Some("red-wiz/putto"));
+                assert_eq!(args.component_filter.as_deref(), Some("payments-api"));
+                assert_eq!(args.context.repo.as_deref(), Some("example/payments-api"));
             }
             _ => panic!("expected versions command"),
         }
@@ -4015,7 +4020,7 @@ mod tests {
             "matrix",
             "components",
             "--repo",
-            "red-wiz/troy",
+            "example/web-client",
             "--include-dependencies",
             "--type",
             "npm-dependency",
@@ -4032,9 +4037,9 @@ mod tests {
         let compare = Cli::try_parse_from([
             "matrix",
             "compare",
-            "red-wiz/eos",
+            "example/ledger-service",
             "--repo",
-            "red-wiz/putto",
+            "example/payments-api",
             "--version",
             "v0.6.3",
             "--target-version",
@@ -4043,8 +4048,8 @@ mod tests {
         .unwrap();
         match compare.command {
             Commands::Compare(args) => {
-                assert_eq!(args.target, "red-wiz/eos");
-                assert_eq!(args.context.repo.as_deref(), Some("red-wiz/putto"));
+                assert_eq!(args.target, "example/ledger-service");
+                assert_eq!(args.context.repo.as_deref(), Some("example/payments-api"));
                 assert_eq!(args.context.version.as_deref(), Some("v0.6.3"));
                 assert_eq!(args.target_version.as_deref(), Some("0.19.2"));
             }
@@ -4055,7 +4060,7 @@ mod tests {
     #[test]
     fn renders_objects_as_field_value_tables() {
         let text = generic_table_text(&json!({
-            "track": "odin",
+            "track": "runtime",
             "eligible": false,
             "blockers": [],
             "latest": {
@@ -4069,7 +4074,7 @@ mod tests {
         assert!(text.contains("| field"));
         assert!(text.contains("| value"));
         assert!(text.contains("| Track"));
-        assert!(text.contains("| odin"));
+        assert!(text.contains("| runtime"));
         assert!(text.contains("| Eligible"));
         assert!(text.contains("| no"));
         assert!(text.contains("| Blockers"));
@@ -4082,12 +4087,12 @@ mod tests {
     #[test]
     fn renders_object_arrays_as_tables() {
         let text = generic_table_text(&json!([
-            {"zone": "odin", "facts": 3},
+            {"zone": "runtime", "facts": 3},
             {"zone": "agent-admin", "facts": 2}
         ]));
         assert!(text.contains("| zone"));
         assert!(text.contains("| facts"));
-        assert!(text.contains("| odin"));
+        assert!(text.contains("| runtime"));
         assert!(text.contains("| agent-admin"));
         assert!(text.contains("(2 rows)"));
     }
@@ -4096,20 +4101,20 @@ mod tests {
     fn renders_nested_scalar_fields_compactly() {
         let text = generic_table_text(&json!([
             {
-                "component": "did_vdr_go",
+                "component": "identity_contract",
                 "services": ["did"],
-                "aliases": ["did", "vdr"],
+                "aliases": ["did", "api"],
                 "digest": "sha256:735ce2ccadf47e3098ab3c0c6ac682ff0573e214a4decb1ee2f9f93a4d5b9e72"
             },
             {
-                "component": "csr_vdr_go",
+                "component": "profile_contract",
                 "services": "[\"anoncreds\",\"csr\",\"query\",\"vc\"]",
                 "aliases": []
             }
         ]));
-        assert!(text.contains("| did_vdr_go"));
+        assert!(text.contains("| identity_contract"));
         assert!(text.contains("| did"));
-        assert!(text.contains("| did, vdr"));
+        assert!(text.contains("| did, api"));
         assert!(text.contains("| anoncreds, csr, query, vc"));
         assert!(!text.contains("[\"anoncreds\""));
         assert!(text.contains("sha256:735ce2ccadf47e3098ab3c0c6ac682ff"));
@@ -4123,24 +4128,24 @@ mod tests {
             "columns": ["component", "version", "physical_chaincode", "services"],
             "rows": [
                 {
-                    "component": "did_vdr_go",
+                    "component": "identity_contract",
                     "version": "0.4.9",
-                    "physical_chaincode": "did_vdr_go_v0_4_9",
+                    "physical_chaincode": "identity_contract_v0_4_9",
                     "services": "[\"did\"]"
                 },
                 {
-                    "component": "csr_vdr_go",
+                    "component": "profile_contract",
                     "version": "0.2.7",
-                    "physical_chaincode": "csr_vdr_go_v0_2_7",
+                    "physical_chaincode": "profile_contract_v0_2_7",
                     "services": "[\"anoncreds\",\"csr\"]"
                 }
             ]
         }));
         assert!(text.starts_with("2 rows\n"));
-        assert!(text.contains("- did_vdr_go 0.4.9\n"));
-        assert!(text.contains("  Physical chaincode: did_vdr_go_v0_4_9\n"));
+        assert!(text.contains("- identity_contract 0.4.9\n"));
+        assert!(text.contains("  Physical chaincode: identity_contract_v0_4_9\n"));
         assert!(text.contains("  Services: did\n"));
-        assert!(text.contains("- csr_vdr_go 0.2.7\n"));
+        assert!(text.contains("- profile_contract 0.2.7\n"));
         assert!(text.contains("  Services: anoncreds, csr\n"));
         assert!(!text.contains("+"));
         assert!(!text.contains("[\"anoncreds\""));
@@ -4148,11 +4153,11 @@ mod tests {
 
     #[test]
     fn renders_csv_cells_as_spreadsheet_text() {
-        assert_eq!(display_cell(&json!(["did", "vdr"])), "did, vdr");
-        assert_eq!(display_cell(&json!("[\"did\",\"vdr\"]")), "did, vdr");
+        assert_eq!(display_cell(&json!(["did", "api"])), "did, api");
+        assert_eq!(display_cell(&json!("[\"did\",\"api\"]")), "did, api");
         assert_eq!(
-            csv_escape(&display_cell(&json!(["did", "vdr"]))),
-            "\"did, vdr\""
+            csv_escape(&display_cell(&json!(["did", "api"]))),
+            "\"did, api\""
         );
         assert_eq!(display_cell(&json!({"requires": ["a", "b"]})), "1 field");
     }
@@ -4162,23 +4167,23 @@ mod tests {
         let value = json!({
             "columns": ["component", "services"],
             "rows": [
-                {"component": "did_vdr_go", "services": "[\"did\"]"},
-                {"component": "csr_vdr_go", "services": "[\"anoncreds\",\"csr\"]"}
+                {"component": "identity_contract", "services": "[\"did\"]"},
+                {"component": "profile_contract", "services": "[\"anoncreds\",\"csr\"]"}
             ]
         });
         let rows = query_rows(&value);
         assert_eq!(
             rows,
             json!([
-                {"component": "did_vdr_go", "services": ["did"]},
-                {"component": "csr_vdr_go", "services": ["anoncreds", "csr"]}
+                {"component": "identity_contract", "services": ["did"]},
+                {"component": "profile_contract", "services": ["anoncreds", "csr"]}
             ])
         );
 
         let yaml = serde_yaml::to_string(&rows).unwrap();
-        assert!(yaml.starts_with("- component: did_vdr_go"));
+        assert!(yaml.starts_with("- component: identity_contract"));
         assert!(yaml.contains("services:\n  - did"));
-        assert!(yaml.contains("- component: csr_vdr_go"));
+        assert!(yaml.contains("- component: profile_contract"));
         assert!(yaml.contains("  - anoncreds\n  - csr"));
         assert!(!yaml.contains("columns:"));
         assert!(!yaml.contains("rows:"));
@@ -4230,38 +4235,38 @@ mod tests {
             "select * from zone where type='chaincode' and status='failed'"
         );
         assert_eq!(
-            normalize_matrix_sql("select * from zone where repo==red-wiz/eos and status!=failed"),
-            "select * from zone where repo='red-wiz/eos' and status!='failed'"
+            normalize_matrix_sql(
+                "select * from zone where repo==example/ledger-service and status!=failed"
+            ),
+            "select * from zone where repo='example/ledger-service' and status!='failed'"
         );
         assert_eq!(
             normalize_matrix_sql("select * from zone where type==chaincode and status==valid"),
             "select * from zone where type='chaincode' and status in ('compatible','passed','observed','candidate','valid','ready')"
         );
         assert_eq!(
-            normalize_matrix_sql(
-                "select * from deref where fact_id==smart-contract-tuple.vdr.0.1.0"
-            ),
-            "select * from deref where fact_id='smart-contract-tuple.vdr.0.1.0'"
+            normalize_matrix_sql("select * from deref where fact_id==release-bundle.api.1.0.0"),
+            "select * from deref where fact_id='release-bundle.api.1.0.0'"
         );
         assert_eq!(
-            normalize_matrix_sql("select * from requirements r where r.fact_id = odin.id"),
-            "select * from requirements r where r.fact_id = odin.id"
+            normalize_matrix_sql("select * from requirements r where r.fact_id = runtime.id"),
+            "select * from requirements r where r.fact_id = runtime.id"
         );
     }
 
     #[test]
     fn derives_short_component_keys() {
-        assert_eq!(component_key("@red-wiz/eos"), "eos");
-        assert_eq!(component_key("did_vdr_go"), "did_vdr_go");
+        assert_eq!(component_key("@example/ledger-service"), "ledger-service");
+        assert_eq!(component_key("identity_contract"), "identity_contract");
     }
 
     #[test]
     fn repo_override_does_not_inherit_git_source_context() {
         let context = MatrixContext::detect(ContextArgs {
-            repo: Some("red-wiz/eos".to_string()),
+            repo: Some("example/ledger-service".to_string()),
             ..ContextArgs::default()
         });
-        assert_eq!(context.repo.as_deref(), Some("red-wiz/eos"));
+        assert_eq!(context.repo.as_deref(), Some("example/ledger-service"));
         assert!(context.sha.is_none());
         assert!(context.reference.is_none());
         assert!(context.tag.is_none());
@@ -4270,10 +4275,10 @@ mod tests {
     #[test]
     fn zone_browsing_does_not_inherit_git_source_context() {
         let context = MatrixContext::detect_browsing(ContextArgs {
-            zone: Some("odin".to_string()),
+            zone: Some("runtime".to_string()),
             ..ContextArgs::default()
         });
-        assert_eq!(context.zone.as_deref(), Some("odin"));
+        assert_eq!(context.zone.as_deref(), Some("runtime"));
         assert!(context.repo.is_none());
         assert!(context.sha.is_none());
         assert!(context.reference.is_none());
@@ -4286,7 +4291,7 @@ mod tests {
         append_context_args(
             &mut command,
             &ContextArgs {
-                repo: Some("red-wiz/putto".to_string()),
+                repo: Some("example/payments-api".to_string()),
                 version: Some("v0.6.3".to_string()),
                 ..ContextArgs::default()
             },
@@ -4297,7 +4302,12 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             args,
-            vec!["--repo", "red-wiz/putto", "--target-version", "v0.6.3"]
+            vec![
+                "--repo",
+                "example/payments-api",
+                "--target-version",
+                "v0.6.3"
+            ]
         );
     }
 
@@ -4305,17 +4315,17 @@ mod tests {
     fn creates_contextual_zone_view() {
         let facts = vec![
             json!({
-                "id": "putto",
-                "track": "odin",
+                "id": "payments-api",
+                "track": "runtime",
                 "status": "candidate",
-                "source": {"repo": "red-wiz/putto"},
-                "subject": {"type": "npm", "name": "@red-wiz/oracle-vdr", "version": "0.6.12", "repo": "red-wiz/putto"}
+                "source": {"repo": "example/payments-api"},
+                "subject": {"type": "npm", "name": "@example/payments-sdk", "version": "0.6.12", "repo": "example/payments-api"}
             }),
             json!({
                 "id": "did",
-                "track": "odin",
+                "track": "runtime",
                 "status": "observed",
-                "subject": {"type": "chaincode", "name": "did_vdr_go", "version": "0.4.8", "repo": "red-wiz/hebe"}
+                "subject": {"type": "chaincode", "name": "identity_contract", "version": "0.4.8", "repo": "example/identity-contracts"}
             }),
             json!({
                 "id": "other",
@@ -4327,7 +4337,7 @@ mod tests {
         let db = build_facts_db(
             &facts,
             &MatrixContext {
-                repo: Some("red-wiz/putto".to_string()),
+                repo: Some("example/payments-api".to_string()),
                 ..MatrixContext::default()
             },
         )
@@ -4338,42 +4348,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result["rows"].as_array().unwrap().len(), 1);
-        assert_eq!(result["rows"][0]["component"], "did_vdr_go");
+        assert_eq!(result["rows"][0]["component"], "identity_contract");
     }
 
     #[test]
     fn exposes_one_shot_context_views() {
         let facts = vec![
             json!({
-                "id": "putto-1",
-                "zone": "odin",
+                "id": "payments-api-1",
+                "zone": "runtime",
                 "status": "valid",
-                "subject": {"type": "app", "name": "putto", "version": "v0.6.3", "repo": "red-wiz/putto"},
+                "subject": {"type": "app", "name": "payments-api", "version": "v0.6.3", "repo": "example/payments-api"},
                 "observedAt": "2026-06-18T00:00:00Z",
-                "provides": [{"capability": "cap.putto", "version": "1"}],
-                "requires": [{"capability": "cap.athena", "version": "2"}]
+                "provides": [{"capability": "cap.payments-api", "version": "1"}],
+                "requires": [{"capability": "cap.auth-service", "version": "2"}]
             }),
             json!({
-                "id": "athena-1",
-                "zone": "odin",
+                "id": "auth-service-1",
+                "zone": "runtime",
                 "status": "valid",
-                "subject": {"type": "service", "name": "athena", "version": "v1.2.0", "repo": "red-wiz/athena"},
+                "subject": {"type": "service", "name": "auth-service", "version": "v1.2.0", "repo": "example/auth-service"},
                 "observedAt": "2026-06-18T00:01:00Z",
-                "provides": [{"capability": "cap.athena", "version": "2"}]
+                "provides": [{"capability": "cap.auth-service", "version": "2"}]
             }),
             json!({
-                "id": "eos-1",
-                "zone": "odin",
+                "id": "ledger-service-1",
+                "zone": "runtime",
                 "status": "valid",
-                "subject": {"type": "service", "name": "eos", "version": "v2.0.0", "repo": "red-wiz/eos"},
+                "subject": {"type": "service", "name": "ledger-service", "version": "v2.0.0", "repo": "example/ledger-service"},
                 "observedAt": "2026-06-18T00:02:00Z",
-                "requires": [{"capability": "cap.putto", "version": "1"}]
+                "requires": [{"capability": "cap.payments-api", "version": "1"}]
             }),
         ];
         let context = MatrixContext::detect(ContextArgs {
-            zone: Some("odin".to_string()),
-            repo: Some("red-wiz/putto".to_string()),
-            component: Some("putto".to_string()),
+            zone: Some("runtime".to_string()),
+            repo: Some("example/payments-api".to_string()),
+            component: Some("payments-api".to_string()),
             version: Some("v0.6.3".to_string()),
             ..ContextArgs::default()
         });
@@ -4385,14 +4395,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(components["rows"].as_array().unwrap().len(), 1);
-        assert_eq!(components["rows"][0]["component"], "putto");
+        assert_eq!(components["rows"][0]["component"], "payments-api");
 
         let versions = execute_readonly_sql(
             &db,
             &versions_query_sql(
                 &db,
                 &context,
-                Some("putto"),
+                Some("payments-api"),
                 ComponentQueryOptions::default(),
                 10,
             ),
@@ -4402,47 +4412,61 @@ mod tests {
 
         let upstream =
             execute_readonly_sql(&db, &context_view_sql(ContextView::Upstream, 10)).unwrap();
-        assert_eq!(upstream["rows"][0]["component"], "athena");
+        assert_eq!(upstream["rows"][0]["component"], "auth-service");
 
         let compatible =
             execute_readonly_sql(&db, &context_view_sql(ContextView::Compatible, 10)).unwrap();
-        assert_eq!(compatible["rows"][0]["component"], "eos");
+        assert_eq!(compatible["rows"][0]["component"], "ledger-service");
 
-        let compare_eos =
-            execute_readonly_sql(&db, &compare_query_sql("red-wiz/eos", None, 10)).unwrap();
+        let compare_ledger_service =
+            execute_readonly_sql(&db, &compare_query_sql("example/ledger-service", None, 10))
+                .unwrap();
         assert_eq!(
-            compare_eos["rows"][0]["relationship"],
+            compare_ledger_service["rows"][0]["relationship"],
             "target_requires_current"
         );
-        assert_eq!(compare_eos["rows"][0]["target_component"], "eos");
-        assert_eq!(compare_eos["rows"][0]["capability"], "cap.putto");
-
-        let compare_athena =
-            execute_readonly_sql(&db, &compare_query_sql("athena", Some("v1.2.0"), 10)).unwrap();
         assert_eq!(
-            compare_athena["rows"][0]["relationship"],
+            compare_ledger_service["rows"][0]["target_component"],
+            "ledger-service"
+        );
+        assert_eq!(
+            compare_ledger_service["rows"][0]["capability"],
+            "cap.payments-api"
+        );
+
+        let compare_auth_service =
+            execute_readonly_sql(&db, &compare_query_sql("auth-service", Some("v1.2.0"), 10))
+                .unwrap();
+        assert_eq!(
+            compare_auth_service["rows"][0]["relationship"],
             "current_requires_target"
         );
-        assert_eq!(compare_athena["rows"][0]["target_subject"], "athena");
-        assert_eq!(compare_athena["rows"][0]["capability"], "cap.athena");
+        assert_eq!(
+            compare_auth_service["rows"][0]["target_subject"],
+            "auth-service"
+        );
+        assert_eq!(
+            compare_auth_service["rows"][0]["capability"],
+            "cap.auth-service"
+        );
     }
 
     #[test]
     fn filters_dependency_subjects_from_default_component_views() {
         let facts = vec![json!({
             "id": "dep-core",
-            "zone": "odin",
+            "zone": "runtime",
             "status": "observed",
             "subject": {
                 "type": "npm-dependency",
                 "name": "@credo-ts/core",
                 "version": "0.6.3",
-                "repo": "red-wiz/troy"
+                "repo": "example/web-client"
             },
             "observedAt": "2026-06-18T00:00:00Z"
         })];
         let context = MatrixContext::detect(ContextArgs {
-            repo: Some("red-wiz/troy".to_string()),
+            repo: Some("example/web-client".to_string()),
             ..ContextArgs::default()
         });
         let db = build_facts_db_with_init(&facts, &context, None).unwrap();
@@ -4496,13 +4520,13 @@ mod tests {
     fn exposes_canonical_identity_and_alias_matching() {
         let facts = vec![json!({
             "id": "dep-core",
-            "zone": "odin",
+            "zone": "runtime",
             "status": "observed",
             "subject": {
                 "type": "npm-dependency",
                 "name": "@credo-ts/core",
                 "version": "0.6.3",
-                "repo": "red-wiz/troy",
+                "repo": "example/web-client",
                 "aliases": ["credo-core"]
             },
             "observedAt": "2026-06-18T00:00:00Z"
@@ -4550,23 +4574,23 @@ mod tests {
     fn filters_active_context_by_version_and_component_key() {
         let facts = vec![
             json!({
-                "id": "eos-1",
-                "track": "odin",
+                "id": "ledger-service-1",
+                "track": "runtime",
                 "status": "candidate",
-                "subject": {"type": "npm", "name": "@red-wiz/eos", "version": "0.19.1", "repo": "red-wiz/eos"}
+                "subject": {"type": "npm", "name": "@example/ledger-service", "version": "0.19.1", "repo": "example/ledger-service"}
             }),
             json!({
-                "id": "eos-2",
-                "track": "odin",
+                "id": "ledger-service-2",
+                "track": "runtime",
                 "status": "candidate",
-                "subject": {"type": "npm", "name": "@red-wiz/eos", "version": "0.19.2", "repo": "red-wiz/eos"}
+                "subject": {"type": "npm", "name": "@example/ledger-service", "version": "0.19.2", "repo": "example/ledger-service"}
             }),
         ];
         let db = build_facts_db(
             &facts,
             &MatrixContext {
-                repo: Some("red-wiz/eos".to_string()),
-                component: Some("eos".to_string()),
+                repo: Some("example/ledger-service".to_string()),
+                component: Some("ledger-service".to_string()),
                 version: Some("0.19.2".to_string()),
                 ..MatrixContext::default()
             },
@@ -4575,8 +4599,8 @@ mod tests {
         let result =
             execute_readonly_sql(&db, "select id, component, version from active").unwrap();
         assert_eq!(result["rows"].as_array().unwrap().len(), 1);
-        assert_eq!(result["rows"][0]["id"], "eos-2");
-        assert_eq!(result["rows"][0]["component"], "eos");
+        assert_eq!(result["rows"][0]["id"], "ledger-service-2");
+        assert_eq!(result["rows"][0]["component"], "ledger-service");
     }
 
     #[test]
@@ -4584,51 +4608,51 @@ mod tests {
         let facts = vec![
             json!({
                 "acceptedAt": "2026-06-17T21:49:24.064Z",
-                "id": "chaincode.csr_vdr_go.0.2.9.6d562df953ec",
+                "id": "chaincode.profile_contract.0.2.9.6d562df953ec",
                 "kind": "CompatibilityFact",
-                "source": {"repository": "red-wiz/aglaea"},
-                "track": "odin",
+                "source": {"repository": "example/contract-service"},
+                "track": "runtime",
                 "fact": {
-                    "id": "chaincode.csr_vdr_go.0.2.9.6d562df953ec",
+                    "id": "chaincode.profile_contract.0.2.9.6d562df953ec",
                     "kind": "CompatibilityFact",
                     "observedAt": "2026-06-17T21:49:21.392Z",
                     "source": {
                         "ref": "refs/tags/v0.2.9",
-                        "repo": "red-wiz/aglaea",
+                        "repo": "example/contract-service",
                         "sha": "6d562df953eca829f918a6ea956482f761dccba8"
                     },
                     "status": "candidate",
                     "subject": {
-                        "name": "csr_vdr_go",
-                        "repo": "red-wiz/aglaea",
+                        "name": "profile_contract",
+                        "repo": "example/contract-service",
                         "type": "chaincode",
                         "version": "0.2.9"
                     },
-                    "track": "odin"
+                    "track": "runtime"
                 }
             }),
             json!({
                 "acceptedAt": "2026-06-17T21:49:24.133Z",
-                "id": "validation.odin.csr_vdr_go.0.2.9",
+                "id": "validation.runtime.profile_contract.0.2.9",
                 "kind": "ValidationFact",
-                "track": "odin",
+                "track": "runtime",
                 "fact": {
-                    "id": "validation.odin.csr_vdr_go.0.2.9",
+                    "id": "validation.runtime.profile_contract.0.2.9",
                     "kind": "ValidationFact",
                     "observedAt": "2026-06-17T21:49:21.392Z",
                     "source": {
-                        "repo": "red-wiz/aglaea",
+                        "repo": "example/contract-service",
                         "sha": "6d562df953eca829f918a6ea956482f761dccba8"
                     },
                     "status": "not-run",
-                    "track": "odin"
+                    "track": "runtime"
                 }
             }),
         ];
         let db = build_facts_db(
             &facts,
             &MatrixContext {
-                zone: Some("odin".to_string()),
+                zone: Some("runtime".to_string()),
                 ..MatrixContext::default()
             },
         )
@@ -4639,9 +4663,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result["rows"].as_array().unwrap().len(), 1);
-        assert_eq!(result["rows"][0]["component"], "csr_vdr_go");
+        assert_eq!(result["rows"][0]["component"], "profile_contract");
         assert_eq!(result["rows"][0]["version"], "0.2.9");
-        assert_eq!(result["rows"][0]["repo"], "red-wiz/aglaea");
+        assert_eq!(result["rows"][0]["repo"], "example/contract-service");
         assert_eq!(
             result["rows"][0]["source_sha"],
             "6d562df953eca829f918a6ea956482f761dccba8"
@@ -4655,127 +4679,130 @@ mod tests {
     fn supports_nested_capability_queries() {
         let facts = vec![
             json!({
-                "id": "athena",
-                "track": "odin",
+                "id": "auth-service",
+                "track": "runtime",
                 "status": "passed",
-                "subject": {"type": "npm", "name": "@red-wiz/athena", "version": "1.2.3", "repo": "red-wiz/athena"},
+                "subject": {"type": "npm", "name": "@example/auth-service", "version": "1.2.3", "repo": "example/auth-service"},
                 "provides": [{"capability": "native-askar", "version": "1.2.3"}]
             }),
             json!({
-                "id": "eos",
-                "track": "odin",
+                "id": "ledger-service",
+                "track": "runtime",
                 "status": "candidate",
-                "subject": {"type": "service", "name": "eos", "version": "2.0.0", "repo": "red-wiz/eos"},
+                "subject": {"type": "service", "name": "ledger-service", "version": "2.0.0", "repo": "example/ledger-service"},
                 "requires": [{"capability": "native-askar", "version": "1.2.3"}]
             }),
         ];
         let db = build_facts_db(
             &facts,
             &MatrixContext {
-                zone: Some("odin".to_string()),
+                zone: Some("runtime".to_string()),
                 ..MatrixContext::default()
             },
         )
         .unwrap();
         let result = execute_readonly_sql(
             &db,
-            "select id, component from odin
-             where repo==red-wiz/eos
+            "select id, component from runtime
+             where repo==example/ledger-service
                and exists (
                  select 1 from requirements r
-                 where r.fact_id = odin.id
+                 where r.fact_id = runtime.id
                    and r.capability in (
                      select p.capability from capabilities p
-                     where p.repo==red-wiz/athena and p.status==passed
+                     where p.repo==example/auth-service and p.status==passed
                    )
                )",
         )
         .unwrap();
         assert_eq!(result["rows"].as_array().unwrap().len(), 1);
-        assert_eq!(result["rows"][0]["component"], "eos");
+        assert_eq!(result["rows"][0]["component"], "ledger-service");
     }
 
     #[test]
     fn exposes_context_aware_dependency_views() {
         let facts = vec![
             json!({
-                "id": "athena",
-                "track": "odin",
+                "id": "auth-service",
+                "track": "runtime",
                 "status": "passed",
-                "subject": {"type": "npm", "name": "@red-wiz/athena", "version": "1.2.3", "repo": "red-wiz/athena"},
+                "subject": {"type": "npm", "name": "@example/auth-service", "version": "1.2.3", "repo": "example/auth-service"},
                 "provides": [{"capability": "native-askar", "version": "1.2.3"}]
             }),
             json!({
-                "id": "eos",
-                "track": "odin",
+                "id": "ledger-service",
+                "track": "runtime",
                 "status": "candidate",
-                "subject": {"type": "service", "name": "eos", "version": "2.0.0", "repo": "red-wiz/eos"},
+                "subject": {"type": "service", "name": "ledger-service", "version": "2.0.0", "repo": "example/ledger-service"},
                 "requires": [{"capability": "native-askar", "version": "1.2.3"}]
             }),
         ];
 
-        let eos_db = build_facts_db(
+        let ledger_service_db = build_facts_db(
             &facts,
             &MatrixContext {
-                repo: Some("red-wiz/eos".to_string()),
+                repo: Some("example/ledger-service".to_string()),
                 ..MatrixContext::default()
             },
         )
         .unwrap();
-        let upstream =
-            execute_readonly_sql(&eos_db, "select component, version from upstream").unwrap();
+        let upstream = execute_readonly_sql(
+            &ledger_service_db,
+            "select component, version from upstream",
+        )
+        .unwrap();
         assert_eq!(upstream["rows"].as_array().unwrap().len(), 1);
-        assert_eq!(upstream["rows"][0]["component"], "athena");
+        assert_eq!(upstream["rows"][0]["component"], "auth-service");
 
-        let athena_db = build_facts_db(
+        let auth_service_db = build_facts_db(
             &facts,
             &MatrixContext {
-                repo: Some("red-wiz/athena".to_string()),
+                repo: Some("example/auth-service".to_string()),
                 ..MatrixContext::default()
             },
         )
         .unwrap();
         let downstream = execute_readonly_sql(
-            &athena_db,
+            &auth_service_db,
             "select component, version, status from compatible_with_current",
         )
         .unwrap();
         assert_eq!(downstream["rows"].as_array().unwrap().len(), 1);
-        assert_eq!(downstream["rows"][0]["component"], "eos");
+        assert_eq!(downstream["rows"][0]["component"], "ledger-service");
         assert_eq!(downstream["rows"][0]["status"], "candidate");
     }
 
     #[test]
     fn exposes_fact_dereference_views() {
         let facts = vec![json!({
-            "id": "smart-contract-tuple.vdr.0.1.0",
+            "id": "release-bundle.api.1.0.0",
             "kind": "CompatibilityFact",
-            "track": "odin",
+            "track": "runtime",
             "status": "observed",
             "subject": {
-                "type": "smart-contract-tuple",
-                "name": "vdr",
+                "type": "release-bundle",
+                "name": "api",
                 "version": "0.1.0",
-                "repo": "red-wiz/compatibility-matrix"
+                "repo": "example/matrix-facts"
             },
             "members": [
                 {
-                    "component": "did_vdr_go",
+                    "component": "identity_contract",
                     "version": "0.4.9",
-                    "logicalChaincode": "did_vdr_go",
-                    "physicalChaincode": "did_vdr_go_v0_4_9",
+                    "logicalChaincode": "identity_contract",
+                    "physicalChaincode": "identity_contract_v0_4_9",
                     "channel": "dev",
                     "network": "obpcs",
                     "services": ["did"]
                 }
             ],
-            "requires": [{"capability": "chaincode:did_vdr_go", "version": "0.4.9"}],
-            "provides": [{"capability": "smart-contract-tuple:vdr", "version": "0.1.0"}]
+            "requires": [{"capability": "chaincode:identity_contract", "version": "0.4.9"}],
+            "provides": [{"capability": "release-bundle:api", "version": "0.1.0"}]
         })];
         let db = build_facts_db(
             &facts,
             &MatrixContext {
-                zone: Some("odin".to_string()),
+                zone: Some("runtime".to_string()),
                 ..MatrixContext::default()
             },
         )
@@ -4783,19 +4810,19 @@ mod tests {
 
         let members = execute_readonly_sql(
             &db,
-            "select component, version, physical_chaincode from members where fact_id==smart-contract-tuple.vdr.0.1.0",
+            "select component, version, physical_chaincode from members where fact_id==release-bundle.api.1.0.0",
         )
         .unwrap();
         assert_eq!(members["rows"].as_array().unwrap().len(), 1);
-        assert_eq!(members["rows"][0]["component"], "did_vdr_go");
+        assert_eq!(members["rows"][0]["component"], "identity_contract");
         assert_eq!(
             members["rows"][0]["physical_chaincode"],
-            "did_vdr_go_v0_4_9"
+            "identity_contract_v0_4_9"
         );
 
         let deref = execute_readonly_sql(
             &db,
-            "select edge, target, target_version from deref where fact_id==smart-contract-tuple.vdr.0.1.0 order by edge",
+            "select edge, target, target_version from deref where fact_id==release-bundle.api.1.0.0 order by edge",
         )
         .unwrap();
         let rows = deref["rows"].as_array().unwrap();
@@ -4806,14 +4833,14 @@ mod tests {
 
         let command_members = execute_readonly_sql(
             &db,
-            &fact_view_sql("smart-contract-tuple.vdr.0.1.0", FactView::Members),
+            &fact_view_sql("release-bundle.api.1.0.0", FactView::Members),
         )
         .unwrap();
         assert_eq!(command_members["rows"].as_array().unwrap().len(), 1);
 
         let command_deref = execute_readonly_sql(
             &db,
-            &fact_view_sql("smart-contract-tuple.vdr.0.1.0", FactView::Deref),
+            &fact_view_sql("release-bundle.api.1.0.0", FactView::Deref),
         )
         .unwrap();
         assert_eq!(command_deref["rows"].as_array().unwrap().len(), 3);
@@ -4822,16 +4849,16 @@ mod tests {
     #[test]
     fn applies_custom_sql_init_views() {
         let facts = vec![json!({
-            "id": "smart-contract-tuple.vdr.0.1.0",
+            "id": "release-bundle.api.1.0.0",
             "kind": "CompatibilityFact",
-            "track": "odin",
+            "track": "runtime",
             "status": "observed",
-            "subject": {"type": "smart-contract-tuple", "name": "vdr", "version": "0.1.0"},
+            "subject": {"type": "release-bundle", "name": "api", "version": "0.1.0"},
             "members": [
                 {
-                    "component": "did_vdr_go",
+                    "component": "identity_contract",
                     "version": "0.4.9",
-                    "physicalChaincode": "did_vdr_go_v0_4_9"
+                    "physicalChaincode": "identity_contract_v0_4_9"
                 }
             ]
         })];
@@ -4840,42 +4867,42 @@ mod tests {
             &MatrixContext::default(),
             Some(
                 "-- Matrix local shortcuts\n\
-                 create view vdr_tuple as\n\
+                 create view api_bundle as\n\
                  select component, version, physical_chaincode\n\
                  from members\n\
-                 where fact_id = 'smart-contract-tuple.vdr.0.1.0';",
+                 where fact_id = 'release-bundle.api.1.0.0';",
             ),
         )
         .unwrap();
-        let result = execute_readonly_sql(&db, "select * from vdr_tuple").unwrap();
+        let result = execute_readonly_sql(&db, "select * from api_bundle").unwrap();
         assert_eq!(result["rows"].as_array().unwrap().len(), 1);
-        assert_eq!(result["rows"][0]["component"], "did_vdr_go");
+        assert_eq!(result["rows"][0]["component"], "identity_contract");
     }
 
     #[test]
     fn parses_sql_pack_lists() {
         assert_eq!(
-            parse_sql_pack_list("base.sql, odin.sql,,team.sql"),
-            vec!["base.sql", "odin.sql", "team.sql"]
+            parse_sql_pack_list("base.sql, runtime.sql,,team.sql"),
+            vec!["base.sql", "runtime.sql", "team.sql"]
         );
     }
 
     #[test]
     fn applies_sql_pack_views() {
         let facts = vec![json!({
-            "id": "smart-contract-tuple.vdr.0.1.0",
+            "id": "release-bundle.api.1.0.0",
             "kind": "CompatibilityFact",
-            "track": "odin",
+            "track": "runtime",
             "status": "observed",
-            "subject": {"type": "smart-contract-tuple", "name": "vdr", "version": "0.1.0"},
+            "subject": {"type": "release-bundle", "name": "api", "version": "0.1.0"},
             "members": [
                 {
-                    "component": "did_vdr_go",
+                    "component": "identity_contract",
                     "version": "0.4.9",
-                    "physicalChaincode": "did_vdr_go_v0_4_9"
+                    "physicalChaincode": "identity_contract_v0_4_9"
                 }
             ],
-            "provides": [{"capability": "smart-contract-tuple:vdr", "version": "0.1.0"}]
+            "provides": [{"capability": "release-bundle:api", "version": "0.1.0"}]
         })];
         let db = build_facts_db_with_init(
             &facts,

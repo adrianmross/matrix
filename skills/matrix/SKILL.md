@@ -69,8 +69,9 @@ Use the `json` column for fields that have not been promoted into first-class
 columns yet.
 
 The local engine also exposes `active`, `zone`, `zones`, `subjects`,
-`components`, `valid_facts`, `invalid_facts`, `requirements`, `capabilities`,
-and one SQL-safe view per zone such as `odin`. In status filters,
+`components`, `identities`, `identity_aliases`, `valid_facts`,
+`invalid_facts`, `requirements`, `capabilities`, and one SQL-safe view per
+zone such as `runtime`. In status filters,
 `status==valid` expands to the compatible status set:
 `compatible`, `passed`, `observed`, `candidate`, `valid`, and `ready`.
 
@@ -85,5 +86,5 @@ start emitting facts before a specialized adapter exists.
 
 Use `matrix enter` when the user wants an interactive SQL session. In the REPL,
 `red` exits and `blue` clears local session context. Use `.context repo
-red-wiz/putto` or `.context set repo red-wiz/putto` to change context without
-leaving the REPL.
+example/payments-api` or `.context set repo example/payments-api` to change
+context without leaving the REPL.
