@@ -2237,7 +2237,7 @@ fn print_table_result(value: &Value, expanded: bool) -> Result<()> {
 
 fn print_csv_result(value: &Value) -> Result<()> {
     let columns = value["columns"].as_array().cloned().unwrap_or_default();
-    let rows = value["rows"].as_array().cloned().unwrap_or_default();
+    let rows = query_rows(value).as_array().cloned().unwrap_or_default();
     let column_names = columns.iter().filter_map(Value::as_str).collect::<Vec<_>>();
     println!(
         "{}",
@@ -2263,8 +2263,10 @@ fn print_csv_result(value: &Value) -> Result<()> {
 fn display_cell(value: &Value) -> String {
     match value {
         Value::Null => "".to_string(),
-        Value::String(value) => value.clone(),
-        _ => value.to_string(),
+        Value::String(value) => compact_json_text(value).unwrap_or_else(|| value.clone()),
+        Value::Bool(_) | Value::Number(_) => scalar_cell_value(value),
+        Value::Array(values) => compact_array_value(values),
+        Value::Object(object) => count_label(object.len(), "field"),
     }
 }
 
@@ -3320,12 +3322,14 @@ mod tests {
     }
 
     #[test]
-    fn leaves_csv_cells_machine_stable() {
-        assert_eq!(display_cell(&json!(["did", "vdr"])), "[\"did\",\"vdr\"]");
+    fn renders_csv_cells_as_spreadsheet_text() {
+        assert_eq!(display_cell(&json!(["did", "vdr"])), "did, vdr");
+        assert_eq!(display_cell(&json!("[\"did\",\"vdr\"]")), "did, vdr");
         assert_eq!(
-            display_cell(&json!({"requires": ["a", "b"]})),
-            "{\"requires\":[\"a\",\"b\"]}"
+            csv_escape(&display_cell(&json!(["did", "vdr"]))),
+            "\"did, vdr\""
         );
+        assert_eq!(display_cell(&json!({"requires": ["a", "b"]})), "1 field");
     }
 
     #[test]
