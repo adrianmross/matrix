@@ -86,6 +86,12 @@ enum Commands {
     Ingest(IngestArgs),
     Deref(FactQueryArgs),
     Members(FactQueryArgs),
+    Components(ListQueryArgs),
+    Versions(VersionQueryArgs),
+    Tags(ListQueryArgs),
+    Upstream(ListQueryArgs),
+    Downstream(ListQueryArgs),
+    Compatible(ListQueryArgs),
     Query(QueryArgs),
     Enter(ContextArgs),
     Update(UpdateCommand),
@@ -216,6 +222,28 @@ struct FactQueryArgs {
 }
 
 #[derive(Args, Clone)]
+struct ListQueryArgs {
+    #[arg(long, default_value_t = 1000)]
+    max_facts: usize,
+    #[arg(long, default_value_t = 50)]
+    limit: usize,
+    #[command(flatten)]
+    context: ContextArgs,
+}
+
+#[derive(Args, Clone)]
+struct VersionQueryArgs {
+    #[arg(value_name = "COMPONENT")]
+    component_filter: Option<String>,
+    #[arg(long, default_value_t = 1000)]
+    max_facts: usize,
+    #[arg(long, default_value_t = 50)]
+    limit: usize,
+    #[command(flatten)]
+    context: ContextArgs,
+}
+
+#[derive(Args, Clone)]
 struct UploadArgs {
     file: Option<PathBuf>,
     #[arg(long)]
@@ -301,6 +329,18 @@ pub async fn run_cli() -> Result<()> {
         Commands::Ingest(args) => ingest(&matrix, args).await?,
         Commands::Deref(args) => fact_view_query(&matrix, args, FactView::Deref).await?,
         Commands::Members(args) => fact_view_query(&matrix, args, FactView::Members).await?,
+        Commands::Components(args) => list_components_query(&matrix, args).await?,
+        Commands::Versions(args) => list_versions_query(&matrix, args).await?,
+        Commands::Tags(args) => list_tags_query(&matrix, args).await?,
+        Commands::Upstream(args) => {
+            context_view_query(&matrix, args, ContextView::Upstream).await?
+        }
+        Commands::Downstream(args) => {
+            context_view_query(&matrix, args, ContextView::Downstream).await?
+        }
+        Commands::Compatible(args) => {
+            context_view_query(&matrix, args, ContextView::Compatible).await?
+        }
         Commands::Query(args) => query(&matrix, args).await?,
         Commands::Enter(context) => dispatch_enter(&matrix, context)?,
         Commands::Update(command) => update_command(&matrix, command).await?,
@@ -872,6 +912,19 @@ impl MatrixContext {
                 .or_else(|| use_git_source_context.then(current_branch).flatten()),
         }
     }
+
+    fn detect_browsing(args: ContextArgs) -> Self {
+        let zone_only_scope =
+            args.zone.is_some() && args.repo.is_none() && args.component.is_none();
+        let mut context = Self::detect(args);
+        if zone_only_scope {
+            context.repo = None;
+            context.tag = None;
+            context.sha = None;
+            context.reference = None;
+        }
+        context
+    }
 }
 
 async fn trace(matrix: &Matrix, args: TraceArgs) -> Result<Value> {
@@ -962,6 +1015,179 @@ fn fact_view_sql(fact_id: &str, view: FactView) -> String {
              order by component"
         ),
     }
+}
+
+#[derive(Clone, Copy)]
+enum ContextView {
+    Upstream,
+    Downstream,
+    Compatible,
+}
+
+async fn list_components_query(matrix: &Matrix, args: ListQueryArgs) -> Result<Value> {
+    let context = MatrixContext::detect_browsing(args.context);
+    let db = query_db(matrix, args.max_facts, &context).await?;
+    let sql = components_query_sql(&db, &context, args.limit);
+    execute_readonly_sql(&db, &sql)
+}
+
+async fn list_versions_query(matrix: &Matrix, args: VersionQueryArgs) -> Result<Value> {
+    let context = MatrixContext::detect_browsing(args.context);
+    let db = query_db(matrix, args.max_facts, &context).await?;
+    let sql = versions_query_sql(&db, &context, args.component_filter.as_deref(), args.limit);
+    execute_readonly_sql(&db, &sql)
+}
+
+async fn list_tags_query(matrix: &Matrix, args: ListQueryArgs) -> Result<Value> {
+    let context = MatrixContext::detect_browsing(args.context);
+    let db = query_db(matrix, args.max_facts, &context).await?;
+    let sql = tags_query_sql(&db, &context, args.limit);
+    execute_readonly_sql(&db, &sql)
+}
+
+async fn context_view_query(
+    matrix: &Matrix,
+    args: ListQueryArgs,
+    view: ContextView,
+) -> Result<Value> {
+    let context = MatrixContext::detect_browsing(args.context);
+    let db = query_db(matrix, args.max_facts, &context).await?;
+    let sql = context_view_sql(view, args.limit);
+    execute_readonly_sql(&db, &sql)
+}
+
+async fn query_db(
+    matrix: &Matrix,
+    max_facts: usize,
+    context: &MatrixContext,
+) -> Result<Connection> {
+    let facts = fetch_facts(matrix, max_facts).await?;
+    let sql_init = matrix.sql_init()?;
+    build_facts_db_with_init(&facts, context, sql_init.as_deref())
+}
+
+fn components_query_sql(db: &Connection, context: &MatrixContext, limit: usize) -> String {
+    format!(
+        "select row_number() over (order by max(observed_at) desc, component asc) as pick,
+                component, repo, zone, count(*) as facts, max(observed_at) as last_observed_at
+         from components
+         where component is not null and component != '' {}
+         group by component, repo, zone
+         order by last_observed_at desc, component asc
+         limit {}",
+        context_filter_sql(db, context, "components", &["repo", "zone"]),
+        limit.max(1)
+    )
+}
+
+fn versions_query_sql(
+    db: &Connection,
+    context: &MatrixContext,
+    component_override: Option<&str>,
+    limit: usize,
+) -> String {
+    let component_filter = component_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            let component = sql_literal(&component_key(value));
+            let exact = sql_literal(value);
+            format!(" and (component = {component} or component = {exact})")
+        })
+        .unwrap_or_default();
+    format!(
+        "select row_number() over (order by max(observed_at) desc, version desc) as pick,
+                version, component, repo, zone, status, count(*) as facts, max(observed_at) as last_observed_at
+         from components
+         where version is not null and component is not null and component != '' {} {}
+         group by version, component, repo, zone, status
+         order by last_observed_at desc, version desc
+         limit {}",
+        context_filter_sql(db, context, "components", &["repo", "zone", "component"]),
+        component_filter,
+        limit.max(1)
+    )
+}
+
+fn tags_query_sql(db: &Connection, context: &MatrixContext, limit: usize) -> String {
+    format!(
+        "select row_number() over (order by max(observed_at) desc, tag desc) as pick,
+                tag, component, repo, zone, status, count(*) as facts, max(observed_at) as last_observed_at
+         from facts
+         where tag is not null {}
+         group by tag, component, repo, zone, status
+         order by last_observed_at desc, tag desc
+         limit {}",
+        context_filter_sql(db, context, "facts", &["repo", "zone", "component"]),
+        limit.max(1)
+    )
+}
+
+fn context_view_sql(view: ContextView, limit: usize) -> String {
+    let limit = limit.max(1);
+    match view {
+        ContextView::Upstream => format!(
+            "select current_component, current_version, capability, capability_version,
+                    component, version, repo, zone, status
+             from upstream
+             order by capability, status, component, version
+             limit {limit}"
+        ),
+        ContextView::Downstream => format!(
+            "select current_component, current_version, capability, capability_version,
+                    component, version, repo, zone, status
+             from downstream
+             order by capability, status, component, version
+             limit {limit}"
+        ),
+        ContextView::Compatible => format!(
+            "select current_component, current_version, capability, capability_version,
+                    component, version, repo, zone, status
+             from compatible_with_current
+             order by component, version, capability
+             limit {limit}"
+        ),
+    }
+}
+
+fn context_filter_sql(
+    db: &Connection,
+    context: &MatrixContext,
+    table: &str,
+    fields: &[&str],
+) -> String {
+    let mut filters = Vec::new();
+    if fields.contains(&"zone")
+        && let Some(zone) = query_context_string(db, "zone").or_else(|| context.zone.clone())
+    {
+        filters.push(format!("{table}.zone = {}", sql_literal(&zone)));
+    }
+    if fields.contains(&"repo")
+        && let Some(repo) = context.repo.as_deref()
+    {
+        filters.push(format!("{table}.repo = {}", sql_literal(repo)));
+    }
+    if fields.contains(&"component")
+        && let Some(component) = context.component.as_deref()
+    {
+        let key = sql_literal(&component_key(component));
+        let exact = sql_literal(component);
+        filters.push(format!(
+            "({table}.component = {key} or {table}.component = {exact})"
+        ));
+    }
+    if filters.is_empty() {
+        String::new()
+    } else {
+        format!(" and {}", filters.join(" and "))
+    }
+}
+
+fn query_context_string(db: &Connection, field: &str) -> Option<String> {
+    let sql = format!("select {field} from context limit 1");
+    db.query_row(&sql, [], |row| row.get::<_, Option<String>>(0))
+        .ok()
+        .flatten()
 }
 
 #[cfg(feature = "interactive")]
@@ -3356,6 +3582,43 @@ mod tests {
     }
 
     #[test]
+    fn accepts_context_view_commands() {
+        let compatible = Cli::try_parse_from([
+            "matrix",
+            "compatible",
+            "--repo",
+            "red-wiz/putto",
+            "--version",
+            "v0.6.3",
+            "--limit",
+            "25",
+            "-o",
+            "json",
+        ])
+        .unwrap();
+        assert_eq!(compatible.output, OutputFormat::Json);
+        match compatible.command {
+            Commands::Compatible(args) => {
+                assert_eq!(args.context.repo.as_deref(), Some("red-wiz/putto"));
+                assert_eq!(args.context.version.as_deref(), Some("v0.6.3"));
+                assert_eq!(args.limit, 25);
+            }
+            _ => panic!("expected compatible command"),
+        }
+
+        let versions =
+            Cli::try_parse_from(["matrix", "versions", "putto", "--repo", "red-wiz/putto"])
+                .unwrap();
+        match versions.command {
+            Commands::Versions(args) => {
+                assert_eq!(args.component_filter.as_deref(), Some("putto"));
+                assert_eq!(args.context.repo.as_deref(), Some("red-wiz/putto"));
+            }
+            _ => panic!("expected versions command"),
+        }
+    }
+
+    #[test]
     fn renders_objects_as_field_value_tables() {
         let text = generic_table_text(&json!({
             "track": "odin",
@@ -3571,6 +3834,19 @@ mod tests {
     }
 
     #[test]
+    fn zone_browsing_does_not_inherit_git_source_context() {
+        let context = MatrixContext::detect_browsing(ContextArgs {
+            zone: Some("odin".to_string()),
+            ..ContextArgs::default()
+        });
+        assert_eq!(context.zone.as_deref(), Some("odin"));
+        assert!(context.repo.is_none());
+        assert!(context.sha.is_none());
+        assert!(context.reference.is_none());
+        assert!(context.tag.is_none());
+    }
+
+    #[test]
     fn forwards_enter_context_to_shell_binary_args() {
         let mut command = ProcessCommand::new("matrix-enter");
         append_context_args(
@@ -3629,6 +3905,63 @@ mod tests {
         .unwrap();
         assert_eq!(result["rows"].as_array().unwrap().len(), 1);
         assert_eq!(result["rows"][0]["component"], "did_vdr_go");
+    }
+
+    #[test]
+    fn exposes_one_shot_context_views() {
+        let facts = vec![
+            json!({
+                "id": "putto-1",
+                "zone": "odin",
+                "status": "valid",
+                "subject": {"type": "app", "name": "putto", "version": "v0.6.3", "repo": "red-wiz/putto"},
+                "observedAt": "2026-06-18T00:00:00Z",
+                "provides": [{"capability": "cap.putto", "version": "1"}],
+                "requires": [{"capability": "cap.athena", "version": "2"}]
+            }),
+            json!({
+                "id": "athena-1",
+                "zone": "odin",
+                "status": "valid",
+                "subject": {"type": "service", "name": "athena", "version": "v1.2.0", "repo": "red-wiz/athena"},
+                "observedAt": "2026-06-18T00:01:00Z",
+                "provides": [{"capability": "cap.athena", "version": "2"}]
+            }),
+            json!({
+                "id": "eos-1",
+                "zone": "odin",
+                "status": "valid",
+                "subject": {"type": "service", "name": "eos", "version": "v2.0.0", "repo": "red-wiz/eos"},
+                "observedAt": "2026-06-18T00:02:00Z",
+                "requires": [{"capability": "cap.putto", "version": "1"}]
+            }),
+        ];
+        let context = MatrixContext::detect(ContextArgs {
+            zone: Some("odin".to_string()),
+            repo: Some("red-wiz/putto".to_string()),
+            component: Some("putto".to_string()),
+            version: Some("v0.6.3".to_string()),
+            ..ContextArgs::default()
+        });
+        let db = build_facts_db_with_init(&facts, &context, None).unwrap();
+
+        let components =
+            execute_readonly_sql(&db, &components_query_sql(&db, &context, 10)).unwrap();
+        assert_eq!(components["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(components["rows"][0]["component"], "putto");
+
+        let versions =
+            execute_readonly_sql(&db, &versions_query_sql(&db, &context, Some("putto"), 10))
+                .unwrap();
+        assert_eq!(versions["rows"][0]["version"], "v0.6.3");
+
+        let upstream =
+            execute_readonly_sql(&db, &context_view_sql(ContextView::Upstream, 10)).unwrap();
+        assert_eq!(upstream["rows"][0]["component"], "athena");
+
+        let compatible =
+            execute_readonly_sql(&db, &context_view_sql(ContextView::Compatible, 10)).unwrap();
+        assert_eq!(compatible["rows"][0]["component"], "eos");
     }
 
     #[test]

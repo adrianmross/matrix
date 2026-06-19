@@ -226,6 +226,18 @@ matrix members smart-contract-tuple.vdr.0.1.0
 matrix deref smart-contract-tuple.vdr.0.1.0
 ```
 
+For context-aware inspection, use built-in views instead of remembering the
+view names:
+
+```bash
+matrix components --zone odin
+matrix versions putto --repo red-wiz/putto
+matrix tags --repo red-wiz/putto
+matrix upstream --repo red-wiz/putto --version v0.6.3
+matrix downstream --repo red-wiz/athena --version v1.2.0
+matrix compatible --repo red-wiz/putto --version v0.6.3
+```
+
 Custom shortcuts can be loaded as SQLite view packs:
 
 ```bash
@@ -302,7 +314,7 @@ Useful commands:
 - `.examples`: print copyable SQL and helper-command examples.
 - `.members <fact-id>`: show tuple members for a fact.
 - `.deref <fact-id>`: show member, requirement, and provide edges for a fact.
-- `.mode table|json|yaml|csv`: change result rendering.
+- `.mode human|table|json|yaml|csv`: change result rendering.
 - `.x`: toggle expanded records.
 - `.timing`: toggle query timings.
 - `.limit <n>`: change the fact fetch limit and refresh the cache.
