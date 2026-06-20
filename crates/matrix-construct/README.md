@@ -29,6 +29,8 @@ History is exposed through:
 
 ```bash
 curl http://127.0.0.1:8080/v1/matrix/facts/example/history
+curl 'http://127.0.0.1:8080/v1/matrix/facts/example/history?relative=-1'
+curl 'http://127.0.0.1:8080/v1/matrix/facts/example/history?asOf=2026-06-19'
 ```
 
 The response shape is:
@@ -60,6 +62,16 @@ The response shape is:
   }
 }
 ```
+
+Selectors return a one-event `events` page:
+
+- `revision=2`: exact revision number.
+- `eventId=event...`: exact immutable event ID.
+- `relative=-1`: offset from the current revision.
+- `relative=-1&fromRevision=3`: offset from a specific base revision.
+- `relative=-1&fromEvent=event...`: offset from a specific base event.
+- `asOf=2026-06-19` or `asOf=2026-06-19T16:00:00Z`: latest revision accepted
+  at or before a date or timestamp.
 
 Producers should use stable fact IDs for logical records that can change over
 time, such as a release tuple or compatibility assertion. The construct assigns

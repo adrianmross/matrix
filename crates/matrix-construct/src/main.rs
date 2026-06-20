@@ -14,7 +14,7 @@ use axum::{
     routing::get,
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use chrono::Utc;
+use chrono::{DateTime, NaiveDate, Utc};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -56,6 +56,16 @@ struct FactQuery {
 struct FactHistoryQuery {
     limit: Option<usize>,
     cursor: Option<String>,
+    revision: Option<i64>,
+    #[serde(rename = "eventId")]
+    event_id: Option<String>,
+    relative: Option<i64>,
+    #[serde(rename = "fromRevision")]
+    from_revision: Option<i64>,
+    #[serde(rename = "fromEvent")]
+    from_event: Option<String>,
+    #[serde(rename = "asOf")]
+    as_of: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -519,13 +529,22 @@ fn query_fact_history(
     fact_id: &str,
     query: &FactHistoryQuery,
 ) -> Result<FactHistoryPage, ApiError> {
-    let limit = query.limit.unwrap_or(25).clamp(1, 200);
-    let offset = query
-        .cursor
-        .as_deref()
-        .map(decode_cursor)
-        .transpose()?
-        .unwrap_or(0);
+    let selected = query.selected_revision().map_err(bad_request)?;
+    let limit = if selected.is_some() {
+        1
+    } else {
+        query.limit.unwrap_or(25).clamp(1, 200)
+    };
+    let offset = if selected.is_some() {
+        0
+    } else {
+        query
+            .cursor
+            .as_deref()
+            .map(decode_cursor)
+            .transpose()?
+            .unwrap_or(0)
+    };
     let mut stmt = db
         .prepare(
             "select event_id, fact_id, revision, accepted_at, content_hash,
@@ -557,11 +576,78 @@ fn query_fact_history(
     }
 
     let current_revision = stored.last().map(|event| event.revision).unwrap_or(0);
+    let selected_index = match selected {
+        Some(FactRevisionSelector::Revision(revision)) => Some(
+            stored
+                .iter()
+                .position(|event| event.revision == revision)
+                .ok_or_else(|| not_found(format!("fact {fact_id:?} has no revision {revision}")))?,
+        ),
+        Some(FactRevisionSelector::Event(event_id)) => Some(
+            stored
+                .iter()
+                .position(|event| event.event_id == event_id)
+                .ok_or_else(|| not_found(format!("fact {fact_id:?} has no event {event_id:?}")))?,
+        ),
+        Some(FactRevisionSelector::Relative {
+            offset,
+            base_revision,
+            base_event_id,
+        }) => {
+            let base_revision = match (base_revision, base_event_id) {
+                (Some(revision), None) => revision,
+                (None, Some(event_id)) => stored
+                    .iter()
+                    .find(|event| event.event_id == event_id)
+                    .map(|event| event.revision)
+                    .ok_or_else(|| {
+                        not_found(format!("fact {fact_id:?} has no event {event_id:?}"))
+                    })?,
+                (None, None) => current_revision,
+                (Some(_), Some(_)) => {
+                    return Err(bad_request("use only one of fromRevision or fromEvent"));
+                }
+            };
+            let revision = base_revision + offset;
+            Some(
+                stored
+                    .iter()
+                    .position(|event| event.revision == revision)
+                    .ok_or_else(|| {
+                        not_found(format!(
+                            "fact {fact_id:?} has no revision {revision} for relative offset {offset}"
+                        ))
+                    })?,
+            )
+        }
+        Some(FactRevisionSelector::AsOf(as_of)) => {
+            let as_of = parse_as_of(&as_of).map_err(bad_request)?;
+            Some(
+                stored
+                    .iter()
+                    .rposition(|event| {
+                        parse_event_time(&event.accepted_at)
+                            .map(|accepted_at| accepted_at <= as_of)
+                            .unwrap_or(false)
+                    })
+                    .ok_or_else(|| {
+                        not_found(format!(
+                            "fact {fact_id:?} has no revision at or before {as_of}"
+                        ))
+                    })?,
+            )
+        }
+        None => None,
+    };
     let mut events = Vec::new();
-    for index in 0..stored.len() {
+    if let Some(index) = selected_index {
         events.push(stored[index].to_json(current_revision, stored.get(index + 1))?);
+    } else {
+        for index in 0..stored.len() {
+            events.push(stored[index].to_json(current_revision, stored.get(index + 1))?);
+        }
+        events.reverse();
     }
-    events.reverse();
 
     let total = events.len();
     let events = events
@@ -617,6 +703,56 @@ impl StoredFactEvent {
             "supersededAt": next.map(|event| event.accepted_at.clone()),
             "fact": serde_json::from_str::<Value>(&self.json).map_err(internal)?,
         }))
+    }
+}
+
+enum FactRevisionSelector {
+    Revision(i64),
+    Event(String),
+    Relative {
+        offset: i64,
+        base_revision: Option<i64>,
+        base_event_id: Option<String>,
+    },
+    AsOf(String),
+}
+
+impl FactHistoryQuery {
+    fn selected_revision(&self) -> std::result::Result<Option<FactRevisionSelector>, String> {
+        let selectors = [
+            self.revision.is_some(),
+            self.event_id.is_some(),
+            self.relative.is_some(),
+            self.as_of.is_some(),
+        ]
+        .into_iter()
+        .filter(|selected| *selected)
+        .count();
+        if selectors > 1 {
+            return Err(
+                "use only one of revision, eventId, relative, or asOf for history selection"
+                    .to_string(),
+            );
+        }
+        if (self.from_revision.is_some() || self.from_event.is_some()) && self.relative.is_none() {
+            return Err("fromRevision and fromEvent require relative".to_string());
+        }
+        if self.from_revision.is_some() && self.from_event.is_some() {
+            return Err("use only one of fromRevision or fromEvent".to_string());
+        }
+        Ok(if let Some(revision) = self.revision {
+            Some(FactRevisionSelector::Revision(revision))
+        } else if let Some(event_id) = self.event_id.clone() {
+            Some(FactRevisionSelector::Event(event_id))
+        } else if let Some(offset) = self.relative {
+            Some(FactRevisionSelector::Relative {
+                offset,
+                base_revision: self.from_revision,
+                base_event_id: self.from_event.clone(),
+            })
+        } else {
+            self.as_of.clone().map(FactRevisionSelector::AsOf)
+        })
     }
 }
 
@@ -746,6 +882,24 @@ fn event_id(fact_id: &str, revision: i64, accepted_at: &str, content_hash: &str)
     format!("event.{}", URL_SAFE_NO_PAD.encode(hash.finalize()))
 }
 
+fn parse_as_of(value: &str) -> std::result::Result<DateTime<Utc>, String> {
+    if let Ok(value) = DateTime::parse_from_rfc3339(value) {
+        return Ok(value.with_timezone(&Utc));
+    }
+    let date = NaiveDate::parse_from_str(value, "%Y-%m-%d")
+        .map_err(|_| "asOf must be RFC3339 timestamp or YYYY-MM-DD date".to_string())?;
+    let date_time = date
+        .and_hms_opt(23, 59, 59)
+        .ok_or_else(|| "asOf date is invalid".to_string())?;
+    Ok(DateTime::from_naive_utc_and_offset(date_time, Utc))
+}
+
+fn parse_event_time(value: &str) -> std::result::Result<DateTime<Utc>, String> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|value| value.with_timezone(&Utc))
+        .map_err(|error| error.to_string())
+}
+
 fn encode_cursor(offset: usize) -> String {
     URL_SAFE_NO_PAD.encode(offset.to_string())
 }
@@ -866,5 +1020,52 @@ mod tests {
         assert_eq!(history.events[1]["status"], "superseded");
         assert_eq!(history.events[1]["fact"]["status"], "candidate");
         assert!(history.events[1]["supersededBy"].is_string());
+
+        let revision_one = query_fact_history(
+            &db,
+            "tuple.api.1.0.0",
+            &FactHistoryQuery {
+                revision: Some(1),
+                ..FactHistoryQuery::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(revision_one.events.len(), 1);
+        assert_eq!(revision_one.events[0]["revision"], 1);
+        assert_eq!(revision_one.events[0]["fact"]["status"], "candidate");
+
+        let previous = query_fact_history(
+            &db,
+            "tuple.api.1.0.0",
+            &FactHistoryQuery {
+                relative: Some(-1),
+                ..FactHistoryQuery::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(previous.events[0]["revision"], 1);
+
+        let current_event_id = history.events[0]["eventId"].as_str().unwrap().to_string();
+        let by_event = query_fact_history(
+            &db,
+            "tuple.api.1.0.0",
+            &FactHistoryQuery {
+                event_id: Some(current_event_id),
+                ..FactHistoryQuery::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(by_event.events[0]["revision"], 2);
+
+        let future = query_fact_history(
+            &db,
+            "tuple.api.1.0.0",
+            &FactHistoryQuery {
+                as_of: Some("2999-01-01".to_string()),
+                ..FactHistoryQuery::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(future.events[0]["revision"], 2);
     }
 }

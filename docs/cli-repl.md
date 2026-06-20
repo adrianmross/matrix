@@ -111,4 +111,6 @@ cache:
 
 ```text
 .history release-bundle.api.1.0.0
+.history release-bundle.api.1.0.0 --relative -1
+.history release-bundle.api.1.0.0 --as-of 2026-06-19
 ```

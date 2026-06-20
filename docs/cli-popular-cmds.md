@@ -66,6 +66,8 @@ matrix members release-bundle.api.1.0.0
 matrix deref release-bundle.api.1.0.0
 matrix history release-bundle.api.1.0.0
 matrix supersedes release-bundle.api.1.0.0 -o json
+matrix history release-bundle.api.1.0.0 --relative -1
+matrix history release-bundle.api.1.0.0 --as-of 2026-06-19
 matrix query 'select component, version, runtime from members where fact_id==release-bundle.api.1.0.0'
 ```
 

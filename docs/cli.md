@@ -155,6 +155,22 @@ Structured output returns the construct event objects, including `eventId`,
 `factId`, `revision`, `acceptedAt`, `contentHash`, `supersededBy`,
 `supersededAt`, and the preserved `fact` body.
 
+Select one revision when you do not need the full audit list:
+
+```bash
+matrix history release-bundle.api.1.0.0 --revision 2
+matrix history release-bundle.api.1.0.0 --relative -1
+matrix history release-bundle.api.1.0.0 --relative -1 --from-revision 3
+matrix history release-bundle.api.1.0.0 --relative -1 --from-event event.abc123
+matrix history release-bundle.api.1.0.0 --event event.abc123
+matrix history release-bundle.api.1.0.0 --as-of 2026-06-19
+matrix history release-bundle.api.1.0.0 --as-of 2026-06-19T16:00:00Z
+```
+
+`--relative -1` means one revision before current by default. Use
+`--from-revision` or `--from-event` to make the offset relative to a different
+base revision.
+
 Producer guidance:
 
 - Reuse `fact.id` for the same logical assertion or tuple across updates.

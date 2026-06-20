@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use directories::ProjectDirs;
 use reqwest::{Method, header::CONTENT_TYPE};
@@ -156,10 +156,27 @@ struct TraceArgs {
 }
 
 #[derive(Args)]
+#[command(group(
+    ArgGroup::new("history_selector")
+        .args(["revision", "event", "relative", "as_of"])
+        .multiple(false)
+))]
 struct HistoryArgs {
     fact_id: String,
     #[arg(long, default_value_t = 25)]
     limit: usize,
+    #[arg(long)]
+    revision: Option<i64>,
+    #[arg(long)]
+    event: Option<String>,
+    #[arg(long, allow_hyphen_values = true)]
+    relative: Option<i64>,
+    #[arg(long)]
+    from_revision: Option<i64>,
+    #[arg(long)]
+    from_event: Option<String>,
+    #[arg(long = "as-of")]
+    as_of: Option<String>,
 }
 
 #[derive(Args, Clone, Default)]
@@ -999,11 +1016,30 @@ async fn trace(matrix: &Matrix, args: TraceArgs) -> Result<Value> {
 }
 
 async fn history(matrix: &Matrix, args: HistoryArgs) -> Result<Value> {
+    let mut query = vec![("limit", args.limit.max(1).to_string())];
+    if let Some(revision) = args.revision {
+        query.push(("revision", revision.to_string()));
+    }
+    if let Some(event) = args.event {
+        query.push(("eventId", event));
+    }
+    if let Some(relative) = args.relative {
+        query.push(("relative", relative.to_string()));
+    }
+    if let Some(from_revision) = args.from_revision {
+        query.push(("fromRevision", from_revision.to_string()));
+    }
+    if let Some(from_event) = args.from_event {
+        query.push(("fromEvent", from_event));
+    }
+    if let Some(as_of) = args.as_of {
+        query.push(("asOf", as_of));
+    }
     matrix
         .get(&format!(
-            "/facts/{}/history?limit={}",
+            "/facts/{}/history?{}",
             enc(&args.fact_id),
-            args.limit.max(1)
+            query_string(query)
         ))
         .await
 }
@@ -1288,6 +1324,16 @@ fn parse_compare_repl_args(args: Vec<&str>) -> Result<(String, Option<String>)> 
         bail!("usage: .compare <component|repo|subject> [--target-version <version>]");
     }
     Ok((target.join(" "), target_version))
+}
+
+#[cfg(feature = "interactive")]
+fn parse_repl_history_args(args: Vec<&str>) -> Result<HistoryArgs> {
+    let mut argv = vec!["matrix", "history"];
+    argv.extend(args);
+    match Cli::try_parse_from(argv)?.command {
+        Commands::History(args) => Ok(args),
+        _ => unreachable!("history argv should parse as history command"),
+    }
 }
 
 fn tags_query_sql(db: &Connection, context: &MatrixContext, limit: usize) -> String {
@@ -1684,14 +1730,12 @@ impl<'a> ReplSession<'a> {
                 }
             }
             "history" | "supersedes" => {
-                let fact_id = parts.collect::<Vec<_>>().join(" ");
-                if fact_id.is_empty() {
+                let args = parts.collect::<Vec<_>>();
+                if args.is_empty() {
                     eprintln!("Usage: .{name} <fact-id>");
                 } else {
-                    let value = self
-                        .matrix
-                        .get(&format!("/facts/{}/history?limit=25", enc(&fact_id)))
-                        .await?;
+                    let args = parse_repl_history_args(args)?;
+                    let value = history(self.matrix, args).await?;
                     print_value(&value, self.matrix.output)?;
                 }
             }
@@ -3024,6 +3068,8 @@ Matrix shell commands
   .deref <fact-id>          Show member/require/provide edges for a fact
   .members <fact-id>        Show tuple members for a fact
   .history <fact-id>        Show accepted revisions for a fact
+  .history <fact-id> --relative -1
+                            Show a selected revision by offset from current
   .compare <target>         Compare active context to a component/repo/subject
   .why <target>             Alias for .compare
   .examples                 Show copyable query examples
@@ -3067,6 +3113,8 @@ where fact_id==release-bundle.api.1.0.0;
 
 .members release-bundle.api.1.0.0
 .deref release-bundle.api.1.0.0
+.history release-bundle.api.1.0.0 --relative -1
+.history release-bundle.api.1.0.0 --as-of 2026-06-19
 .compare ledger-service
 .why example/ledger-service --target-version v2.4.0
 "#
@@ -3149,6 +3197,13 @@ impl MatrixCompleter {
             ".zones",
             "/help",
             "/status",
+            "--as-of",
+            "--event",
+            "--from-event",
+            "--from-revision",
+            "--relative",
+            "--revision",
+            "--target-version",
             "blue",
             "by",
             "capabilities",
@@ -4101,6 +4156,52 @@ mod tests {
                 assert_eq!(args.limit, 25);
             }
             _ => panic!("expected supersedes command"),
+        }
+
+        let selected = Cli::try_parse_from([
+            "matrix",
+            "history",
+            "release-bundle.api.1.0.0",
+            "--relative",
+            "-1",
+            "--from-revision",
+            "3",
+            "--as-of",
+            "2026-06-19",
+        ]);
+        assert!(selected.is_err());
+
+        let relative = Cli::try_parse_from([
+            "matrix",
+            "history",
+            "release-bundle.api.1.0.0",
+            "--relative",
+            "-1",
+            "--from-event",
+            "event.abc",
+        ])
+        .unwrap();
+        match relative.command {
+            Commands::History(args) => {
+                assert_eq!(args.relative, Some(-1));
+                assert_eq!(args.from_event.as_deref(), Some("event.abc"));
+            }
+            _ => panic!("expected history command"),
+        }
+
+        let as_of = Cli::try_parse_from([
+            "matrix",
+            "history",
+            "release-bundle.api.1.0.0",
+            "--as-of",
+            "2026-06-19T16:00:00Z",
+        ])
+        .unwrap();
+        match as_of.command {
+            Commands::History(args) => {
+                assert_eq!(args.as_of.as_deref(), Some("2026-06-19T16:00:00Z"));
+            }
+            _ => panic!("expected history command"),
         }
     }
 
