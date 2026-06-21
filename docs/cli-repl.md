@@ -58,6 +58,7 @@ clears the current local session context.
 - `.tables`, `.views`, `.schema [table]`, `.describe [table]`: inspect the
   local query model.
 - `.examples`: print copyable SQL and helper-command examples.
+- `.get <fact-id>`: show the current or selected revision of a fact.
 - `.members <fact-id>`: show tuple members for a fact.
 - `.deref <fact-id>`: show member, requirement, and provide edges for a fact.
 - `.history <fact-id>`: show accepted revisions and supersession metadata for a
@@ -110,6 +111,8 @@ History comes from the construct audit endpoint rather than the local session
 cache:
 
 ```text
+.get release-bundle.api.1.0.0
+.get release-bundle.api.1.0.0 --relative -1
 .history release-bundle.api.1.0.0
 .history release-bundle.api.1.0.0 --relative -1
 .history release-bundle.api.1.0.0 --as-of 2026-06-19

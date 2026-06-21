@@ -123,6 +123,7 @@ Some facts describe a tuple, bundle, or aggregate of other members. Use
 `members` and `deref` to inspect those records:
 
 ```bash
+matrix get release-bundle.api.1.0.0
 matrix members release-bundle.api.1.0.0
 matrix deref release-bundle.api.1.0.0
 matrix history release-bundle.api.1.0.0
@@ -142,9 +143,12 @@ where fact_id==release-bundle.api.1.0.0;
 
 Facts use stable IDs for logical compatibility records. When a producer submits
 the same ID again, the construct keeps the latest body in `facts` and appends an
-immutable accepted event. Use history commands to inspect prior accepted bodies:
+immutable accepted event. Use `get` to read the current or selected body, and
+`history` to inspect the audit list:
 
 ```bash
+matrix get release-bundle.api.1.0.0
+matrix get release-bundle.api.1.0.0 --relative -1
 matrix history release-bundle.api.1.0.0
 matrix supersedes release-bundle.api.1.0.0 -o json
 ```
@@ -160,16 +164,16 @@ Select one revision when you do not need the full audit list:
 ```bash
 matrix history release-bundle.api.1.0.0 --revision 2
 matrix history release-bundle.api.1.0.0 --relative -1
-matrix history release-bundle.api.1.0.0 --relative -1 --from-revision 3
-matrix history release-bundle.api.1.0.0 --relative -1 --from-event event.abc123
+matrix history release-bundle.api.1.0.0 --revision 3 --relative -1
+matrix history release-bundle.api.1.0.0 --event event.abc123 --relative -1
 matrix history release-bundle.api.1.0.0 --event event.abc123
 matrix history release-bundle.api.1.0.0 --as-of 2026-06-19
 matrix history release-bundle.api.1.0.0 --as-of 2026-06-19T16:00:00Z
 ```
 
 `--relative -1` means one revision before current by default. Use
-`--from-revision` or `--from-event` to make the offset relative to a different
-base revision.
+`--revision` or `--event` with `--relative` to make the offset relative to a
+different base revision.
 
 Producer guidance:
 

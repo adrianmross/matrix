@@ -1,6 +1,6 @@
 [package]
 name = "matrix-enter"
-version = "0.3.10"
+version = "0.3.11"
 edition = "2024"
 description = "Interactive SQL shell for the Matrix compatibility CLI."
 license = "Apache-2.0"

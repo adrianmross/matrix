@@ -13,6 +13,7 @@ clients such as the `matrix` CLI.
 - `GET /v1/matrix/zones/{zone}/candidates/{level}`
 - `GET /v1/matrix/facts`
 - `GET /v1/matrix/facts/latest`
+- `GET /v1/matrix/facts/{id}`
 - `GET /v1/matrix/facts/{id}/history`
 - `POST /v1/matrix/facts`
 
@@ -25,7 +26,15 @@ migrating from track-based APIs.
 producer submits the same fact ID again, the current `facts` row is updated and
 the construct appends an immutable event to `fact_events`.
 
-History is exposed through:
+The current or selected fact body is exposed through the standard fact getter:
+
+```bash
+curl http://127.0.0.1:8080/v1/matrix/facts/example
+curl 'http://127.0.0.1:8080/v1/matrix/facts/example?relative=-1'
+curl 'http://127.0.0.1:8080/v1/matrix/facts/example?revision=3&relative=-1'
+```
+
+Full history is exposed through:
 
 ```bash
 curl http://127.0.0.1:8080/v1/matrix/facts/example/history
@@ -68,8 +77,8 @@ Selectors return a one-event `events` page:
 - `revision=2`: exact revision number.
 - `eventId=event...`: exact immutable event ID.
 - `relative=-1`: offset from the current revision.
-- `relative=-1&fromRevision=3`: offset from a specific base revision.
-- `relative=-1&fromEvent=event...`: offset from a specific base event.
+- `revision=3&relative=-1`: offset from a specific base revision.
+- `eventId=event...&relative=-1`: offset from a specific base event.
 - `asOf=2026-06-19` or `asOf=2026-06-19T16:00:00Z`: latest revision accepted
   at or before a date or timestamp.
 

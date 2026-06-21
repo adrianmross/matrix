@@ -62,6 +62,8 @@ matrix query 'select alias, identity from identity_aliases order by alias limit 
 ## Fact Bundles
 
 ```bash
+matrix get release-bundle.api.1.0.0
+matrix get release-bundle.api.1.0.0 --relative -1
 matrix members release-bundle.api.1.0.0
 matrix deref release-bundle.api.1.0.0
 matrix history release-bundle.api.1.0.0

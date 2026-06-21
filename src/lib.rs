@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{ArgGroup, Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use directories::ProjectDirs;
 use reqwest::{Method, header::CONTENT_TYPE};
@@ -81,6 +81,7 @@ enum Commands {
         level: String,
     },
     Trace(TraceArgs),
+    Get(FactGetArgs),
     History(HistoryArgs),
     Supersedes(HistoryArgs),
     Upload(UploadArgs),
@@ -156,25 +157,33 @@ struct TraceArgs {
 }
 
 #[derive(Args)]
-#[command(group(
-    ArgGroup::new("history_selector")
-        .args(["revision", "event", "relative", "as_of"])
-        .multiple(false)
-))]
 struct HistoryArgs {
     fact_id: String,
     #[arg(long, default_value_t = 25)]
     limit: usize,
+    #[command(flatten)]
+    selector: RevisionSelectorArgs,
+}
+
+#[derive(Args)]
+struct FactGetArgs {
+    fact_id: String,
+    #[arg(long)]
+    history: bool,
+    #[arg(long, default_value_t = 25)]
+    limit: usize,
+    #[command(flatten)]
+    selector: RevisionSelectorArgs,
+}
+
+#[derive(Args, Clone, Default)]
+struct RevisionSelectorArgs {
     #[arg(long)]
     revision: Option<i64>,
     #[arg(long)]
     event: Option<String>,
     #[arg(long, allow_hyphen_values = true)]
     relative: Option<i64>,
-    #[arg(long)]
-    from_revision: Option<i64>,
-    #[arg(long)]
-    from_event: Option<String>,
     #[arg(long = "as-of")]
     as_of: Option<String>,
 }
@@ -382,6 +391,7 @@ pub async fn run_cli() -> Result<()> {
                 .await?
         }
         Commands::Trace(args) => trace(&matrix, args).await?,
+        Commands::Get(args) => get_fact(&matrix, args).await?,
         Commands::History(args) | Commands::Supersedes(args) => history(&matrix, args).await?,
         Commands::Upload(args) | Commands::Publish(args) => upload(&matrix, args).await?,
         Commands::Ingest(args) => ingest(&matrix, args).await?,
@@ -1015,26 +1025,24 @@ async fn trace(matrix: &Matrix, args: TraceArgs) -> Result<Value> {
     }))
 }
 
+async fn get_fact(matrix: &Matrix, args: FactGetArgs) -> Result<Value> {
+    let mut query = revision_selector_query(&args.selector)?;
+    query.push(("limit", args.limit.max(1).to_string()));
+    if args.history {
+        query.push(("history", "true".to_string()));
+    }
+    matrix
+        .get(&format!(
+            "/facts/{}?{}",
+            enc(&args.fact_id),
+            query_string(query)
+        ))
+        .await
+}
+
 async fn history(matrix: &Matrix, args: HistoryArgs) -> Result<Value> {
-    let mut query = vec![("limit", args.limit.max(1).to_string())];
-    if let Some(revision) = args.revision {
-        query.push(("revision", revision.to_string()));
-    }
-    if let Some(event) = args.event {
-        query.push(("eventId", event));
-    }
-    if let Some(relative) = args.relative {
-        query.push(("relative", relative.to_string()));
-    }
-    if let Some(from_revision) = args.from_revision {
-        query.push(("fromRevision", from_revision.to_string()));
-    }
-    if let Some(from_event) = args.from_event {
-        query.push(("fromEvent", from_event));
-    }
-    if let Some(as_of) = args.as_of {
-        query.push(("asOf", as_of));
-    }
+    let mut query = revision_selector_query(&args.selector)?;
+    query.push(("limit", args.limit.max(1).to_string()));
     matrix
         .get(&format!(
             "/facts/{}/history?{}",
@@ -1042,6 +1050,31 @@ async fn history(matrix: &Matrix, args: HistoryArgs) -> Result<Value> {
             query_string(query)
         ))
         .await
+}
+
+fn revision_selector_query(selector: &RevisionSelectorArgs) -> Result<Vec<(&'static str, String)>> {
+    if selector.as_of.is_some()
+        && (selector.revision.is_some() || selector.event.is_some() || selector.relative.is_some())
+    {
+        bail!("--as-of cannot be combined with --revision, --event, or --relative");
+    }
+    if selector.revision.is_some() && selector.event.is_some() {
+        bail!("use only one of --revision or --event");
+    }
+    let mut query = Vec::new();
+    if let Some(revision) = selector.revision {
+        query.push(("revision", revision.to_string()));
+    }
+    if let Some(event) = selector.event.clone() {
+        query.push(("eventId", event));
+    }
+    if let Some(relative) = selector.relative {
+        query.push(("relative", relative.to_string()));
+    }
+    if let Some(as_of) = selector.as_of.clone() {
+        query.push(("asOf", as_of));
+    }
+    Ok(query)
 }
 
 async fn upload(matrix: &Matrix, args: UploadArgs) -> Result<Value> {
@@ -1333,6 +1366,16 @@ fn parse_repl_history_args(args: Vec<&str>) -> Result<HistoryArgs> {
     match Cli::try_parse_from(argv)?.command {
         Commands::History(args) => Ok(args),
         _ => unreachable!("history argv should parse as history command"),
+    }
+}
+
+#[cfg(feature = "interactive")]
+fn parse_repl_get_args(args: Vec<&str>) -> Result<FactGetArgs> {
+    let mut argv = vec!["matrix", "get"];
+    argv.extend(args);
+    match Cli::try_parse_from(argv)?.command {
+        Commands::Get(args) => Ok(args),
+        _ => unreachable!("get argv should parse as get command"),
     }
 }
 
@@ -1727,6 +1770,16 @@ impl<'a> ReplSession<'a> {
                     eprintln!("Usage: .members <fact-id>");
                 } else {
                     self.run_sql(&fact_view_sql(&fact_id, FactView::Members))?;
+                }
+            }
+            "get" => {
+                let args = parts.collect::<Vec<_>>();
+                if args.is_empty() {
+                    eprintln!("Usage: .get <fact-id> [--revision N|--relative N|--event ID|--as-of DATE]");
+                } else {
+                    let args = parse_repl_get_args(args)?;
+                    let value = get_fact(self.matrix, args).await?;
+                    print_value(&value, self.matrix.output)?;
                 }
             }
             "history" | "supersedes" => {
@@ -3065,6 +3118,7 @@ Matrix shell commands
   .trace <subject>          Show recent facts for a subject
   .gate <zone> [level]      Fetch a gate decision from the construct
   .views                    List local tables and views
+  .get <fact-id>            Show the current or selected revision of a fact
   .deref <fact-id>          Show member/require/provide edges for a fact
   .members <fact-id>        Show tuple members for a fact
   .history <fact-id>        Show accepted revisions for a fact
@@ -3169,6 +3223,7 @@ impl MatrixCompleter {
             ".examples",
             ".explain",
             ".gate",
+            ".get",
             ".help",
             ".history",
             ".limit",
@@ -3199,8 +3254,6 @@ impl MatrixCompleter {
             "/status",
             "--as-of",
             "--event",
-            "--from-event",
-            "--from-revision",
             "--relative",
             "--revision",
             "--target-version",
@@ -3224,6 +3277,7 @@ impl MatrixCompleter {
             "fact_id",
             "from",
             "group",
+            "get",
             "history",
             "id",
             "incompatible",
@@ -3718,6 +3772,10 @@ fn print_human_object(object: &serde_json::Map<String, Value>) {
         print_fact_history_human(object);
         return;
     }
+    if object.contains_key("factId") && object.contains_key("fact") {
+        print_fact_get_human(object);
+        return;
+    }
     if let Some(saved) = object.get("saved").and_then(Value::as_str) {
         println!("Saved {saved}");
         return;
@@ -3775,6 +3833,52 @@ fn print_human_object(object: &serde_json::Map<String, Value>) {
 
 fn print_fact_history_human(object: &serde_json::Map<String, Value>) {
     print!("{}", fact_history_human_text(object));
+}
+
+fn print_fact_get_human(object: &serde_json::Map<String, Value>) {
+    print!("{}", fact_get_human_text(object));
+}
+
+fn fact_get_human_text(object: &serde_json::Map<String, Value>) -> String {
+    let fact_id = object
+        .get("factId")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let event = object.get("event").and_then(Value::as_object);
+    let fact = object.get("fact").and_then(Value::as_object);
+    let mut text = format!("Fact: {fact_id}\n");
+    if let Some(event) = event {
+        push_object_field(&mut text, event, "revision", "Revision");
+        push_object_field(&mut text, event, "status", "Revision status");
+        push_object_field(&mut text, event, "acceptedAt", "Accepted");
+        push_object_field(&mut text, event, "eventId", "Event");
+        push_object_field(&mut text, event, "contentHash", "Hash");
+    }
+    if let Some(fact) = fact {
+        text.push_str("Body\n");
+        for key in [
+            "id",
+            "zone",
+            "kind",
+            "status",
+            "sourceRepository",
+            "sourceSha",
+            "sourceRef",
+        ] {
+            push_object_field(&mut text, fact, key, &format!("  {}", human_label(key)));
+        }
+        if let Some(subject) = fact.get("subject").and_then(Value::as_object) {
+            for key in ["type", "name", "version", "repo"] {
+                push_object_field(
+                    &mut text,
+                    subject,
+                    key,
+                    &format!("  Subject {}", human_label(key)),
+                );
+            }
+        }
+    }
+    text
 }
 
 fn fact_history_human_text(object: &serde_json::Map<String, Value>) -> String {
@@ -4164,12 +4268,18 @@ mod tests {
             "release-bundle.api.1.0.0",
             "--relative",
             "-1",
-            "--from-revision",
+            "--revision",
             "3",
             "--as-of",
             "2026-06-19",
-        ]);
-        assert!(selected.is_err());
+        ])
+        .unwrap();
+        match selected.command {
+            Commands::History(args) => {
+                assert!(revision_selector_query(&args.selector).is_err());
+            }
+            _ => panic!("expected history command"),
+        }
 
         let relative = Cli::try_parse_from([
             "matrix",
@@ -4177,14 +4287,14 @@ mod tests {
             "release-bundle.api.1.0.0",
             "--relative",
             "-1",
-            "--from-event",
+            "--event",
             "event.abc",
         ])
         .unwrap();
         match relative.command {
             Commands::History(args) => {
-                assert_eq!(args.relative, Some(-1));
-                assert_eq!(args.from_event.as_deref(), Some("event.abc"));
+                assert_eq!(args.selector.relative, Some(-1));
+                assert_eq!(args.selector.event.as_deref(), Some("event.abc"));
             }
             _ => panic!("expected history command"),
         }
@@ -4199,9 +4309,31 @@ mod tests {
         .unwrap();
         match as_of.command {
             Commands::History(args) => {
-                assert_eq!(args.as_of.as_deref(), Some("2026-06-19T16:00:00Z"));
+                assert_eq!(args.selector.as_of.as_deref(), Some("2026-06-19T16:00:00Z"));
             }
             _ => panic!("expected history command"),
+        }
+
+        let get = Cli::try_parse_from([
+            "matrix",
+            "get",
+            "release-bundle.api.1.0.0",
+            "--revision",
+            "3",
+            "--relative",
+            "-1",
+            "-o",
+            "json",
+        ])
+        .unwrap();
+        assert_eq!(get.output, OutputFormat::Json);
+        match get.command {
+            Commands::Get(args) => {
+                assert_eq!(args.fact_id, "release-bundle.api.1.0.0");
+                assert_eq!(args.selector.revision, Some(3));
+                assert_eq!(args.selector.relative, Some(-1));
+            }
+            _ => panic!("expected get command"),
         }
     }
 
@@ -4384,6 +4516,38 @@ mod tests {
         assert!(text.contains("- r2 current accepted 2026-06-19T16:00:00Z"));
         assert!(text.contains("- r1 superseded accepted 2026-06-19T15:00:00Z"));
         assert!(text.contains("Superseded by: event.current"));
+    }
+
+    #[test]
+    fn renders_fact_get_as_selected_fact() {
+        let value = json!({
+            "factId": "release-bundle.api.1.0.0",
+            "event": {
+                "eventId": "event.current",
+                "revision": 2,
+                "acceptedAt": "2026-06-19T16:00:00Z",
+                "contentHash": "sha256:new",
+                "status": "current"
+            },
+            "fact": {
+                "id": "release-bundle.api.1.0.0",
+                "zone": "runtime",
+                "status": "passed",
+                "sourceRepository": "example/api",
+                "sourceSha": "222",
+                "subject": {
+                    "type": "release-bundle",
+                    "name": "api",
+                    "version": "1.0.0"
+                }
+            }
+        });
+        let text = fact_get_human_text(value.as_object().unwrap());
+        assert!(text.contains("Fact: release-bundle.api.1.0.0"));
+        assert!(text.contains("Revision: 2"));
+        assert!(text.contains("Revision status: current"));
+        assert!(text.contains("  Zone: runtime"));
+        assert!(text.contains("  Subject Version: 1.0.0"));
     }
 
     #[test]

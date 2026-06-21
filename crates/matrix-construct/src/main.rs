@@ -52,14 +52,16 @@ struct FactQuery {
     cursor: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, Clone)]
 struct FactHistoryQuery {
+    history: Option<bool>,
     limit: Option<usize>,
     cursor: Option<String>,
     revision: Option<i64>,
     #[serde(rename = "eventId")]
     event_id: Option<String>,
     relative: Option<i64>,
+    // Deprecated API aliases. Prefer revision/eventId with relative.
     #[serde(rename = "fromRevision")]
     from_revision: Option<i64>,
     #[serde(rename = "fromEvent")]
@@ -135,6 +137,7 @@ fn router(state: AppState) -> Router {
         .route("/v1/matrix/zones/{zone}/candidates/{level}", get(candidate))
         .route("/v1/matrix/facts", get(facts).post(upload_facts))
         .route("/v1/matrix/facts/latest", get(latest_fact))
+        .route("/v1/matrix/facts/{id}", get(fact_get))
         .route("/v1/matrix/facts/{id}/history", get(fact_history))
         // Compatibility aliases for adapters migrating from track-based APIs.
         .route("/v1/compatibility", get(overview))
@@ -149,6 +152,7 @@ fn router(state: AppState) -> Router {
         )
         .route("/v1/compatibility/facts", get(facts).post(upload_facts))
         .route("/v1/compatibility/facts/latest", get(latest_fact))
+        .route("/v1/compatibility/facts/{id}", get(fact_get))
         .route("/v1/compatibility/facts/{id}/history", get(fact_history))
         .with_state(state)
 }
@@ -254,6 +258,31 @@ async fn latest_fact(
     let db = state.db.lock().map_err(internal)?;
     let page = query_facts(&db, &query)?;
     Ok(Json(json!({ "fact": page.facts.into_iter().next() })))
+}
+
+async fn fact_get(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<FactHistoryQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let db = state.db.lock().map_err(internal)?;
+    if query.history.unwrap_or(false) {
+        return Ok(Json(
+            serde_json::to_value(query_fact_history(&db, &id, &query)?).map_err(internal)?,
+        ));
+    }
+
+    let mut selected = query.clone();
+    if !selected.has_selector() {
+        selected.relative = Some(0);
+    }
+    let page = query_fact_history(&db, &id, &selected)?;
+    let event = page
+        .events
+        .into_iter()
+        .next()
+        .ok_or_else(|| not_found(format!("fact {id:?} was not found")))?;
+    Ok(Json(fact_get_response(&id, event)))
 }
 
 async fn fact_history(
@@ -706,6 +735,18 @@ impl StoredFactEvent {
     }
 }
 
+fn fact_get_response(fact_id: &str, mut event: Value) -> Value {
+    let fact = event.get("fact").cloned().unwrap_or(Value::Null);
+    if let Some(object) = event.as_object_mut() {
+        object.remove("fact");
+    }
+    json!({
+        "factId": fact_id,
+        "event": event,
+        "fact": fact,
+    })
+}
+
 enum FactRevisionSelector {
     Revision(i64),
     Event(String),
@@ -719,20 +760,13 @@ enum FactRevisionSelector {
 
 impl FactHistoryQuery {
     fn selected_revision(&self) -> std::result::Result<Option<FactRevisionSelector>, String> {
-        let selectors = [
-            self.revision.is_some(),
-            self.event_id.is_some(),
-            self.relative.is_some(),
-            self.as_of.is_some(),
-        ]
-        .into_iter()
-        .filter(|selected| *selected)
-        .count();
-        if selectors > 1 {
-            return Err(
-                "use only one of revision, eventId, relative, or asOf for history selection"
-                    .to_string(),
-            );
+        if self.as_of.is_some()
+            && (self.revision.is_some() || self.event_id.is_some() || self.relative.is_some())
+        {
+            return Err("asOf cannot be combined with revision, eventId, or relative".to_string());
+        }
+        if self.revision.is_some() && self.event_id.is_some() {
+            return Err("use only one of revision or eventId".to_string());
         }
         if (self.from_revision.is_some() || self.from_event.is_some()) && self.relative.is_none() {
             return Err("fromRevision and fromEvent require relative".to_string());
@@ -740,19 +774,28 @@ impl FactHistoryQuery {
         if self.from_revision.is_some() && self.from_event.is_some() {
             return Err("use only one of fromRevision or fromEvent".to_string());
         }
-        Ok(if let Some(revision) = self.revision {
-            Some(FactRevisionSelector::Revision(revision))
-        } else if let Some(event_id) = self.event_id.clone() {
-            Some(FactRevisionSelector::Event(event_id))
-        } else if let Some(offset) = self.relative {
-            Some(FactRevisionSelector::Relative {
+        if let Some(offset) = self.relative {
+            Ok(Some(FactRevisionSelector::Relative {
                 offset,
-                base_revision: self.from_revision,
-                base_event_id: self.from_event.clone(),
-            })
+                base_revision: self.revision.or(self.from_revision),
+                base_event_id: self.event_id.clone().or_else(|| self.from_event.clone()),
+            }))
+        } else if let Some(revision) = self.revision {
+            Ok(Some(FactRevisionSelector::Revision(revision)))
+        } else if let Some(event_id) = self.event_id.clone() {
+            Ok(Some(FactRevisionSelector::Event(event_id)))
         } else {
-            self.as_of.clone().map(FactRevisionSelector::AsOf)
-        })
+            Ok(self.as_of.clone().map(FactRevisionSelector::AsOf))
+        }
+    }
+
+    fn has_selector(&self) -> bool {
+        self.revision.is_some()
+            || self.event_id.is_some()
+            || self.relative.is_some()
+            || self.as_of.is_some()
+            || self.from_revision.is_some()
+            || self.from_event.is_some()
     }
 }
 
@@ -1045,17 +1088,41 @@ mod tests {
         .unwrap();
         assert_eq!(previous.events[0]["revision"], 1);
 
+        let previous_from_revision = query_fact_history(
+            &db,
+            "tuple.api.1.0.0",
+            &FactHistoryQuery {
+                revision: Some(2),
+                relative: Some(-1),
+                ..FactHistoryQuery::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(previous_from_revision.events[0]["revision"], 1);
+
         let current_event_id = history.events[0]["eventId"].as_str().unwrap().to_string();
         let by_event = query_fact_history(
             &db,
             "tuple.api.1.0.0",
             &FactHistoryQuery {
-                event_id: Some(current_event_id),
+                event_id: Some(current_event_id.clone()),
                 ..FactHistoryQuery::default()
             },
         )
         .unwrap();
         assert_eq!(by_event.events[0]["revision"], 2);
+
+        let previous_from_event = query_fact_history(
+            &db,
+            "tuple.api.1.0.0",
+            &FactHistoryQuery {
+                event_id: Some(current_event_id),
+                relative: Some(-1),
+                ..FactHistoryQuery::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(previous_from_event.events[0]["revision"], 1);
 
         let future = query_fact_history(
             &db,
@@ -1067,5 +1134,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(future.events[0]["revision"], 2);
+
+        let current = query_fact_history(
+            &db,
+            "tuple.api.1.0.0",
+            &FactHistoryQuery {
+                relative: Some(0),
+                ..FactHistoryQuery::default()
+            },
+        )
+        .unwrap();
+        let response = fact_get_response("tuple.api.1.0.0", current.events[0].clone());
+        assert_eq!(response["factId"], "tuple.api.1.0.0");
+        assert_eq!(response["event"]["revision"], 2);
+        assert_eq!(response["fact"]["status"], "passed");
     }
 }
