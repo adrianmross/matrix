@@ -10,6 +10,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use directories::ProjectDirs;
+use glob::glob;
 use quick_xml::{Reader, events::Event};
 use reqwest::{Method, header::CONTENT_TYPE};
 use rusqlite::{Connection, params};
@@ -326,6 +327,10 @@ struct IngestArgs {
     stdin: bool,
     #[arg(long)]
     upload: bool,
+    #[arg(long = "junit-file")]
+    junit_files: Vec<PathBuf>,
+    #[arg(long = "junit-glob")]
+    junit_globs: Vec<String>,
     #[arg(long)]
     zone: Option<String>,
     #[arg(long)]
@@ -1097,13 +1102,58 @@ async fn upload(matrix: &Matrix, args: UploadArgs) -> Result<Value> {
 
 async fn ingest(matrix: &Matrix, args: IngestArgs) -> Result<Value> {
     let input = read_text_input(args.file.clone(), args.stdin)?;
-    let facts = normalize_ingest(&args.adapter, &input, &IngestSource::from_args(&args)?)?;
+    let source = IngestSource::from_args(&args)?;
+    let mut facts = normalize_ingest(&args.adapter, &input, &source)?;
+    append_junit_facts(&mut facts, &args, &source)?;
     let fact = json!({ "facts": facts });
     if args.upload {
         matrix.request(Method::POST, "/facts", Some(fact)).await
     } else {
         Ok(fact)
     }
+}
+
+fn append_junit_facts(
+    facts: &mut Vec<Value>,
+    args: &IngestArgs,
+    source: &IngestSource,
+) -> Result<()> {
+    let junit_paths = junit_input_paths(args)?;
+    if junit_paths.is_empty() {
+        return Ok(());
+    }
+    if !matches!(source.adapter.as_str(), "tox" | "nox") {
+        bail!("--junit-file and --junit-glob are only supported with tox or nox ingest");
+    }
+
+    let mut junit_source = source.clone();
+    junit_source.adapter = "junit".to_string();
+    for path in junit_paths {
+        let input = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read JUnit file {}", path.display()))?;
+        facts.extend(
+            normalize_junit(&input, &junit_source)
+                .with_context(|| format!("failed to normalize JUnit file {}", path.display()))?,
+        );
+    }
+    Ok(())
+}
+
+fn junit_input_paths(args: &IngestArgs) -> Result<Vec<PathBuf>> {
+    let mut paths = std::collections::BTreeSet::new();
+    paths.extend(args.junit_files.iter().cloned());
+    for pattern in &args.junit_globs {
+        for entry in
+            glob(pattern).with_context(|| format!("invalid --junit-glob pattern {pattern:?}"))?
+        {
+            paths.insert(
+                entry.with_context(|| {
+                    format!("failed to read --junit-glob match for {pattern:?}")
+                })?,
+            );
+        }
+    }
+    Ok(paths.into_iter().collect())
 }
 
 #[derive(Clone, Debug)]
@@ -5130,6 +5180,36 @@ mod tests {
     }
 
     #[test]
+    fn accepts_tox_nox_junit_attachment_flags() {
+        let cli = Cli::try_parse_from([
+            "matrix",
+            "ingest",
+            "tox",
+            "--file",
+            "tox-result.json",
+            "--junit-file",
+            ".tox/py311/junit.xml",
+            "--junit-glob",
+            ".tox/*/junit.xml",
+            "-o",
+            "json",
+        ])
+        .unwrap();
+        assert_eq!(cli.output, OutputFormat::Json);
+        match cli.command {
+            Commands::Ingest(args) => {
+                assert_eq!(args.adapter, "tox");
+                assert_eq!(
+                    args.junit_files,
+                    vec![PathBuf::from(".tox/py311/junit.xml")]
+                );
+                assert_eq!(args.junit_globs, vec![".tox/*/junit.xml"]);
+            }
+            _ => panic!("expected ingest command"),
+        }
+    }
+
+    #[test]
     fn accepts_context_view_commands() {
         let compatible = Cli::try_parse_from([
             "matrix",
@@ -5498,6 +5578,33 @@ mod tests {
         assert_eq!(nox.len(), 2);
         assert_eq!(nox[0]["subjectType"], "nox-session");
         assert_eq!(nox[1]["status"], "failed");
+    }
+
+    #[test]
+    fn tox_nox_can_attach_canonical_junit_facts() {
+        let source = fixture_source("tox");
+        let mut facts =
+            normalize_tox(include_str!("../fixtures/ingest/tox.json"), &source).unwrap();
+        let mut junit_source = source.clone();
+        junit_source.adapter = "junit".to_string();
+        facts.extend(
+            normalize_junit(include_str!("../fixtures/ingest/junit.xml"), &junit_source).unwrap(),
+        );
+
+        assert!(facts.iter().any(|fact| fact["subjectType"] == "tox-env"));
+        assert!(
+            facts
+                .iter()
+                .any(|fact| fact["subjectType"] == "junit-suite")
+        );
+
+        let db = build_facts_db(&facts, &MatrixContext::default()).unwrap();
+        let rows = execute_readonly_sql(
+            &db,
+            "select type, component, status from components where type in ('tox-env', 'junit-suite') order by type, component",
+        )
+        .unwrap();
+        assert_eq!(rows["rows"].as_array().unwrap().len(), 3);
     }
 
     #[test]

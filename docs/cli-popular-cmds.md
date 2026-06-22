@@ -43,7 +43,9 @@ matrix why ledger-service --repo example/payments-api --version v1.6.3
 matrix upload facts.json
 matrix publish facts.json
 matrix ingest tox --file tox-result.json
+matrix ingest tox --file tox-result.json --junit-glob '.tox/*/junit.xml'
 matrix ingest nox --file nox-result.json
+matrix ingest nox --file nox-result.json --junit-file reports/junit.xml
 matrix ingest junit --file junit.xml
 matrix ingest sbom --file bom.cdx.json
 matrix ingest k6 --file summary.json --zone stage

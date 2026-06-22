@@ -77,6 +77,8 @@ Adapters can feed evidence into Matrix:
 matrix ingest tox --file tox-result.json
 matrix ingest nox --file nox-result.json
 matrix ingest junit --file junit.xml
+matrix ingest tox --file tox-result.json --junit-glob '.tox/*/junit.xml'
+matrix ingest nox --file nox-result.json --junit-file reports/junit.xml
 matrix ingest sbom --file bom.cdx.json
 matrix ingest k6 --file summary.json
 matrix ingest microcks --file test-result.json
@@ -87,6 +89,10 @@ Adapters emit normalized Matrix fact batches with stable fields such as
 `--upload` to submit the normalized facts to the configured construct. Use
 `--zone`, `--repo`, `--component`, `--version`, `--sha`, and `--ref` to override
 the context detected from git or the input file.
+
+For tox and nox, Matrix treats the runner output as environment/session
+orchestration evidence. Attach JUnit reports with `--junit-file` or
+`--junit-glob` for the canonical test-case facts.
 
 ## Codex Plugin
 

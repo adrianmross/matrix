@@ -82,7 +82,10 @@ SBOM generators, package managers, supply-chain graph tools, or custom CI
 validators. Adapter names are intentionally plain strings so new producers can
 start emitting facts before a specialized adapter exists. Prefer supported
 adapters when available: `junit`, `sbom`, `tox`, `nox`, `k6`, and `microcks`.
-Use `--upload` only when the configured construct and credentials are known.
+For tox/nox, prefer attached JUnit reports with `--junit-file` or
+`--junit-glob`; tox/nox facts should describe runner/session orchestration, not
+duplicate the JUnit test-case model. Use `--upload` only when the configured
+construct and credentials are known.
 
 ## Interactive Mode
 

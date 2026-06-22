@@ -192,7 +192,8 @@ to the configured construct.
 matrix ingest junit --file junit.xml
 matrix ingest sbom --file bom.cdx.json
 matrix ingest tox --file tox-result.json --upload
-matrix ingest nox --file nox-result.json --zone test
+matrix ingest tox --file tox-result.json --junit-glob '.tox/*/junit.xml' --upload
+matrix ingest nox --file nox-result.json --junit-file reports/junit.xml --zone test
 matrix ingest k6 --file summary.json --zone stage
 matrix ingest microcks --file test-result.json --zone stage
 ```
@@ -203,7 +204,9 @@ Supported adapters:
   cases.
 - `sbom`: emits a root SBOM fact and package/dependency facts for CycloneDX or
   SPDX JSON.
-- `tox` / `nox`: emit test environment/session facts from JSON reports.
+- `tox` / `nox`: emit orchestration facts for environments or sessions. Attach
+  JUnit files with `--junit-file` or `--junit-glob` when you want the actual
+  test cases in the same upload.
 - `k6`: emits load-test evidence and marks failed thresholds as failed facts.
 - `microcks`: emits API contract-test evidence from JSON test results.
 
@@ -216,6 +219,18 @@ matrix ingest junit --file junit.xml \
   --version 1.2.3 \
   --sha "$GITHUB_SHA" \
   --ref "$GITHUB_REF" \
+  --upload
+```
+
+For tox/nox, prefer JUnit for the detailed test model and keep tox/nox as the
+runner/session layer:
+
+```bash
+matrix ingest tox --file tox-result.json \
+  --junit-glob '.tox/*/junit.xml' \
+  --repo example/payments-api \
+  --component payments-api \
+  --version 1.2.3 \
   --upload
 ```
 
