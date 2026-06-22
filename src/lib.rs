@@ -1,16 +1,16 @@
 use std::{
     env, fs,
     io::{self, IsTerminal, Read},
-    path::PathBuf,
-    process::{Command as ProcessCommand, Stdio},
-    time::Duration,
+    path::{Path, PathBuf},
+    process::{self, Command as ProcessCommand, Stdio},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use directories::ProjectDirs;
-use reqwest::{Method, header::CONTENT_TYPE};
+use reqwest::{Method, StatusCode, header::CONTENT_TYPE};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -19,10 +19,8 @@ mod ingest;
 
 const MATRIX_REPOSITORY: &str = "adrianmross/matrix";
 const MATRIX_HOMEBREW_FORMULA: &str = "adrianmross/tap/matrix";
+const MATRIX_LINUX_TARGET: &str = "x86_64-unknown-linux-gnu";
 const UPDATE_CHECK_TTL: Duration = Duration::from_secs(60 * 60 * 24);
-
-#[cfg(feature = "interactive")]
-use std::time::SystemTime;
 
 #[cfg(feature = "interactive")]
 use comfy_table::{Table, presets::UTF8_FULL};
@@ -697,7 +695,8 @@ async fn config_command(matrix: &mut Matrix, command: ConfigCommand) -> Result<V
 }
 
 async fn update_command(matrix: &Matrix, command: UpdateCommand) -> Result<Value> {
-    if is_homebrew_install() && command.check {
+    let homebrew_install = is_homebrew_install();
+    if homebrew_install && command.check {
         let current =
             homebrew_installed_version().unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
         if let Some(latest) = homebrew_outdated_version() {
@@ -715,7 +714,7 @@ async fn update_command(matrix: &Matrix, command: UpdateCommand) -> Result<Value
         }));
     }
 
-    if is_homebrew_install() && !command.check {
+    if homebrew_install && !command.check {
         run_status_command("brew", &["update"])?;
         run_status_command("brew", &["upgrade", MATRIX_HOMEBREW_FORMULA])?;
         clear_update_notice_cache();
@@ -728,6 +727,13 @@ async fn update_command(matrix: &Matrix, command: UpdateCommand) -> Result<Value
     let latest = latest_matrix_version(&matrix.client).await?;
     let current = env!("CARGO_PKG_VERSION");
     let update_available = version_is_newer(current, &latest);
+
+    if !command.check {
+        if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            return run_direct_linux_update(matrix, &latest, command.force).await;
+        }
+        bail!("{}", direct_update_unavailable_message(&latest));
+    }
 
     if command.check {
         if update_available {
@@ -744,20 +750,196 @@ async fn update_command(matrix: &Matrix, command: UpdateCommand) -> Result<Value
             "updateAvailable": false
         }));
     }
+    unreachable!("non-check update path returns before check response handling")
+}
 
-    if !update_available && !command.force {
+async fn run_direct_linux_update(matrix: &Matrix, latest: &str, force: bool) -> Result<Value> {
+    let current = env!("CARGO_PKG_VERSION");
+    if !version_is_newer(current, latest) && !force {
         return Ok(Value::String(format!(
             "Already on latest version, {current}"
         )));
     }
 
-    bail!(
-        "this matrix install was not detected as Homebrew-managed; install or upgrade with: brew upgrade {MATRIX_HOMEBREW_FORMULA}"
-    );
+    let release = latest_matrix_release(&matrix.client).await?;
+    let asset_name = format!("matrix-{latest}-{MATRIX_LINUX_TARGET}.tar.gz");
+    let asset_url = release_asset_api_url(&release, &asset_name).ok_or_else(|| {
+        anyhow!("release v{latest} did not include expected Linux asset {asset_name}")
+    })?;
+    let archive = download_github_release_asset(&matrix.client, &asset_url).await?;
+    let temp_dir = update_temp_dir(latest)?;
+    fs::create_dir_all(&temp_dir)?;
+    let archive_path = temp_dir.join(&asset_name);
+    fs::write(&archive_path, archive)?;
+
+    let extract_status = ProcessCommand::new("tar")
+        .args(["-xzf"])
+        .arg(&archive_path)
+        .arg("-C")
+        .arg(&temp_dir)
+        .status()
+        .context("failed to run tar to extract the Linux release archive")?;
+    if !extract_status.success() {
+        bail!("failed to extract Linux release archive with tar -xzf");
+    }
+
+    let package_dir = temp_dir.join(asset_name.trim_end_matches(".tar.gz"));
+    let extracted_matrix = package_dir.join("matrix");
+    if !extracted_matrix.is_file() {
+        bail!(
+            "Linux release archive did not contain expected binary at {}",
+            extracted_matrix.display()
+        );
+    }
+
+    let current_exe =
+        env::current_exe().context("could not determine current matrix executable")?;
+    let current_exe = current_exe.canonicalize().unwrap_or(current_exe);
+    let install_dir = current_exe.parent().ok_or_else(|| {
+        anyhow!(
+            "could not determine install directory for {}",
+            current_exe.display()
+        )
+    })?;
+
+    install_binary_from_archive(&extracted_matrix, &current_exe, "matrix", latest)?;
+    for binary in ["matrix-enter", "matrix-construct"] {
+        let installed = install_dir.join(binary);
+        let extracted = package_dir.join(binary);
+        if installed.exists() && extracted.is_file() {
+            install_binary_from_archive(&extracted, &installed, binary, latest)?;
+        }
+    }
+    clear_update_notice_cache();
+    let _ = fs::remove_dir_all(&temp_dir);
+
+    Ok(Value::String(format!(
+        "Updated matrix from {current} to {latest}. Run `matrix --version` to confirm."
+    )))
+}
+
+fn install_binary_from_archive(
+    extracted: &Path,
+    destination: &Path,
+    binary: &str,
+    latest: &str,
+) -> Result<()> {
+    let install_dir = destination
+        .parent()
+        .ok_or_else(|| anyhow!("could not determine install directory for {}", binary))?;
+    let replacement = install_dir.join(format!(".{binary}-update-{}-{latest}", process::id()));
+    fs::copy(extracted, &replacement).with_context(|| {
+        format!(
+            "could not stage updated {binary} binary in {}; try: {}",
+            install_dir.display(),
+            linux_manual_update_command(latest, default_linux_install_path().as_deref())
+        )
+    })?;
+    make_executable(&replacement)?;
+    fs::rename(&replacement, destination).with_context(|| {
+        format!(
+            "could not replace {}; try: {}",
+            destination.display(),
+            linux_manual_update_command(latest, default_linux_install_path().as_deref())
+        )
+    })?;
+    Ok(())
+}
+
+fn direct_update_unavailable_message(latest: &str) -> String {
+    format!(
+        "this matrix install was not detected as Homebrew-managed. On macOS use `brew upgrade {MATRIX_HOMEBREW_FORMULA}`. On Linux use `{}`. From source use `{}`.",
+        linux_manual_update_command(latest, default_linux_install_path().as_deref()),
+        cargo_install_update_command(latest)
+    )
+}
+
+fn cargo_install_update_command(latest: &str) -> String {
+    format!(
+        "cargo install --locked --git https://github.com/{MATRIX_REPOSITORY} --tag v{latest} matrix --force"
+    )
+}
+
+fn linux_manual_update_command(latest: &str, install_path: Option<&Path>) -> String {
+    let install_path = install_path
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "~/.cargo/bin/matrix".to_string());
+    format!(
+        "gh release download v{latest} --repo {MATRIX_REPOSITORY} --pattern 'matrix-{latest}-{MATRIX_LINUX_TARGET}.tar.gz' --dir /tmp/matrix-update && tar -xzf /tmp/matrix-update/matrix-{latest}-{MATRIX_LINUX_TARGET}.tar.gz -C /tmp/matrix-update && install /tmp/matrix-update/matrix-{latest}-{MATRIX_LINUX_TARGET}/matrix {install_path}"
+    )
+}
+
+fn default_linux_install_path() -> Option<PathBuf> {
+    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return env::current_exe()
+            .ok()
+            .and_then(|path| path.canonicalize().ok().or(Some(path)));
+    }
+    None
+}
+
+fn release_asset_api_url(release: &Value, asset_name: &str) -> Option<String> {
+    release
+        .get("assets")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|asset| asset.get("name").and_then(Value::as_str) == Some(asset_name))?
+        .get("url")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+}
+
+async fn download_github_release_asset(
+    client: &reqwest::Client,
+    asset_url: &str,
+) -> Result<Vec<u8>> {
+    let token = github_token();
+    let mut request = client
+        .get(asset_url)
+        .header("accept", "application/octet-stream")
+        .timeout(Duration::from_secs(60));
+    if let Some(token) = token.as_deref() {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await?;
+    let status = response.status();
+    if !status.is_success() {
+        if status == StatusCode::NOT_FOUND && token.is_none() {
+            bail!(
+                "GitHub release asset download returned 404 for {MATRIX_REPOSITORY}; set MATRIX_GITHUB_TOKEN, GITHUB_TOKEN, or GH_TOKEN, or run `gh auth login`"
+            );
+        }
+        let text = response.text().await.unwrap_or_default();
+        bail!("GitHub release asset download failed with {status}: {text}");
+    }
+    response
+        .bytes()
+        .await
+        .map(|bytes| bytes.to_vec())
+        .context("failed to read release asset")
+}
+
+fn update_temp_dir(latest: &str) -> Result<PathBuf> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before UNIX epoch")?
+        .as_millis();
+    Ok(env::temp_dir().join(format!("matrix-update-{latest}-{}-{now}", process::id())))
+}
+
+fn make_executable(path: &Path) -> Result<()> {
+    let mut permissions = fs::metadata(path)?.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o755);
+    }
+    fs::set_permissions(path, permissions)?;
+    Ok(())
 }
 
 async fn maybe_print_update_notice(matrix: &Matrix, command: &Commands) {
-    if matrix.output == OutputFormat::Json
+    if matrix.output != OutputFormat::Human
         || matches!(command, Commands::Update(_))
         || env::var_os("MATRIX_NO_UPDATE_CHECK").is_some()
     {
@@ -798,15 +980,7 @@ async fn maybe_print_update_notice(matrix: &Matrix, command: &Commands) {
 }
 
 async fn latest_matrix_version(client: &reqwest::Client) -> Result<String> {
-    let mut request = client
-        .get(format!(
-            "https://api.github.com/repos/{MATRIX_REPOSITORY}/releases/latest"
-        ))
-        .timeout(Duration::from_secs(3));
-    if let Some(token) = github_token() {
-        request = request.bearer_auth(token);
-    }
-    let body: Value = request.send().await?.error_for_status()?.json().await?;
+    let body = latest_matrix_release(client).await?;
     body["tag_name"]
         .as_str()
         .map(normalize_version)
@@ -814,10 +988,53 @@ async fn latest_matrix_version(client: &reqwest::Client) -> Result<String> {
         .ok_or_else(|| anyhow!("latest release response did not include tag_name"))
 }
 
+async fn latest_matrix_release(client: &reqwest::Client) -> Result<Value> {
+    let token = github_token();
+    let mut request = client
+        .get(format!(
+            "https://api.github.com/repos/{MATRIX_REPOSITORY}/releases/latest"
+        ))
+        .timeout(Duration::from_secs(3));
+    if let Some(token) = token.as_deref() {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await?;
+    let status = response.status();
+    let body: Value = response.json().await.unwrap_or_else(|_| json!({}));
+    if !status.is_success() {
+        if status == StatusCode::NOT_FOUND && token.is_none() {
+            bail!(
+                "GitHub release lookup returned 404 for {MATRIX_REPOSITORY}; set MATRIX_GITHUB_TOKEN, GITHUB_TOKEN, or GH_TOKEN, or run `gh auth login` so matrix can read `gh auth token`"
+            );
+        }
+        bail!(
+            "GitHub release lookup failed with {status}: {}",
+            error_detail(&body, "")
+        );
+    }
+    Ok(body)
+}
+
 fn github_token() -> Option<String> {
     ["MATRIX_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"]
         .into_iter()
         .find_map(|name| env::var(name).ok().filter(|value| !value.trim().is_empty()))
+        .or_else(gh_auth_token)
+}
+
+fn gh_auth_token() -> Option<String> {
+    let output = ProcessCommand::new("gh")
+        .args(["auth", "token"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn fresh_update_notice(path: &std::path::Path) -> Option<String> {
@@ -4740,6 +4957,30 @@ mod tests {
         assert!(version_is_newer("0.3.9", "0.4.0"));
         assert!(!version_is_newer("0.4.0", "0.3.9"));
         assert!(!version_is_newer("1.0.0", "V1.0.0"));
+    }
+
+    #[test]
+    fn linux_manual_update_command_uses_release_archive() {
+        let install_path = PathBuf::from("/usr/local/bin/matrix");
+        let command = linux_manual_update_command("0.3.12", Some(&install_path));
+
+        assert!(command.contains("gh release download v0.3.12"));
+        assert!(command.contains("adrianmross/matrix"));
+        assert!(command.contains("matrix-0.3.12-x86_64-unknown-linux-gnu.tar.gz"));
+        assert!(command.ends_with(
+            "install /tmp/matrix-update/matrix-0.3.12-x86_64-unknown-linux-gnu/matrix /usr/local/bin/matrix"
+        ));
+    }
+
+    #[test]
+    fn direct_update_message_includes_source_and_archive_paths() {
+        let message = direct_update_unavailable_message("0.3.12");
+
+        assert!(message.contains("brew upgrade adrianmross/tap/matrix"));
+        assert!(message.contains("gh release download v0.3.12"));
+        assert!(message.contains(
+            "cargo install --locked --git https://github.com/adrianmross/matrix --tag v0.3.12 matrix --force"
+        ));
     }
 
     #[test]

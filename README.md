@@ -29,6 +29,32 @@ dependencies:
 cargo build --release --no-default-features -p matrix
 ```
 
+## Installation
+
+On macOS or Linux with Homebrew:
+
+```bash
+brew tap adrianmross/tap
+brew install adrianmross/tap/matrix
+```
+
+From source:
+
+```bash
+cargo install --locked --git https://github.com/adrianmross/matrix matrix
+```
+
+Linux x86_64 direct installs can use the GitHub Release archive:
+
+```bash
+MATRIX_VERSION="$(gh release view --repo adrianmross/matrix --json tagName -q .tagName)"
+gh release download "$MATRIX_VERSION" --repo adrianmross/matrix --pattern "matrix-${MATRIX_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz" --dir /tmp/matrix-install
+tar -xzf "/tmp/matrix-install/matrix-${MATRIX_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz" -C /tmp/matrix-install
+install "/tmp/matrix-install/matrix-${MATRIX_VERSION#v}-x86_64-unknown-linux-gnu/matrix" ~/.cargo/bin/matrix
+install "/tmp/matrix-install/matrix-${MATRIX_VERSION#v}-x86_64-unknown-linux-gnu/matrix-enter" ~/.cargo/bin/matrix-enter
+install "/tmp/matrix-install/matrix-${MATRIX_VERSION#v}-x86_64-unknown-linux-gnu/matrix-construct" ~/.cargo/bin/matrix-construct
+```
+
 ## Concepts
 
 - **construct**: the configured Matrix API/server and compatibility graph.
@@ -136,12 +162,21 @@ service binary version.
 `matrix` checks GitHub Releases for a newer version once per day on interactive
 startup and prints `matrix update` when one is available. Set
 `MATRIX_NO_UPDATE_CHECK=1` to disable the notice. For the GitHub release API, it
-uses `MATRIX_GITHUB_TOKEN`, `GITHUB_TOKEN`, or `GH_TOKEN` when one is present.
-Homebrew-managed installs update through the Adrian Ross tap:
+uses `MATRIX_GITHUB_TOKEN`, `GITHUB_TOKEN`, `GH_TOKEN`, or `gh auth token` when
+available.
+
+`matrix update` delegates to Homebrew for Homebrew-managed installs and updates
+Linux x86_64 direct installs from the release archive when possible:
 
 ```bash
 brew update
 brew upgrade adrianmross/tap/matrix
+```
+
+For source installs, update with:
+
+```bash
+cargo install --locked --git https://github.com/adrianmross/matrix matrix --force
 ```
 
 Use `matrix update --check` for a machine-readable release check.
