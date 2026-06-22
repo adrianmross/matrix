@@ -1,0 +1,48 @@
+name: Homebrew Validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Expected Matrix version, without leading v. Leave empty to skip exact version checks."
+        required: false
+        type: string
+      tap:
+        description: "Homebrew tap to validate"
+        required: false
+        default: "adrianmross/tap"
+        type: string
+      formula:
+        description: "Formula name to validate"
+        required: false
+        default: "matrix"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: macos-15
+    steps:
+      - name: Validate Homebrew formula
+        shell: bash
+        run: |
+          set -euo pipefail
+          tap="${{ inputs.tap }}"
+          formula="${{ inputs.formula }}"
+          version="${{ inputs.version }}"
+          brew update
+          brew tap "${tap}"
+          brew audit --formula "${tap}/${formula}"
+          brew install "${tap}/${formula}"
+          matrix --version | tee matrix.version
+          matrix-enter --version | tee matrix-enter.version
+          matrix-construct --version | tee matrix-construct.version
+          if [[ -n "${version}" ]]; then
+            grep -Fx "matrix ${version}" matrix.version
+            grep -Fx "matrix-enter ${version}" matrix-enter.version
+            grep -Fx "matrix-construct ${version}" matrix-construct.version
+          fi
+          matrix completion zsh >/dev/null
+          matrix --construct http://127.0.0.1:1 --api-prefix /v1/matrix doctor -o json

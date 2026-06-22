@@ -55,7 +55,23 @@ jobs:
           cp README.md LICENSE "${package_dir}/"
           chmod +x "${package_dir}/matrix" "${package_dir}/matrix-enter" "${package_dir}/matrix-construct"
           tar -C dist -czf "dist/${archive}.tar.gz" "${archive}"
-          shasum -a 256 "dist/${archive}.tar.gz" > "dist/${archive}.tar.gz.sha256"
+          (cd dist && shasum -a 256 "${archive}.tar.gz" > "${archive}.tar.gz.sha256")
+      - name: Smoke packaged archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_tag="${{ inputs.tag || github.ref_name }}"
+          version="${release_tag#v}"
+          archive="matrix-${version}-${{ matrix.target }}"
+          shasum -a 256 -c "dist/${archive}.tar.gz.sha256"
+          mkdir -p "smoke"
+          tar -C smoke -xzf "dist/${archive}.tar.gz"
+          "smoke/${archive}/matrix" --version | tee "smoke/${archive}/matrix.version"
+          "smoke/${archive}/matrix-enter" --version | tee "smoke/${archive}/matrix-enter.version"
+          "smoke/${archive}/matrix-construct" --version | tee "smoke/${archive}/matrix-construct.version"
+          grep -Fx "matrix ${version}" "smoke/${archive}/matrix.version"
+          grep -Fx "matrix-enter ${version}" "smoke/${archive}/matrix-enter.version"
+          grep -Fx "matrix-construct ${version}" "smoke/${archive}/matrix-construct.version"
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.target }}
@@ -74,6 +90,26 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+      - name: Verify release artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_tag="${{ inputs.tag || github.ref_name }}"
+          version="${release_tag#v}"
+          expected=(
+            "matrix-${version}-x86_64-unknown-linux-gnu.tar.gz"
+            "matrix-${version}-x86_64-apple-darwin.tar.gz"
+            "matrix-${version}-aarch64-apple-darwin.tar.gz"
+          )
+          for archive in "${expected[@]}"; do
+            test -f "artifacts/${archive}"
+            test -f "artifacts/${archive}.sha256"
+            (cd artifacts && shasum -a 256 -c "${archive}.sha256")
+          done
+          archive_count="$(find artifacts -maxdepth 1 -name '*.tar.gz' | wc -l | tr -d ' ')"
+          checksum_count="$(find artifacts -maxdepth 1 -name '*.sha256' | wc -l | tr -d ' ')"
+          test "${archive_count}" = "3"
+          test "${checksum_count}" = "3"
       - name: Create release notes
         shell: bash
         run: |
@@ -87,7 +123,19 @@ jobs:
             echo "- matrix CLI"
             echo "- matrix-enter interactive shell"
             echo "- matrix-construct service"
-            echo "- SHA-256 checksums"
+            echo
+            echo "Release validation:"
+            echo
+            echo "- Packaged binaries were executed on their target runner with --version."
+            echo "- SHA-256 checksum files were verified before publishing."
+            echo
+            echo "SHA-256 checksums:"
+            echo
+            for checksum in artifacts/*.sha256; do
+              digest="$(awk '{print $1}' "${checksum}")"
+              file="$(basename "${checksum%.sha256}")"
+              echo "- ${file}: ${digest}"
+            done
           } > RELEASE_NOTES.md
       - name: Publish release
         env:

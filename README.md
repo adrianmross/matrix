@@ -155,12 +155,21 @@ git push origin v0.3.11
 
 The `Release` workflow builds `matrix`, `matrix-enter`, and `matrix-construct`
 for Linux x64, macOS Intel, and macOS Apple Silicon, publishes tarballs, and
-uploads SHA-256 checksums to the GitHub Release.
+uploads SHA-256 checksums to the GitHub Release. Each target archive is
+extracted on its build runner before upload, and the packaged `matrix`,
+`matrix-enter`, and `matrix-construct` binaries must print the release version.
+The publish job verifies all checksums again and includes the checksum summary
+in the release notes.
 
 The `Tag Release` workflow is the preferred path for normal releases. Run it
 with `version=0.3.11` after bumping the Cargo package versions. It validates
 formatting, tests, clippy, version alignment, and tag uniqueness before pushing
 the annotated tag.
+
+After updating the Homebrew tap formula, run the `Homebrew Validation` workflow
+with the same version. It taps `adrianmross/tap`, audits and installs the
+`matrix` formula on macOS, checks all three binary versions, verifies shell
+completion generation, and runs a non-network-success `matrix doctor` command.
 
 ## Design Notes
 
