@@ -68,7 +68,7 @@ jobs:
           release_tag="${{ inputs.tag || github.ref_name }}"
           version="${release_tag#v}"
           archive="matrix-${version}-${{ matrix.target }}"
-          shasum -a 256 -c "dist/${archive}.tar.gz.sha256"
+          (cd dist && shasum -a 256 -c "${archive}.tar.gz.sha256")
           mkdir -p "smoke"
           tar -C smoke -xzf "dist/${archive}.tar.gz"
           "smoke/${archive}/matrix" --version | tee "smoke/${archive}/matrix.version"
