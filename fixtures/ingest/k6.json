@@ -1,0 +1,20 @@
+{
+  "metrics": {
+    "http_req_duration": {
+      "value": 183.2,
+      "thresholds": {
+        "p(95)<500": {
+          "ok": true
+        }
+      }
+    },
+    "checks": {
+      "rate": 0.98,
+      "thresholds": {
+        "rate>0.99": {
+          "ok": false
+        }
+      }
+    }
+  }
+}

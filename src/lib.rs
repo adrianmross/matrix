@@ -10,6 +10,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use directories::ProjectDirs;
+use quick_xml::{Reader, events::Event};
 use reqwest::{Method, header::CONTENT_TYPE};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -325,6 +326,18 @@ struct IngestArgs {
     stdin: bool,
     #[arg(long)]
     upload: bool,
+    #[arg(long)]
+    zone: Option<String>,
+    #[arg(long)]
+    repo: Option<String>,
+    #[arg(long)]
+    component: Option<String>,
+    #[arg(long)]
+    version: Option<String>,
+    #[arg(long)]
+    sha: Option<String>,
+    #[arg(long)]
+    r#ref: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -1083,16 +1096,784 @@ async fn upload(matrix: &Matrix, args: UploadArgs) -> Result<Value> {
 }
 
 async fn ingest(matrix: &Matrix, args: IngestArgs) -> Result<Value> {
-    let payload = read_input(args.file, args.stdin)?;
-    let fact = json!({
-        "adapter": args.adapter,
-        "format": "matrix.ingest.v1",
-        "payload": payload,
-    });
+    let input = read_text_input(args.file.clone(), args.stdin)?;
+    let facts = normalize_ingest(&args.adapter, &input, &IngestSource::from_args(&args)?)?;
+    let fact = json!({ "facts": facts });
     if args.upload {
         matrix.request(Method::POST, "/facts", Some(fact)).await
     } else {
         Ok(fact)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct IngestSource {
+    adapter: String,
+    zone: String,
+    repo: Option<String>,
+    component: String,
+    version: Option<String>,
+    sha: Option<String>,
+    reference: Option<String>,
+}
+
+impl IngestSource {
+    fn from_args(args: &IngestArgs) -> Result<Self> {
+        let adapter = normalize_adapter(&args.adapter)?;
+        let repo = args.repo.clone().or_else(current_repo);
+        let component = args
+            .component
+            .clone()
+            .or_else(|| repo.as_deref().map(component_key))
+            .unwrap_or_else(|| adapter.clone());
+        Ok(Self {
+            zone: args
+                .zone
+                .clone()
+                .unwrap_or_else(|| default_ingest_zone(&adapter).to_string()),
+            adapter,
+            repo,
+            component,
+            version: args.version.clone(),
+            sha: args.sha.clone().or_else(current_sha),
+            reference: args
+                .r#ref
+                .clone()
+                .or_else(current_exact_tag)
+                .or_else(current_branch),
+        })
+    }
+}
+
+fn normalize_ingest(adapter: &str, input: &str, source: &IngestSource) -> Result<Vec<Value>> {
+    match normalize_adapter(adapter)?.as_str() {
+        "junit" => normalize_junit(input, source),
+        "sbom" => normalize_sbom(input, source),
+        "tox" => normalize_tox(input, source),
+        "nox" => normalize_nox(input, source),
+        "k6" => normalize_k6(input, source),
+        "microcks" => normalize_microcks(input, source),
+        _ => unreachable!("normalize_adapter rejects unsupported adapters"),
+    }
+}
+
+fn normalize_adapter(adapter: &str) -> Result<String> {
+    let normalized = adapter.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "junit" | "sbom" | "tox" | "nox" | "k6" | "microcks" => Ok(normalized),
+        _ => bail!(
+            "unsupported ingest adapter {adapter:?}; supported adapters: junit, sbom, tox, nox, k6, microcks"
+        ),
+    }
+}
+
+fn default_ingest_zone(adapter: &str) -> &'static str {
+    match adapter {
+        "sbom" => "supply-chain",
+        "junit" | "tox" | "nox" | "k6" | "microcks" => "test",
+        _ => "evidence",
+    }
+}
+
+fn normalize_junit(input: &str, source: &IngestSource) -> Result<Vec<Value>> {
+    let suites = parse_junit_suites(input)?;
+    if suites.is_empty() {
+        bail!("JUnit input did not include any testsuite elements");
+    }
+    Ok(suites
+        .into_iter()
+        .map(|suite| {
+            let failed = suite.failures + suite.errors > 0;
+            let suite_name = if suite.name.is_empty() {
+                source.component.clone()
+            } else {
+                suite.name.clone()
+            };
+            let version = source.version.clone();
+            let mut fact = base_fact(
+                source,
+                format!(
+                    "junit.{}.{}{}",
+                    slug(&source.component),
+                    slug(&suite_name),
+                    version
+                        .as_deref()
+                        .map(|value| format!(".{}", slug(value)))
+                        .unwrap_or_default()
+                ),
+                "junit-suite",
+                suite_name,
+                version,
+                if failed { "failed" } else { "passed" },
+            );
+            put_array(
+                &mut fact,
+                "provides",
+                vec![json!({
+                    "capability": "test:junit",
+                    "version": source.version,
+                    "suite": suite.name,
+                })],
+            );
+            put_array(
+                &mut fact,
+                "members",
+                suite
+                    .cases
+                    .into_iter()
+                    .map(|case| {
+                        json!({
+                            "component": case.name,
+                            "status": case.status,
+                            "className": case.classname,
+                            "time": case.time,
+                        })
+                    })
+                    .collect(),
+            );
+            put_object(
+                &mut fact,
+                "metrics",
+                json!({
+                    "tests": suite.tests,
+                    "failures": suite.failures,
+                    "errors": suite.errors,
+                    "skipped": suite.skipped,
+                    "time": suite.time,
+                }),
+            );
+            fact
+        })
+        .collect())
+}
+
+fn normalize_sbom(input: &str, source: &IngestSource) -> Result<Vec<Value>> {
+    let value: Value = serde_json::from_str(input).context("SBOM input was not valid JSON")?;
+    if value.get("bomFormat").and_then(Value::as_str) == Some("CycloneDX") {
+        return normalize_cyclonedx_sbom(&value, source);
+    }
+    if value.get("spdxVersion").is_some() {
+        return normalize_spdx_sbom(&value, source);
+    }
+    bail!("unsupported SBOM JSON; expected CycloneDX or SPDX")
+}
+
+fn normalize_cyclonedx_sbom(value: &Value, source: &IngestSource) -> Result<Vec<Value>> {
+    let root = value
+        .pointer("/metadata/component")
+        .filter(|component| component.is_object());
+    let root_name = root
+        .and_then(|component| string_field(component, "name"))
+        .unwrap_or_else(|| source.component.clone());
+    let root_version = root
+        .and_then(|component| string_field(component, "version"))
+        .or_else(|| source.version.clone());
+    let components = value
+        .get("components")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let members = components
+        .iter()
+        .map(sbom_component_member)
+        .collect::<Vec<_>>();
+    let requirements = members
+        .iter()
+        .filter_map(|member| {
+            let name = member.get("component").and_then(Value::as_str)?;
+            Some(json!({
+                "capability": format!("package:{name}"),
+                "version": member.get("version").and_then(Value::as_str),
+                "purl": member.get("purl").and_then(Value::as_str),
+            }))
+        })
+        .collect::<Vec<_>>();
+
+    let mut facts = Vec::new();
+    let mut sbom = base_fact(
+        source,
+        format!(
+            "sbom.{}{}",
+            slug(&root_name),
+            root_version
+                .as_deref()
+                .map(|value| format!(".{}", slug(value)))
+                .unwrap_or_default()
+        ),
+        "sbom",
+        root_name,
+        root_version.clone(),
+        "observed",
+    );
+    put_array(&mut sbom, "members", members);
+    put_array(&mut sbom, "requires", requirements);
+    put_array(
+        &mut sbom,
+        "provides",
+        vec![json!({
+            "capability": format!("sbom:{}", source.component),
+            "version": root_version,
+        })],
+    );
+    facts.push(sbom);
+
+    for component in components {
+        if let Some(fact) = sbom_package_fact(&component, source) {
+            facts.push(fact);
+        }
+    }
+    Ok(facts)
+}
+
+fn normalize_spdx_sbom(value: &Value, source: &IngestSource) -> Result<Vec<Value>> {
+    let packages = value
+        .get("packages")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if packages.is_empty() {
+        bail!("SPDX SBOM did not include packages");
+    }
+    let root_name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .unwrap_or_else(|| source.component.clone());
+    let members = packages
+        .iter()
+        .map(sbom_component_member)
+        .collect::<Vec<_>>();
+    let mut facts = vec![base_fact(
+        source,
+        format!("sbom.{}", slug(&root_name)),
+        "sbom",
+        root_name,
+        source.version.clone(),
+        "observed",
+    )];
+    put_array(&mut facts[0], "members", members);
+    for package in packages {
+        if let Some(fact) = sbom_package_fact(&package, source) {
+            facts.push(fact);
+        }
+    }
+    Ok(facts)
+}
+
+fn normalize_tox(input: &str, source: &IngestSource) -> Result<Vec<Value>> {
+    let value: Value = serde_json::from_str(input).context("tox input was not valid JSON")?;
+    let mut facts = Vec::new();
+    if let Some(envs) = value
+        .get("testenvs")
+        .or_else(|| value.get("envs"))
+        .and_then(Value::as_object)
+    {
+        for (name, env) in envs {
+            facts.push(test_run_fact(source, "tox", "tox-env", name, env));
+        }
+    }
+    if facts.is_empty() {
+        facts.push(test_run_fact(
+            source,
+            "tox",
+            "tox-run",
+            &source.component,
+            &value,
+        ));
+    }
+    Ok(facts)
+}
+
+fn normalize_nox(input: &str, source: &IngestSource) -> Result<Vec<Value>> {
+    let value: Value = serde_json::from_str(input).context("nox input was not valid JSON")?;
+    let sessions = value
+        .get("sessions")
+        .or_else(|| value.get("results"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if sessions.is_empty() {
+        return Ok(vec![test_run_fact(
+            source,
+            "nox",
+            "nox-run",
+            &source.component,
+            &value,
+        )]);
+    }
+    Ok(sessions
+        .iter()
+        .enumerate()
+        .map(|(index, session)| {
+            let name = string_field(session, "name")
+                .or_else(|| string_field(session, "session"))
+                .unwrap_or_else(|| format!("session-{index}"));
+            test_run_fact(source, "nox", "nox-session", &name, session)
+        })
+        .collect())
+}
+
+fn normalize_k6(input: &str, source: &IngestSource) -> Result<Vec<Value>> {
+    let value: Value = serde_json::from_str(input).context("k6 input was not valid JSON")?;
+    let metrics = value
+        .get("metrics")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let failed = metrics.values().any(metric_threshold_failed);
+    let mut fact = base_fact(
+        source,
+        format!("k6.{}", slug(&source.component)),
+        "load-test",
+        source.component.clone(),
+        source.version.clone(),
+        if failed { "failed" } else { "passed" },
+    );
+    put_array(
+        &mut fact,
+        "provides",
+        vec![json!({
+            "capability": "test:k6",
+            "version": source.version,
+        })],
+    );
+    put_array(
+        &mut fact,
+        "members",
+        metrics
+            .iter()
+            .map(|(name, metric)| {
+                json!({
+                    "component": name,
+                    "status": if metric_threshold_failed(metric) { "failed" } else { "passed" },
+                    "value": metric.get("value"),
+                    "rate": metric.get("rate"),
+                    "thresholds": metric.get("thresholds"),
+                })
+            })
+            .collect(),
+    );
+    Ok(vec![fact])
+}
+
+fn normalize_microcks(input: &str, source: &IngestSource) -> Result<Vec<Value>> {
+    let value: Value = serde_json::from_str(input).context("Microcks input was not valid JSON")?;
+    let name = string_field(&value, "name")
+        .or_else(|| string_field(&value, "serviceName"))
+        .or_else(|| {
+            value
+                .pointer("/testResult/serviceName")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .unwrap_or_else(|| source.component.clone());
+    let success = value
+        .get("success")
+        .and_then(Value::as_bool)
+        .or_else(|| {
+            value
+                .pointer("/testResult/success")
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or_else(|| {
+            !matches!(
+                string_field(&value, "status")
+                    .unwrap_or_default()
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "failed" | "failure" | "error"
+            )
+        });
+    let mut fact = base_fact(
+        source,
+        format!("microcks.{}", slug(&name)),
+        "api-contract-test",
+        name.clone(),
+        source.version.clone(),
+        if success { "passed" } else { "failed" },
+    );
+    put_array(
+        &mut fact,
+        "provides",
+        vec![json!({
+            "capability": "test:microcks",
+            "version": source.version,
+            "service": name,
+        })],
+    );
+    put_object(&mut fact, "result", value);
+    Ok(vec![fact])
+}
+
+fn test_run_fact(
+    source: &IngestSource,
+    adapter: &str,
+    subject_type: &str,
+    name: &str,
+    evidence: &Value,
+) -> Value {
+    let status = test_status(evidence);
+    let mut fact = base_fact(
+        source,
+        format!("{}.{}.{}", adapter, slug(&source.component), slug(name)),
+        subject_type,
+        name.to_string(),
+        source.version.clone(),
+        status,
+    );
+    put_array(
+        &mut fact,
+        "provides",
+        vec![json!({
+            "capability": format!("test:{adapter}"),
+            "version": source.version,
+        })],
+    );
+    put_object(&mut fact, "result", evidence.clone());
+    fact
+}
+
+fn test_status(value: &Value) -> &'static str {
+    if let Some(status) = string_field(value, "status")
+        .or_else(|| string_field(value, "result"))
+        .or_else(|| string_field(value, "outcome"))
+    {
+        let status = status.to_ascii_lowercase();
+        if matches!(status.as_str(), "pass" | "passed" | "success" | "ok") {
+            return "passed";
+        }
+        if matches!(
+            status.as_str(),
+            "fail" | "failed" | "failure" | "error" | "errored"
+        ) {
+            return "failed";
+        }
+    }
+    if let Some(success) = value.get("success").and_then(Value::as_bool) {
+        return if success { "passed" } else { "failed" };
+    }
+    if let Some(retcode) = value
+        .get("retcode")
+        .or_else(|| value.get("returncode"))
+        .or_else(|| value.get("exit_code"))
+        .and_then(Value::as_i64)
+    {
+        return if retcode == 0 { "passed" } else { "failed" };
+    }
+    "observed"
+}
+
+#[derive(Clone, Debug, Default)]
+struct JUnitSuite {
+    name: String,
+    tests: u64,
+    failures: u64,
+    errors: u64,
+    skipped: u64,
+    time: Option<String>,
+    cases: Vec<JUnitCase>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct JUnitCase {
+    name: String,
+    classname: Option<String>,
+    time: Option<String>,
+    status: String,
+}
+
+fn parse_junit_suites(input: &str) -> Result<Vec<JUnitSuite>> {
+    let mut reader = Reader::from_str(input);
+    reader.config_mut().trim_text(true);
+    let mut suites = Vec::new();
+    let mut current_suite: Option<JUnitSuite> = None;
+    let mut current_case: Option<JUnitCase> = None;
+
+    loop {
+        match reader.read_event()? {
+            Event::Start(event) if event.name().as_ref() == b"testsuite" => {
+                current_suite = Some(junit_suite_from_attrs(&reader, &event)?);
+            }
+            Event::Empty(event) if event.name().as_ref() == b"testsuite" => {
+                suites.push(junit_suite_from_attrs(&reader, &event)?);
+            }
+            Event::End(event) if event.name().as_ref() == b"testsuite" => {
+                if let Some(suite) = current_suite.take() {
+                    suites.push(suite);
+                }
+            }
+            Event::Start(event) if event.name().as_ref() == b"testcase" => {
+                current_case = Some(junit_case_from_attrs(&reader, &event)?);
+            }
+            Event::Empty(event) if event.name().as_ref() == b"testcase" => {
+                if let Some(suite) = current_suite.as_mut() {
+                    suite.cases.push(junit_case_from_attrs(&reader, &event)?);
+                }
+            }
+            Event::Start(event) | Event::Empty(event)
+                if matches!(event.name().as_ref(), b"failure" | b"error" | b"skipped") =>
+            {
+                if let Some(case) = current_case.as_mut() {
+                    case.status = match event.name().as_ref() {
+                        b"skipped" => "skipped",
+                        _ => "failed",
+                    }
+                    .to_string();
+                }
+            }
+            Event::End(event) if event.name().as_ref() == b"testcase" => {
+                if let (Some(suite), Some(case)) = (current_suite.as_mut(), current_case.take()) {
+                    suite.cases.push(case);
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    Ok(suites)
+}
+
+fn junit_suite_from_attrs(
+    reader: &Reader<&[u8]>,
+    event: &quick_xml::events::BytesStart<'_>,
+) -> Result<JUnitSuite> {
+    let attrs = xml_attrs(reader, event)?;
+    Ok(JUnitSuite {
+        name: attrs.get("name").cloned().unwrap_or_default(),
+        tests: parse_u64(attrs.get("tests")),
+        failures: parse_u64(attrs.get("failures")),
+        errors: parse_u64(attrs.get("errors")),
+        skipped: parse_u64(attrs.get("skipped")),
+        time: attrs.get("time").cloned(),
+        cases: Vec::new(),
+    })
+}
+
+fn junit_case_from_attrs(
+    reader: &Reader<&[u8]>,
+    event: &quick_xml::events::BytesStart<'_>,
+) -> Result<JUnitCase> {
+    let attrs = xml_attrs(reader, event)?;
+    Ok(JUnitCase {
+        name: attrs.get("name").cloned().unwrap_or_default(),
+        classname: attrs.get("classname").cloned(),
+        time: attrs.get("time").cloned(),
+        status: "passed".to_string(),
+    })
+}
+
+fn xml_attrs(
+    reader: &Reader<&[u8]>,
+    event: &quick_xml::events::BytesStart<'_>,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut attrs = std::collections::BTreeMap::new();
+    for attr in event.attributes().with_checks(false) {
+        let attr = attr?;
+        let key = std::str::from_utf8(attr.key.as_ref())?.to_string();
+        let value = attr
+            .decode_and_unescape_value(reader.decoder())?
+            .to_string();
+        attrs.insert(key, value);
+    }
+    Ok(attrs)
+}
+
+fn parse_u64(value: Option<&String>) -> u64 {
+    value.and_then(|value| value.parse().ok()).unwrap_or(0)
+}
+
+fn sbom_component_member(component: &Value) -> Value {
+    json_strip_nulls(json!({
+        "component": string_field(component, "name")
+            .or_else(|| string_field(component, "SPDXID"))
+            .unwrap_or_else(|| "unknown".to_string()),
+        "version": string_field(component, "version").or_else(|| string_field(component, "versionInfo")),
+        "type": string_field(component, "type"),
+        "purl": string_field(component, "purl"),
+        "bomRef": string_field(component, "bom-ref").or_else(|| string_field(component, "SPDXID")),
+        "digest": sbom_digest(component),
+    }))
+}
+
+fn sbom_package_fact(component: &Value, source: &IngestSource) -> Option<Value> {
+    let name = string_field(component, "name").or_else(|| string_field(component, "SPDXID"))?;
+    let version =
+        string_field(component, "version").or_else(|| string_field(component, "versionInfo"));
+    let mut fact = base_fact(
+        source,
+        format!(
+            "package.{}{}",
+            slug(&name),
+            version
+                .as_deref()
+                .map(|value| format!(".{}", slug(value)))
+                .unwrap_or_default()
+        ),
+        "dependency",
+        name.clone(),
+        version.clone(),
+        "observed",
+    );
+    put_array(
+        &mut fact,
+        "provides",
+        vec![json_strip_nulls(json!({
+            "capability": format!("package:{name}"),
+            "version": version,
+            "purl": string_field(component, "purl"),
+            "digest": sbom_digest(component),
+        }))],
+    );
+    put_object(&mut fact, "package", component.clone());
+    Some(fact)
+}
+
+fn sbom_digest(component: &Value) -> Option<String> {
+    component
+        .get("hashes")
+        .and_then(Value::as_array)
+        .and_then(|hashes| hashes.first())
+        .and_then(|hash| {
+            let algorithm =
+                string_field(hash, "alg").or_else(|| string_field(hash, "algorithm"))?;
+            let content =
+                string_field(hash, "content").or_else(|| string_field(hash, "checksumValue"))?;
+            Some(format!("{}:{}", algorithm.to_ascii_lowercase(), content))
+        })
+        .or_else(|| {
+            component
+                .get("checksums")
+                .and_then(Value::as_array)
+                .and_then(|checksums| checksums.first())
+                .and_then(|checksum| {
+                    let algorithm = string_field(checksum, "algorithm")?;
+                    let content = string_field(checksum, "checksumValue")?;
+                    Some(format!("{}:{}", algorithm.to_ascii_lowercase(), content))
+                })
+        })
+}
+
+fn metric_threshold_failed(metric: &Value) -> bool {
+    metric
+        .get("thresholds")
+        .and_then(Value::as_object)
+        .map(|thresholds| {
+            thresholds.values().any(|threshold| {
+                threshold
+                    .get("ok")
+                    .and_then(Value::as_bool)
+                    .map(|ok| !ok)
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn base_fact(
+    source: &IngestSource,
+    id: String,
+    subject_type: &str,
+    subject_name: String,
+    subject_version: Option<String>,
+    status: &str,
+) -> Value {
+    let mut map = serde_json::Map::new();
+    map.insert("id".to_string(), json!(id));
+    map.insert("zone".to_string(), json!(source.zone));
+    map.insert("kind".to_string(), json!("evidence"));
+    map.insert("status".to_string(), json!(status));
+    map.insert("subjectType".to_string(), json!(subject_type));
+    map.insert("subjectName".to_string(), json!(subject_name));
+    map.insert("canonicalComponent".to_string(), json!(source.component));
+    map.insert(
+        "subject".to_string(),
+        json_strip_nulls(json!({
+            "type": subject_type,
+            "name": subject_name,
+            "version": subject_version,
+            "canonicalComponent": source.component,
+            "repo": source.repo,
+        })),
+    );
+    map.insert(
+        "source".to_string(),
+        json_strip_nulls(json!({
+            "adapter": source.adapter,
+            "repo": source.repo,
+            "sha": source.sha,
+            "ref": source.reference,
+        })),
+    );
+    put_optional(&mut map, "subjectVersion", subject_version);
+    put_optional(&mut map, "sourceRepository", source.repo.clone());
+    put_optional(&mut map, "sourceSha", source.sha.clone());
+    put_optional(&mut map, "sourceRef", source.reference.clone());
+    Value::Object(map)
+}
+
+fn put_optional(map: &mut serde_json::Map<String, Value>, key: &str, value: Option<String>) {
+    if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+        map.insert(key.to_string(), Value::String(value));
+    }
+}
+
+fn put_array(fact: &mut Value, key: &str, value: Vec<Value>) {
+    if !value.is_empty()
+        && let Some(map) = fact.as_object_mut()
+    {
+        map.insert(key.to_string(), Value::Array(value));
+    }
+}
+
+fn put_object(fact: &mut Value, key: &str, value: Value) {
+    if !value.is_null()
+        && let Some(map) = fact.as_object_mut()
+    {
+        map.insert(key.to_string(), value);
+    }
+}
+
+fn string_field(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn json_strip_nulls(value: Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .filter_map(|(key, value)| {
+                    let value = json_strip_nulls(value);
+                    (!value.is_null()).then_some((key, value))
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.into_iter().map(json_strip_nulls).collect()),
+        value => value,
+    }
+}
+
+fn slug(value: &str) -> String {
+    let slug = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    if slug.is_empty() {
+        "unknown".to_string()
+    } else {
+        slug
     }
 }
 
@@ -3501,6 +4282,17 @@ fn read_input(file: Option<PathBuf>, stdin: bool) -> Result<Value> {
     bail!("provide a file path or --stdin")
 }
 
+fn read_text_input(file: Option<PathBuf>, stdin: bool) -> Result<String> {
+    if stdin {
+        return read_stdin_string();
+    }
+    if let Some(file) = file {
+        return fs::read_to_string(&file)
+            .with_context(|| format!("failed to read {}", file.display()));
+    }
+    bail!("provide a file path or --stdin")
+}
+
 fn config_path() -> Result<PathBuf> {
     let dirs = ProjectDirs::from("dev", "matrix", "matrix")
         .ok_or_else(|| anyhow!("could not determine config directory"))?;
@@ -4623,6 +5415,111 @@ mod tests {
         assert!(!json.contains("\"columns\""));
         assert!(!json.contains("\"rows\""));
         assert!(!json.contains("\"[\\\""));
+    }
+
+    fn fixture_source(adapter: &str) -> IngestSource {
+        IngestSource {
+            adapter: adapter.to_string(),
+            zone: default_ingest_zone(adapter).to_string(),
+            repo: Some("example/payments-api".to_string()),
+            component: "payments-api".to_string(),
+            version: Some("1.2.3".to_string()),
+            sha: Some("abc123".to_string()),
+            reference: Some("refs/heads/main".to_string()),
+        }
+    }
+
+    #[test]
+    fn normalizes_junit_as_validation_facts() {
+        let source = fixture_source("junit");
+        let facts = normalize_junit(include_str!("../fixtures/ingest/junit.xml"), &source).unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0]["zone"], "test");
+        assert_eq!(facts[0]["status"], "failed");
+        assert_eq!(facts[0]["subjectType"], "junit-suite");
+        assert_eq!(facts[0]["subjectName"], "api-contract");
+        assert_eq!(facts[0]["members"].as_array().unwrap().len(), 2);
+
+        let db = build_facts_db(&facts, &MatrixContext::default()).unwrap();
+        let rows = execute_readonly_sql(
+            &db,
+            "select component, version, status from components where type==junit-suite",
+        )
+        .unwrap();
+        assert_eq!(rows["rows"][0]["component"], "api-contract");
+        assert_eq!(rows["rows"][0]["version"], "1.2.3");
+        assert_eq!(rows["rows"][0]["status"], "failed");
+    }
+
+    #[test]
+    fn normalizes_cyclonedx_sbom_to_root_and_package_facts() {
+        let source = fixture_source("sbom");
+        let facts =
+            normalize_sbom(include_str!("../fixtures/ingest/cyclonedx.json"), &source).unwrap();
+        assert_eq!(facts.len(), 2);
+        assert_eq!(facts[0]["zone"], "supply-chain");
+        assert_eq!(facts[0]["subjectType"], "sbom");
+        assert_eq!(facts[0]["members"].as_array().unwrap().len(), 1);
+        assert_eq!(facts[1]["subjectType"], "dependency");
+        assert_eq!(facts[1]["subjectName"], "serde");
+
+        let db = build_facts_db(&facts, &MatrixContext::default()).unwrap();
+        let capabilities = execute_readonly_sql(
+            &db,
+            "select capability, capability_version from capabilities order by capability",
+        )
+        .unwrap();
+        assert!(
+            capabilities["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["capability"] == "package:serde"
+                    && row["capability_version"] == "1.0.219")
+        );
+    }
+
+    #[test]
+    fn normalizes_tox_and_nox_sessions() {
+        let tox = normalize_tox(
+            include_str!("../fixtures/ingest/tox.json"),
+            &fixture_source("tox"),
+        )
+        .unwrap();
+        assert_eq!(tox.len(), 2);
+        assert!(tox.iter().any(|fact| fact["status"] == "passed"));
+        assert!(tox.iter().any(|fact| fact["status"] == "failed"));
+
+        let nox = normalize_nox(
+            include_str!("../fixtures/ingest/nox.json"),
+            &fixture_source("nox"),
+        )
+        .unwrap();
+        assert_eq!(nox.len(), 2);
+        assert_eq!(nox[0]["subjectType"], "nox-session");
+        assert_eq!(nox[1]["status"], "failed");
+    }
+
+    #[test]
+    fn normalizes_test_stage_adapters() {
+        let k6 = normalize_k6(
+            include_str!("../fixtures/ingest/k6.json"),
+            &fixture_source("k6"),
+        )
+        .unwrap();
+        assert_eq!(k6.len(), 1);
+        assert_eq!(k6[0]["subjectType"], "load-test");
+        assert_eq!(k6[0]["status"], "failed");
+        assert_eq!(k6[0]["members"].as_array().unwrap().len(), 2);
+
+        let microcks = normalize_microcks(
+            include_str!("../fixtures/ingest/microcks.json"),
+            &fixture_source("microcks"),
+        )
+        .unwrap();
+        assert_eq!(microcks.len(), 1);
+        assert_eq!(microcks[0]["subjectType"], "api-contract-test");
+        assert_eq!(microcks[0]["status"], "passed");
     }
 
     #[test]

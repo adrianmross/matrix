@@ -182,6 +182,48 @@ Producer guidance:
 - Treat construct `eventId` values as immutable audit IDs assigned by the
   server, not as producer-supplied IDs.
 
+## Producer Ingest
+
+`matrix ingest` converts common producer outputs into normalized Matrix facts.
+By default the command prints a fact batch; add `--upload` to submit the facts
+to the configured construct.
+
+```bash
+matrix ingest junit --file junit.xml
+matrix ingest sbom --file bom.cdx.json
+matrix ingest tox --file tox-result.json --upload
+matrix ingest nox --file nox-result.json --zone test
+matrix ingest k6 --file summary.json --zone stage
+matrix ingest microcks --file test-result.json --zone stage
+```
+
+Supported adapters:
+
+- `junit`: emits validation facts for JUnit test suites and members for test
+  cases.
+- `sbom`: emits a root SBOM fact and package/dependency facts for CycloneDX or
+  SPDX JSON.
+- `tox` / `nox`: emit test environment/session facts from JSON reports.
+- `k6`: emits load-test evidence and marks failed thresholds as failed facts.
+- `microcks`: emits API contract-test evidence from JSON test results.
+
+Use these context flags when the input does not carry enough identity:
+
+```bash
+matrix ingest junit --file junit.xml \
+  --repo example/payments-api \
+  --component payments-api \
+  --version 1.2.3 \
+  --sha "$GITHUB_SHA" \
+  --ref "$GITHUB_REF" \
+  --upload
+```
+
+The adapters use `test` as the default zone for test-stage evidence and
+`supply-chain` for SBOM evidence. Override `--zone` when those facts belong to
+a specific train such as `dev`, `stage`, `production`, or a team-defined
+compatibility zone.
+
 ## Context-Aware Views
 
 Use built-in commands instead of remembering view names:

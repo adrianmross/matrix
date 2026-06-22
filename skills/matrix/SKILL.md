@@ -80,7 +80,9 @@ zone such as `runtime`. In status filters,
 Use `matrix ingest` for producer tools such as test runners, build matrices,
 SBOM generators, package managers, supply-chain graph tools, or custom CI
 validators. Adapter names are intentionally plain strings so new producers can
-start emitting facts before a specialized adapter exists.
+start emitting facts before a specialized adapter exists. Prefer supported
+adapters when available: `junit`, `sbom`, `tox`, `nox`, `k6`, and `microcks`.
+Use `--upload` only when the configured construct and credentials are known.
 
 ## Interactive Mode
 

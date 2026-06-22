@@ -78,10 +78,15 @@ matrix ingest tox --file tox-result.json
 matrix ingest nox --file nox-result.json
 matrix ingest junit --file junit.xml
 matrix ingest sbom --file bom.cdx.json
+matrix ingest k6 --file summary.json
+matrix ingest microcks --file test-result.json
 ```
 
-Add `--upload` to submit the normalized adapter payload to the configured
-construct.
+Adapters emit normalized Matrix fact batches with stable fields such as
+`zone`, `status`, `subject`, `requires`, `provides`, and `members`. Add
+`--upload` to submit the normalized facts to the configured construct. Use
+`--zone`, `--repo`, `--component`, `--version`, `--sha`, and `--ref` to override
+the context detected from git or the input file.
 
 ## Codex Plugin
 

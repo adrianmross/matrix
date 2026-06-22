@@ -1,0 +1,25 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.5",
+  "metadata": {
+    "component": {
+      "type": "application",
+      "name": "payments-api",
+      "version": "1.2.3"
+    }
+  },
+  "components": [
+    {
+      "type": "library",
+      "name": "serde",
+      "version": "1.0.219",
+      "purl": "pkg:cargo/serde@1.0.219",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "abc123"
+        }
+      ]
+    }
+  ]
+}

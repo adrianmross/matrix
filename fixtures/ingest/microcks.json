@@ -1,0 +1,8 @@
+{
+  "name": "payments-api:1.2.3",
+  "success": true,
+  "testResult": {
+    "serviceName": "payments-api",
+    "elapsedTime": 231
+  }
+}

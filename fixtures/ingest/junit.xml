@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites>
+  <testsuite name="api-contract" tests="2" failures="1" errors="0" skipped="0" time="0.42">
+    <testcase classname="api.health" name="returns_200" time="0.10"/>
+    <testcase classname="api.auth" name="rejects_bad_token" time="0.32">
+      <failure message="expected 401"/>
+    </testcase>
+  </testsuite>
+</testsuites>

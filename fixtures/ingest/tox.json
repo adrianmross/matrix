@@ -1,0 +1,12 @@
+{
+  "testenvs": {
+    "py311": {
+      "retcode": 0,
+      "commands": ["pytest"]
+    },
+    "py312": {
+      "retcode": 1,
+      "commands": ["pytest"]
+    }
+  }
+}

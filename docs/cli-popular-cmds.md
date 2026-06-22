@@ -46,6 +46,8 @@ matrix ingest tox --file tox-result.json
 matrix ingest nox --file nox-result.json
 matrix ingest junit --file junit.xml
 matrix ingest sbom --file bom.cdx.json
+matrix ingest k6 --file summary.json --zone stage
+matrix ingest microcks --file test-result.json --zone stage
 matrix ingest sbom --file bom.cdx.json --upload
 ```
 

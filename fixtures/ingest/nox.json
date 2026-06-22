@@ -1,0 +1,12 @@
+{
+  "sessions": [
+    {
+      "name": "lint",
+      "status": "passed"
+    },
+    {
+      "name": "tests",
+      "status": "failed"
+    }
+  ]
+}
