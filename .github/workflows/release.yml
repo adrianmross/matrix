@@ -7,6 +7,11 @@ on:
         description: "Release tag, for example v0.3.3"
         required: true
         type: string
+      publish:
+        description: "Publish artifacts to the GitHub Release"
+        required: false
+        default: true
+        type: boolean
   push:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
@@ -138,6 +143,7 @@ jobs:
             done
           } > RELEASE_NOTES.md
       - name: Publish release
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.publish }}
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
