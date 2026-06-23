@@ -9,28 +9,33 @@ use anyhow::{Context, Result};
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, NaiveDate, Utc};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tracing_subscriber::{EnvFilter, fmt};
 
 type SharedDb = Arc<Mutex<Connection>>;
+const DEFAULT_FACT_LIMIT: usize = 100;
+const DEFAULT_HISTORY_LIMIT: usize = 25;
+const MAX_PAGE_LIMIT: usize = 200;
 
 #[derive(Clone)]
 struct AppState {
     db: SharedDb,
+    auth_token: Option<String>,
 }
 
 #[derive(Debug)]
 struct ApiError {
     status: StatusCode,
+    code: &'static str,
     message: String,
 }
 
@@ -87,6 +92,8 @@ struct FactHistoryPage {
 #[derive(Debug, Serialize)]
 struct PageInfo {
     limit: usize,
+    #[serde(rename = "maxLimit")]
+    max_limit: usize,
     total: usize,
     #[serde(rename = "nextCursor")]
     next_cursor: Option<String>,
@@ -116,6 +123,9 @@ async fn main() -> Result<()> {
 
     let state = AppState {
         db: Arc::new(Mutex::new(conn)),
+        auth_token: env::var("MATRIX_CONSTRUCT_TOKEN")
+            .ok()
+            .filter(|token| !token.trim().is_empty()),
     };
     let app = router(state);
     let addr: SocketAddr = env::var("MATRIX_CONSTRUCT_ADDR")
@@ -131,7 +141,10 @@ async fn main() -> Result<()> {
 fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+        .route("/openapi.json", get(openapi))
         .route("/v1/matrix", get(overview))
+        .route("/v1/matrix/openapi.json", get(openapi))
         .route("/v1/matrix/zones/{zone}", get(zone))
         .route("/v1/matrix/zones/{zone}/gates/{level}", get(gate))
         .route("/v1/matrix/zones/{zone}/candidates/{level}", get(candidate))
@@ -141,6 +154,7 @@ fn router(state: AppState) -> Router {
         .route("/v1/matrix/facts/{id}/history", get(fact_history))
         // Compatibility aliases for adapters migrating from track-based APIs.
         .route("/v1/compatibility", get(overview))
+        .route("/v1/compatibility/openapi.json", get(openapi))
         .route("/v1/compatibility/tracks/{zone}", get(zone))
         .route(
             "/v1/compatibility/tracks/{zone}/promotion-gates/{level}",
@@ -158,7 +172,24 @@ fn router(state: AppState) -> Router {
 }
 
 async fn healthz() -> Json<Value> {
-    Json(json!({ "status": "ok" }))
+    Json(json!({ "status": "ok", "service": "matrix-construct" }))
+}
+
+async fn readyz(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let db = state.db.lock().map_err(internal)?;
+    db.query_row("select 1", [], |_row| Ok(()))
+        .map_err(internal)?;
+    Ok(Json(json!({
+        "status": "ready",
+        "service": "matrix-construct",
+        "storage": "sqlite"
+    })))
+}
+
+async fn openapi() -> Result<Json<Value>, ApiError> {
+    serde_json::from_str(include_str!("../openapi.json"))
+        .map(Json)
+        .map_err(internal)
 }
 
 async fn overview(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
@@ -186,7 +217,7 @@ async fn zone(
         &db,
         &FactQuery {
             zone: Some(zone.clone()),
-            limit: Some(100),
+            limit: Some(DEFAULT_FACT_LIMIT),
             ..FactQuery::default()
         },
     )?;
@@ -230,7 +261,7 @@ async fn candidate(
     let db = state.db.lock().map_err(internal)?;
     let mut normalized = query;
     normalized.zone = Some(zone.clone());
-    normalized.limit = Some(100);
+    normalized.limit = Some(DEFAULT_FACT_LIMIT);
     let facts = query_facts(&db, &normalized)?;
     Ok(Json(json!({
         "zone": zone,
@@ -296,18 +327,26 @@ async fn fact_history(
 
 async fn upload_facts(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
+    authorize_write(&state, &headers)?;
     let facts = extract_facts(body)?;
     let mut db = state.db.lock().map_err(internal)?;
     let tx = db.transaction().map_err(internal)?;
     let mut accepted = 0usize;
+    let mut duplicates = 0usize;
     for fact in facts {
-        upsert_fact(&tx, fact)?;
-        accepted += 1;
+        match upsert_fact(&tx, fact)? {
+            UpsertOutcome::Accepted => accepted += 1,
+            UpsertOutcome::Duplicate => duplicates += 1,
+        }
     }
     tx.commit().map_err(internal)?;
-    Ok((StatusCode::ACCEPTED, Json(json!({ "accepted": accepted }))))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({ "accepted": accepted, "duplicates": duplicates })),
+    ))
 }
 
 fn init_db(db: &Connection) -> Result<()> {
@@ -364,7 +403,12 @@ fn extract_facts(body: Value) -> Result<Vec<Value>, ApiError> {
     Err(bad_request("expected an object, fact, or facts array"))
 }
 
-fn upsert_fact(db: &Connection, fact: Value) -> Result<(), ApiError> {
+enum UpsertOutcome {
+    Accepted,
+    Duplicate,
+}
+
+fn upsert_fact(db: &Connection, fact: Value) -> Result<UpsertOutcome, ApiError> {
     let id = fact
         .get("id")
         .and_then(Value::as_str)
@@ -377,6 +421,18 @@ fn upsert_fact(db: &Connection, fact: Value) -> Result<(), ApiError> {
     let observed_at = text_at(&fact, &["observedAt"]).unwrap_or_else(|| accepted_at.clone());
     let serialized = serde_json::to_string(&fact).map_err(internal)?;
     let content_hash = content_hash(&serialized);
+    let existing_content_hash = db
+        .query_row(
+            "select content_hash from facts where id = ?1",
+            [&id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(internal)?
+        .flatten();
+    if existing_content_hash.as_deref() == Some(content_hash.as_str()) {
+        return Ok(UpsertOutcome::Duplicate);
+    }
     insert_fact_event(db, &id, &accepted_at, &content_hash, &fact, &serialized)?;
     db.execute(
         "insert into facts (
@@ -413,7 +469,7 @@ fn upsert_fact(db: &Connection, fact: Value) -> Result<(), ApiError> {
         ],
     )
     .map_err(internal)?;
-    Ok(())
+    Ok(UpsertOutcome::Accepted)
 }
 
 fn insert_fact_event(
@@ -453,7 +509,7 @@ fn insert_fact_event(
 }
 
 fn query_facts(db: &Connection, query: &FactQuery) -> Result<FactPage, ApiError> {
-    let limit = query.limit.unwrap_or(100).clamp(1, 200);
+    let limit = bounded_limit(query.limit, DEFAULT_FACT_LIMIT);
     let offset = query
         .cursor
         .as_deref()
@@ -480,6 +536,7 @@ fn query_facts(db: &Connection, query: &FactQuery) -> Result<FactPage, ApiError>
         facts,
         page: PageInfo {
             limit,
+            max_limit: MAX_PAGE_LIMIT,
             total,
             next_cursor,
         },
@@ -562,7 +619,7 @@ fn query_fact_history(
     let limit = if selected.is_some() {
         1
     } else {
-        query.limit.unwrap_or(25).clamp(1, 200)
+        bounded_limit(query.limit, DEFAULT_HISTORY_LIMIT)
     };
     let offset = if selected.is_some() {
         0
@@ -691,6 +748,7 @@ fn query_fact_history(
         events,
         page: PageInfo {
             limit,
+            max_limit: MAX_PAGE_LIMIT,
             total,
             next_cursor,
         },
@@ -956,9 +1014,33 @@ fn decode_cursor(cursor: &str) -> Result<usize, ApiError> {
         .map_err(|_| bad_request("cursor is invalid"))
 }
 
+fn bounded_limit(limit: Option<usize>, default: usize) -> usize {
+    limit.unwrap_or(default).clamp(1, MAX_PAGE_LIMIT)
+}
+
+fn authorize_write(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    let Some(expected) = state.auth_token.as_deref() else {
+        return Ok(());
+    };
+    let bearer = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim);
+    if bearer == Some(expected) {
+        return Ok(());
+    }
+    Err(ApiError {
+        status: StatusCode::UNAUTHORIZED,
+        code: "unauthorized",
+        message: "write authorization is required".to_string(),
+    })
+}
+
 fn bad_request(message: impl Into<String>) -> ApiError {
     ApiError {
         status: StatusCode::BAD_REQUEST,
+        code: "bad_request",
         message: message.into(),
     }
 }
@@ -966,6 +1048,7 @@ fn bad_request(message: impl Into<String>) -> ApiError {
 fn not_found(message: impl Into<String>) -> ApiError {
     ApiError {
         status: StatusCode::NOT_FOUND,
+        code: "not_found",
         message: message.into(),
     }
 }
@@ -973,13 +1056,24 @@ fn not_found(message: impl Into<String>) -> ApiError {
 fn internal(error: impl std::fmt::Display) -> ApiError {
     ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
+        code: "internal_error",
         message: error.to_string(),
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, Json(json!({ "error": self.message }))).into_response()
+        (
+            self.status,
+            Json(json!({
+                "error": {
+                    "code": self.code,
+                    "message": self.message,
+                    "status": self.status.as_u16()
+                }
+            })),
+        )
+            .into_response()
     }
 }
 
@@ -1013,8 +1107,71 @@ mod tests {
         )
         .unwrap();
         assert_eq!(page.facts.len(), 1);
+        assert_eq!(page.page.limit, DEFAULT_FACT_LIMIT);
+        assert_eq!(page.page.max_limit, MAX_PAGE_LIMIT);
         assert!(page.facts[0]["acceptedAt"].is_string());
         assert!(page.facts[0]["contentHash"].is_string());
+    }
+
+    #[test]
+    fn duplicate_fact_content_is_idempotent() {
+        let db = Connection::open_in_memory().unwrap();
+        init_db(&db).unwrap();
+        let fact = json!({"id":"a","zone":"sdk","status":"passed"});
+
+        assert!(matches!(
+            upsert_fact(&db, fact.clone()).unwrap(),
+            UpsertOutcome::Accepted
+        ));
+        assert!(matches!(
+            upsert_fact(&db, fact).unwrap(),
+            UpsertOutcome::Duplicate
+        ));
+
+        let history = query_fact_history(
+            &db,
+            "a",
+            &FactHistoryQuery {
+                limit: Some(10),
+                ..FactHistoryQuery::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(history.events.len(), 1);
+    }
+
+    #[test]
+    fn write_auth_is_optional_but_enforced_when_configured() {
+        let db = Connection::open_in_memory().unwrap();
+        let unauthenticated = AppState {
+            db: Arc::new(Mutex::new(db)),
+            auth_token: None,
+        };
+        assert!(authorize_write(&unauthenticated, &HeaderMap::new()).is_ok());
+
+        let authenticated = AppState {
+            db: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
+            auth_token: Some("secret".to_string()),
+        };
+        assert!(authorize_write(&authenticated, &HeaderMap::new()).is_err());
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer secret".parse().unwrap(),
+        );
+        assert!(authorize_write(&authenticated, &headers).is_ok());
+    }
+
+    #[test]
+    fn openapi_spec_is_valid_json_and_lists_core_paths() {
+        let spec: Value = serde_json::from_str(include_str!("../openapi.json")).unwrap();
+        assert_eq!(spec["openapi"], "3.1.0");
+        assert!(spec["paths"]["/healthz"].is_object());
+        assert!(spec["paths"]["/readyz"].is_object());
+        assert!(spec["paths"]["/v1/matrix/facts"].is_object());
+        assert!(spec["paths"]["/v1/matrix/facts/{id}/history"].is_object());
+        assert!(spec["components"]["schemas"]["ErrorResponse"].is_object());
     }
 
     #[test]

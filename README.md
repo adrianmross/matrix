@@ -195,7 +195,9 @@ uploads SHA-256 checksums to the GitHub Release. Each target archive is
 extracted on its build runner before upload, and the packaged `matrix`,
 `matrix-enter`, and `matrix-construct` binaries must print the release version.
 The publish job verifies all checksums again and includes the checksum summary
-in the release notes.
+in the release notes. The workflow also builds and smokes the
+`matrix-construct` container image. Publishing releases push
+`ghcr.io/adrianmross/matrix-construct:<version>`.
 
 The `Tag Release` workflow is the preferred path for normal releases. Run it
 with `version=0.3.11` after bumping the Cargo package versions. It validates

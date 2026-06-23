@@ -19,6 +19,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
   build:
@@ -133,6 +134,12 @@ jobs:
             echo
             echo "- Packaged binaries were executed on their target runner with --version."
             echo "- SHA-256 checksum files were verified before publishing."
+            echo "- The matrix-construct container image was built and smoked with --version."
+            if [[ "${{ github.event_name != 'workflow_dispatch' || inputs.publish }}" == "true" ]]; then
+              echo "- The matrix-construct container image was published to ghcr.io/${{ github.repository_owner }}/matrix-construct:${release_tag#v}."
+            else
+              echo "- Container image publishing was skipped because publish=false."
+            fi
             echo
             echo "SHA-256 checksums:"
             echo
@@ -158,3 +165,37 @@ jobs:
               --title "Matrix ${release_tag}" \
               --notes-file RELEASE_NOTES.md
           fi
+
+  construct-image:
+    name: Build matrix-construct image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build image
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_tag="${{ inputs.tag || github.ref_name }}"
+          version="${release_tag#v}"
+          image="ghcr.io/${{ github.repository_owner }}/matrix-construct:${version}"
+          docker build -f crates/matrix-construct/Dockerfile -t "${image}" .
+          echo "image=${image}" >> "${GITHUB_ENV}"
+          echo "version=${version}" >> "${GITHUB_ENV}"
+      - name: Smoke image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm "${image}" --version | tee image.version
+          grep -Fx "matrix-construct ${version}" image.version
+      - name: Login to GHCR
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.publish }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "${GH_TOKEN}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Push image
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.publish }}
+        shell: bash
+        run: docker push "${image}"

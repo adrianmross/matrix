@@ -1,0 +1,448 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Matrix Construct API",
+    "version": "0.3.11",
+    "description": "Generic compatibility matrix construct API for storing facts, reading zones, evaluating gates, and inspecting fact history."
+  },
+  "paths": {
+    "/healthz": {
+      "get": {
+        "summary": "Liveness probe",
+        "responses": {
+          "200": {
+            "description": "Service process is alive",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Health" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/readyz": {
+      "get": {
+        "summary": "Readiness probe",
+        "responses": {
+          "200": {
+            "description": "Storage is reachable",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Readiness" }
+              }
+            }
+          },
+          "500": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "summary": "OpenAPI document",
+        "responses": {
+          "200": {
+            "description": "OpenAPI document",
+            "content": {
+              "application/json": {
+                "schema": { "type": "object" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/matrix": {
+      "get": {
+        "summary": "Construct overview",
+        "responses": {
+          "200": {
+            "description": "Known zones",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Overview" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/matrix/zones/{zone}": {
+      "get": {
+        "summary": "Read facts for a zone",
+        "parameters": [
+          { "$ref": "#/components/parameters/Zone" },
+          { "$ref": "#/components/parameters/Limit" },
+          { "$ref": "#/components/parameters/Cursor" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Zone facts",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ZoneFacts" }
+              }
+            }
+          },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/matrix/zones/{zone}/gates/{level}": {
+      "get": {
+        "summary": "Evaluate a simple promotion gate",
+        "parameters": [
+          { "$ref": "#/components/parameters/Zone" },
+          { "$ref": "#/components/parameters/Level" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Gate result",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Gate" }
+              }
+            }
+          },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/matrix/zones/{zone}/candidates/{level}": {
+      "get": {
+        "summary": "Read candidate facts for a zone and level",
+        "parameters": [
+          { "$ref": "#/components/parameters/Zone" },
+          { "$ref": "#/components/parameters/Level" },
+          { "$ref": "#/components/parameters/Limit" },
+          { "$ref": "#/components/parameters/Cursor" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Candidate facts",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Candidate" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/matrix/facts": {
+      "get": {
+        "summary": "List facts",
+        "parameters": [
+          { "$ref": "#/components/parameters/ZoneQuery" },
+          { "$ref": "#/components/parameters/Kind" },
+          { "$ref": "#/components/parameters/Status" },
+          { "$ref": "#/components/parameters/SourceRepository" },
+          { "$ref": "#/components/parameters/SubjectType" },
+          { "$ref": "#/components/parameters/SubjectName" },
+          { "$ref": "#/components/parameters/Channel" },
+          { "$ref": "#/components/parameters/Limit" },
+          { "$ref": "#/components/parameters/Cursor" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Fact page",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/FactPage" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "post": {
+        "summary": "Submit facts",
+        "description": "If MATRIX_CONSTRUCT_TOKEN is set, this endpoint requires Authorization: Bearer <token>.",
+        "security": [{ "bearerAuth": [] }, {}],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/FactUpload" }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Facts accepted or recognized as duplicates",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/FactUploadResult" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/matrix/facts/latest": {
+      "get": {
+        "summary": "Read the latest matching fact",
+        "parameters": [
+          { "$ref": "#/components/parameters/ZoneQuery" },
+          { "$ref": "#/components/parameters/Kind" },
+          { "$ref": "#/components/parameters/Status" },
+          { "$ref": "#/components/parameters/SourceRepository" },
+          { "$ref": "#/components/parameters/SubjectType" },
+          { "$ref": "#/components/parameters/SubjectName" },
+          { "$ref": "#/components/parameters/Channel" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Latest matching fact",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": { "fact": { "type": ["object", "null"] } }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/matrix/facts/{id}": {
+      "get": {
+        "summary": "Read current or selected fact revision",
+        "parameters": [
+          { "$ref": "#/components/parameters/FactId" },
+          { "$ref": "#/components/parameters/Revision" },
+          { "$ref": "#/components/parameters/EventId" },
+          { "$ref": "#/components/parameters/Relative" },
+          { "$ref": "#/components/parameters/AsOf" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Selected fact",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/FactGet" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/matrix/facts/{id}/history": {
+      "get": {
+        "summary": "Read immutable fact history",
+        "parameters": [
+          { "$ref": "#/components/parameters/FactId" },
+          { "$ref": "#/components/parameters/Revision" },
+          { "$ref": "#/components/parameters/EventId" },
+          { "$ref": "#/components/parameters/Relative" },
+          { "$ref": "#/components/parameters/AsOf" },
+          { "$ref": "#/components/parameters/Limit" },
+          { "$ref": "#/components/parameters/Cursor" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Fact history page",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/FactHistoryPage" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": { "type": "http", "scheme": "bearer" }
+    },
+    "parameters": {
+      "Zone": { "name": "zone", "in": "path", "required": true, "schema": { "type": "string" } },
+      "Level": { "name": "level", "in": "path", "required": true, "schema": { "type": "string" } },
+      "FactId": { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+      "ZoneQuery": { "name": "zone", "in": "query", "schema": { "type": "string" } },
+      "Kind": { "name": "kind", "in": "query", "schema": { "type": "string" } },
+      "Status": { "name": "status", "in": "query", "schema": { "type": "string" } },
+      "SourceRepository": { "name": "sourceRepository", "in": "query", "schema": { "type": "string" } },
+      "SubjectType": { "name": "subjectType", "in": "query", "schema": { "type": "string" } },
+      "SubjectName": { "name": "subjectName", "in": "query", "schema": { "type": "string" } },
+      "Channel": { "name": "channel", "in": "query", "schema": { "type": "string" } },
+      "Limit": { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 100 } },
+      "Cursor": { "name": "cursor", "in": "query", "schema": { "type": "string" } },
+      "Revision": { "name": "revision", "in": "query", "schema": { "type": "integer" } },
+      "EventId": { "name": "eventId", "in": "query", "schema": { "type": "string" } },
+      "Relative": { "name": "relative", "in": "query", "schema": { "type": "integer" } },
+      "AsOf": { "name": "asOf", "in": "query", "schema": { "type": "string" } }
+    },
+    "responses": {
+      "Error": {
+        "description": "Stable JSON error",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "Health": {
+        "type": "object",
+        "required": ["status", "service"],
+        "properties": {
+          "status": { "type": "string", "const": "ok" },
+          "service": { "type": "string" }
+        }
+      },
+      "Readiness": {
+        "type": "object",
+        "required": ["status", "service", "storage"],
+        "properties": {
+          "status": { "type": "string", "const": "ready" },
+          "service": { "type": "string" },
+          "storage": { "type": "string" }
+        }
+      },
+      "Overview": {
+        "type": "object",
+        "required": ["generatedAt", "zones"],
+        "properties": {
+          "generatedAt": { "type": "string", "format": "date-time" },
+          "zones": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "PageInfo": {
+        "type": "object",
+        "required": ["limit", "maxLimit", "total", "nextCursor"],
+        "properties": {
+          "limit": { "type": "integer" },
+          "maxLimit": { "type": "integer", "const": 200 },
+          "total": { "type": "integer" },
+          "nextCursor": { "type": ["string", "null"] }
+        }
+      },
+      "FactPage": {
+        "type": "object",
+        "required": ["facts", "page"],
+        "properties": {
+          "facts": { "type": "array", "items": { "type": "object" } },
+          "page": { "$ref": "#/components/schemas/PageInfo" }
+        }
+      },
+      "ZoneFacts": {
+        "type": "object",
+        "required": ["zone", "facts", "page"],
+        "properties": {
+          "zone": { "type": "string" },
+          "facts": { "type": "array", "items": { "type": "object" } },
+          "page": { "$ref": "#/components/schemas/PageInfo" }
+        }
+      },
+      "Gate": {
+        "type": "object",
+        "required": ["zone", "level", "gate"],
+        "properties": {
+          "zone": { "type": "string" },
+          "level": { "type": "string" },
+          "gate": {
+            "type": "object",
+            "properties": {
+              "eligible": { "type": "boolean" },
+              "status": { "type": "string" },
+              "failedFacts": { "type": "integer" },
+              "totalFacts": { "type": "integer" }
+            }
+          }
+        }
+      },
+      "Candidate": {
+        "type": "object",
+        "required": ["zone", "level", "candidate"],
+        "properties": {
+          "zone": { "type": "string" },
+          "level": { "type": "string" },
+          "candidate": {
+            "type": "object",
+            "properties": {
+              "eligible": { "type": "boolean" },
+              "facts": { "type": "array", "items": { "type": "object" } }
+            }
+          }
+        }
+      },
+      "FactUpload": {
+        "oneOf": [
+          { "type": "object", "required": ["fact"], "properties": { "fact": { "type": "object" } } },
+          { "type": "object", "required": ["facts"], "properties": { "facts": { "type": "array", "items": { "type": "object" } } } },
+          { "type": "object" }
+        ]
+      },
+      "FactUploadResult": {
+        "type": "object",
+        "required": ["accepted", "duplicates"],
+        "properties": {
+          "accepted": { "type": "integer" },
+          "duplicates": { "type": "integer" }
+        }
+      },
+      "FactGet": {
+        "type": "object",
+        "required": ["factId", "event", "fact"],
+        "properties": {
+          "factId": { "type": "string" },
+          "event": { "$ref": "#/components/schemas/FactEvent" },
+          "fact": { "type": "object" }
+        }
+      },
+      "FactHistoryPage": {
+        "type": "object",
+        "required": ["factId", "events", "page"],
+        "properties": {
+          "factId": { "type": "string" },
+          "events": { "type": "array", "items": { "$ref": "#/components/schemas/FactEvent" } },
+          "page": { "$ref": "#/components/schemas/PageInfo" }
+        }
+      },
+      "FactEvent": {
+        "type": "object",
+        "required": ["eventId", "factId", "revision", "acceptedAt", "contentHash", "status", "current"],
+        "properties": {
+          "eventId": { "type": "string" },
+          "factId": { "type": "string" },
+          "revision": { "type": "integer" },
+          "acceptedAt": { "type": "string", "format": "date-time" },
+          "contentHash": { "type": "string" },
+          "sourceRepository": { "type": ["string", "null"] },
+          "sourceSha": { "type": ["string", "null"] },
+          "sourceRef": { "type": ["string", "null"] },
+          "status": { "type": "string", "enum": ["current", "superseded"] },
+          "current": { "type": "boolean" },
+          "supersededBy": { "type": ["string", "null"] },
+          "supersededAt": { "type": ["string", "null"] },
+          "fact": { "type": "object" }
+        }
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+          "error": {
+            "type": "object",
+            "required": ["code", "message", "status"],
+            "properties": {
+              "code": { "type": "string" },
+              "message": { "type": "string" },
+              "status": { "type": "integer" }
+            }
+          }
+        }
+      }
+    }
+  }
+}
