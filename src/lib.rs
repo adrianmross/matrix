@@ -906,7 +906,7 @@ async fn download_github_release_asset(
     if !status.is_success() {
         if status == StatusCode::NOT_FOUND && token.is_none() {
             bail!(
-                "GitHub release asset download returned 404 for {MATRIX_REPOSITORY}; set MATRIX_GITHUB_TOKEN, GITHUB_TOKEN, or GH_TOKEN, or run `gh auth login`"
+                "GitHub release asset download returned 404 for {MATRIX_REPOSITORY}; public releases should not require auth, but MATRIX_GITHUB_TOKEN or GITHUB_TOKEN can be set for authenticated GitHub API access"
             );
         }
         let text = response.text().await.unwrap_or_default();
@@ -1004,7 +1004,7 @@ async fn latest_matrix_release(client: &reqwest::Client) -> Result<Value> {
     if !status.is_success() {
         if status == StatusCode::NOT_FOUND && token.is_none() {
             bail!(
-                "GitHub release lookup returned 404 for {MATRIX_REPOSITORY}; set MATRIX_GITHUB_TOKEN, GITHUB_TOKEN, or GH_TOKEN, or run `gh auth login` so matrix can read `gh auth token`"
+                "GitHub release lookup returned 404 for {MATRIX_REPOSITORY}; public releases should not require auth, but MATRIX_GITHUB_TOKEN or GITHUB_TOKEN can be set for authenticated GitHub API access"
             );
         }
         bail!(
@@ -1016,25 +1016,9 @@ async fn latest_matrix_release(client: &reqwest::Client) -> Result<Value> {
 }
 
 fn github_token() -> Option<String> {
-    ["MATRIX_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"]
+    ["MATRIX_GITHUB_TOKEN", "GITHUB_TOKEN"]
         .into_iter()
         .find_map(|name| env::var(name).ok().filter(|value| !value.trim().is_empty()))
-        .or_else(gh_auth_token)
-}
-
-fn gh_auth_token() -> Option<String> {
-    let output = ProcessCommand::new("gh")
-        .args(["auth", "token"])
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8(output.stdout)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
 }
 
 fn fresh_update_notice(path: &std::path::Path) -> Option<String> {

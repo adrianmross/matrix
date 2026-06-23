@@ -162,8 +162,9 @@ service binary version.
 `matrix` checks GitHub Releases for a newer version once per day on interactive
 startup and prints `matrix update` when one is available. Set
 `MATRIX_NO_UPDATE_CHECK=1` to disable the notice. For the GitHub release API, it
-uses `MATRIX_GITHUB_TOKEN`, `GITHUB_TOKEN`, `GH_TOKEN`, or `gh auth token` when
-available.
+does not need a token for public releases. Set `MATRIX_GITHUB_TOKEN` for a
+Matrix-specific install token, or `GITHUB_TOKEN` for generic GitHub automation
+and higher API rate limits.
 
 `matrix update` delegates to Homebrew for Homebrew-managed installs and updates
 Linux x86_64 direct installs from the release archive when possible:
