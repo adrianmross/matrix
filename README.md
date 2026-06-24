@@ -44,7 +44,9 @@ From source:
 cargo install --locked --git https://github.com/adrianmross/matrix matrix
 ```
 
-Linux x86_64 direct installs can use the GitHub Release archive:
+Linux x86_64 direct installs can use the GitHub Release archive. The Linux
+archive is statically linked so it does not require the release runner's glibc
+version on the install host:
 
 ```bash
 MATRIX_VERSION="$(gh release view --repo adrianmross/matrix --json tagName -q .tagName)"
@@ -218,8 +220,10 @@ git push origin v0.3.13
 
 The `Release` workflow builds `matrix`, `matrix-enter`, and `matrix-construct`
 for Linux x64, macOS Intel, and macOS Apple Silicon, publishes tarballs, and
-uploads SHA-256 checksums to the GitHub Release. Each target archive is
-extracted on its build runner before upload, and the packaged `matrix`,
+uploads SHA-256 checksums to the GitHub Release. Linux x64 binaries are
+statically linked with musl so direct installs are not tied to the release
+runner's glibc version. Each target archive is extracted on its build runner
+before upload, and the packaged `matrix`,
 `matrix-enter`, and `matrix-construct` binaries must print the release version.
 The publish job verifies all checksums again and includes the checksum summary
 in the release notes. The workflow also builds and smokes the

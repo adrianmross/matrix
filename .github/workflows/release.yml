@@ -31,21 +31,47 @@ jobs:
         include:
           - runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            rust-target: x86_64-unknown-linux-musl
+            linux-static: true
           - runner: macos-15-intel
             target: x86_64-apple-darwin
+            rust-target: ""
+            linux-static: false
           - runner: macos-15
             target: aarch64-apple-darwin
+            rust-target: ""
+            linux-static: false
 
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install static Linux build dependencies
+        if: ${{ matrix.linux-static }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y file musl-tools
+          rustup target add "${{ matrix.rust-target }}"
       - uses: Swatinem/rust-cache@v2
         with:
-          key: release-${{ matrix.target }}
+          key: release-${{ matrix.target }}-${{ matrix.rust-target }}
       - run: cargo test --workspace
-      - run: cargo build --release -p matrix --no-default-features
-      - run: cargo build --release -p matrix-enter
-      - run: cargo build --release -p matrix-construct
+      - name: Build release binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          rust_target="${{ matrix.rust-target }}"
+          target_args=()
+          release_dir="target/release"
+          if [[ -n "${rust_target}" ]]; then
+            target_args=(--target "${rust_target}")
+            release_dir="target/${rust_target}/release"
+          fi
+          cargo build --release -p matrix --no-default-features "${target_args[@]}"
+          cargo build --release -p matrix-enter "${target_args[@]}"
+          cargo build --release -p matrix-construct "${target_args[@]}"
+          echo "RELEASE_DIR=${release_dir}" >> "${GITHUB_ENV}"
       - name: Package binaries
         shell: bash
         run: |
@@ -55,9 +81,9 @@ jobs:
           archive="matrix-${version}-${{ matrix.target }}"
           package_dir="dist/${archive}"
           mkdir -p "${package_dir}"
-          cp target/release/matrix "${package_dir}/matrix"
-          cp target/release/matrix-enter "${package_dir}/matrix-enter"
-          cp target/release/matrix-construct "${package_dir}/matrix-construct"
+          cp "${RELEASE_DIR}/matrix" "${package_dir}/matrix"
+          cp "${RELEASE_DIR}/matrix-enter" "${package_dir}/matrix-enter"
+          cp "${RELEASE_DIR}/matrix-construct" "${package_dir}/matrix-construct"
           cp README.md LICENSE "${package_dir}/"
           chmod +x "${package_dir}/matrix" "${package_dir}/matrix-enter" "${package_dir}/matrix-construct"
           tar -C dist -czf "dist/${archive}.tar.gz" "${archive}"
@@ -78,6 +104,12 @@ jobs:
           grep -Fx "matrix ${version}" "smoke/${archive}/matrix.version"
           grep -Fx "matrix-enter ${version}" "smoke/${archive}/matrix-enter.version"
           grep -Fx "matrix-construct ${version}" "smoke/${archive}/matrix-construct.version"
+          if [[ "${{ matrix.linux-static }}" == "true" ]]; then
+            for binary in matrix matrix-enter matrix-construct; do
+              file "smoke/${archive}/${binary}" | tee "smoke/${archive}/${binary}.file"
+              grep -q "statically linked" "smoke/${archive}/${binary}.file"
+            done
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.target }}
@@ -133,6 +165,7 @@ jobs:
             echo "Release validation:"
             echo
             echo "- Packaged binaries were executed on their target runner with --version."
+            echo "- The Linux x86_64 archive is statically linked with musl to avoid host glibc version coupling."
             echo "- SHA-256 checksum files were verified before publishing."
             echo "- The matrix-construct container image was built and smoked with --version."
             if [[ "${{ github.event_name != 'workflow_dispatch' || inputs.publish }}" == "true" ]]; then
