@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Matrix Construct API",
-    "version": "0.3.12",
+    "version": "0.3.13",
     "description": "Generic compatibility matrix construct API for storing facts, reading zones, evaluating gates, and inspecting fact history."
   },
   "paths": {
