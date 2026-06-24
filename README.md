@@ -194,6 +194,13 @@ brew update
 brew upgrade adrianmross/tap/matrix
 ```
 
+For Linux direct installs, override the target binary path when the running
+binary is not the path you want to replace:
+
+```bash
+matrix update --install-path /home/me/bin/matrix
+```
+
 For source installs, update with:
 
 ```bash

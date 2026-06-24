@@ -158,6 +158,8 @@ struct UpdateCommand {
     check: bool,
     #[arg(long)]
     force: bool,
+    #[arg(long)]
+    install_path: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -921,13 +923,16 @@ async fn update_command(matrix: &Matrix, command: UpdateCommand) -> Result<Value
                 "current": current,
                 "latest": latest,
                 "updateAvailable": true,
+                "installMethod": "homebrew",
                 "command": "matrix update"
             }));
         }
         return Ok(json!({
             "current": current,
             "latest": current,
-            "updateAvailable": false
+            "updateAvailable": false,
+            "installMethod": "homebrew",
+            "command": "matrix update"
         }));
     }
 
@@ -947,30 +952,49 @@ async fn update_command(matrix: &Matrix, command: UpdateCommand) -> Result<Value
 
     if !command.check {
         if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-            return run_direct_linux_update(matrix, &latest, command.force).await;
+            return run_direct_linux_update(
+                matrix,
+                &latest,
+                command.force,
+                command.install_path.as_deref(),
+            )
+            .await;
         }
         bail!("{}", direct_update_unavailable_message(&latest));
     }
 
-    if command.check {
-        if update_available {
-            return Ok(json!({
-                "current": current,
-                "latest": latest,
-                "updateAvailable": true,
-                "command": "matrix update"
-            }));
-        }
+    let install_path = command
+        .install_path
+        .clone()
+        .or_else(default_linux_install_path);
+    if update_available {
         return Ok(json!({
             "current": current,
             "latest": latest,
-            "updateAvailable": false
+            "updateAvailable": true,
+            "installMethod": update_install_method(homebrew_install),
+            "installPath": install_path,
+            "command": "matrix update",
+            "manualCommand": linux_manual_update_command(&latest, install_path.as_deref())
         }));
     }
-    unreachable!("non-check update path returns before check response handling")
+    Ok(json!({
+        "current": current,
+        "latest": latest,
+        "updateAvailable": false,
+        "installMethod": update_install_method(homebrew_install),
+        "installPath": install_path,
+        "command": "matrix update",
+        "manualCommand": linux_manual_update_command(&latest, install_path.as_deref())
+    }))
 }
 
-async fn run_direct_linux_update(matrix: &Matrix, latest: &str, force: bool) -> Result<Value> {
+async fn run_direct_linux_update(
+    matrix: &Matrix,
+    latest: &str,
+    force: bool,
+    install_path: Option<&Path>,
+) -> Result<Value> {
     let current = env!("CARGO_PKG_VERSION");
     if !version_is_newer(current, latest) && !force {
         return Ok(Value::String(format!(
@@ -1009,8 +1033,10 @@ async fn run_direct_linux_update(matrix: &Matrix, latest: &str, force: bool) -> 
         );
     }
 
-    let current_exe =
-        env::current_exe().context("could not determine current matrix executable")?;
+    let current_exe = install_path
+        .map(Path::to_path_buf)
+        .or_else(default_linux_install_path)
+        .ok_or_else(|| anyhow!("could not determine current matrix executable"))?;
     let current_exe = current_exe.canonicalize().unwrap_or(current_exe);
     let install_dir = current_exe.parent().ok_or_else(|| {
         anyhow!(
@@ -1063,6 +1089,16 @@ fn install_binary_from_archive(
     Ok(())
 }
 
+fn update_install_method(homebrew_install: bool) -> &'static str {
+    if homebrew_install {
+        "homebrew"
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        "direct-linux"
+    } else {
+        "manual"
+    }
+}
+
 fn direct_update_unavailable_message(latest: &str) -> String {
     format!(
         "this matrix install was not detected as Homebrew-managed. On macOS use `brew upgrade {MATRIX_HOMEBREW_FORMULA}`. On Linux use `{}`. From source use `{}`.",
@@ -1081,8 +1117,18 @@ fn linux_manual_update_command(latest: &str, install_path: Option<&Path>) -> Str
     let install_path = install_path
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "~/.cargo/bin/matrix".to_string());
+    let install_command = install_path
+        .strip_prefix("~/.cargo/")
+        .map(|_| "install")
+        .unwrap_or_else(|| {
+            if install_path.starts_with("/usr/") || install_path.starts_with("/opt/") {
+                "sudo install"
+            } else {
+                "install"
+            }
+        });
     format!(
-        "gh release download v{latest} --repo {MATRIX_REPOSITORY} --pattern 'matrix-{latest}-{MATRIX_LINUX_TARGET}.tar.gz' --dir /tmp/matrix-update && tar -xzf /tmp/matrix-update/matrix-{latest}-{MATRIX_LINUX_TARGET}.tar.gz -C /tmp/matrix-update && install /tmp/matrix-update/matrix-{latest}-{MATRIX_LINUX_TARGET}/matrix {install_path}"
+        "gh release download v{latest} --repo {MATRIX_REPOSITORY} --pattern 'matrix-{latest}-{MATRIX_LINUX_TARGET}.tar.gz' --dir /tmp/matrix-update && tar -xzf /tmp/matrix-update/matrix-{latest}-{MATRIX_LINUX_TARGET}.tar.gz -C /tmp/matrix-update && {install_command} /tmp/matrix-update/matrix-{latest}-{MATRIX_LINUX_TARGET}/matrix {install_path}"
     )
 }
 
@@ -5039,6 +5085,29 @@ mod tests {
     }
 
     #[test]
+    fn parses_update_install_path() {
+        let cli = Cli::try_parse_from([
+            "matrix",
+            "update",
+            "--check",
+            "--install-path",
+            "/home/me/bin/matrix",
+        ])
+        .expect("update install path parses");
+
+        match cli.command {
+            Commands::Update(UpdateCommand {
+                check: true,
+                install_path: Some(path),
+                ..
+            }) => {
+                assert_eq!(path, PathBuf::from("/home/me/bin/matrix"));
+            }
+            _ => panic!("expected update command with install path"),
+        }
+    }
+
+    #[test]
     fn page_values_accepts_facts_or_items_pages() {
         assert_eq!(
             page_values(&json!({"facts": [{"id": "fact-1"}]}), "facts")[0]["id"],
@@ -5296,7 +5365,25 @@ mod tests {
         assert!(command.contains("adrianmross/matrix"));
         assert!(command.contains("matrix-0.3.12-x86_64-unknown-linux-gnu.tar.gz"));
         assert!(command.ends_with(
-            "install /tmp/matrix-update/matrix-0.3.12-x86_64-unknown-linux-gnu/matrix /usr/local/bin/matrix"
+            "sudo install /tmp/matrix-update/matrix-0.3.12-x86_64-unknown-linux-gnu/matrix /usr/local/bin/matrix"
+        ));
+    }
+
+    #[test]
+    fn linux_manual_update_command_uses_plain_install_for_user_path() {
+        let command = linux_manual_update_command("0.3.12", Some(Path::new("/home/me/bin/matrix")));
+
+        assert!(command.ends_with(
+            "install /tmp/matrix-update/matrix-0.3.12-x86_64-unknown-linux-gnu/matrix /home/me/bin/matrix"
+        ));
+    }
+
+    #[test]
+    fn linux_manual_update_command_uses_plain_install_for_cargo_home_path() {
+        let command = linux_manual_update_command("0.3.12", None);
+
+        assert!(command.ends_with(
+            "install /tmp/matrix-update/matrix-0.3.12-x86_64-unknown-linux-gnu/matrix ~/.cargo/bin/matrix"
         ));
     }
 
