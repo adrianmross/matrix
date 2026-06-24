@@ -1,6 +1,6 @@
 [package]
 name = "matrix-construct"
-version = "0.3.13"
+version = "0.3.14"
 edition = "2024"
 description = "A generic compatibility matrix construct service."
 license = "Apache-2.0"
