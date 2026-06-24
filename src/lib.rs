@@ -20,6 +20,8 @@ mod ingest;
 const MATRIX_REPOSITORY: &str = "adrianmross/matrix";
 const MATRIX_HOMEBREW_FORMULA: &str = "adrianmross/tap/matrix";
 const MATRIX_LINUX_TARGET: &str = "x86_64-unknown-linux-gnu";
+const RED_WIZ_CONSTRUCT_URL: &str = "https://platform-api.red-wiz.stream";
+const RED_WIZ_API_PREFIX: &str = "/v1/compatibility";
 const UPDATE_CHECK_TTL: Duration = Duration::from_secs(60 * 60 * 24);
 
 #[cfg(feature = "interactive")]
@@ -40,6 +42,8 @@ struct Cli {
     construct: Option<String>,
     #[arg(long, env = "MATRIX_API_PREFIX", global = true)]
     api_prefix: Option<String>,
+    #[arg(long, env = "MATRIX_PROFILE", value_enum, global = true)]
+    profile: Option<ConfigProfile>,
     #[arg(short = 'o', long = "out", env = "MATRIX_OUTPUT", value_enum, global = true, default_value_t = OutputFormat::Human)]
     output: OutputFormat,
     #[arg(long, global = true, hide = true)]
@@ -55,6 +59,32 @@ enum OutputFormat {
     Yaml,
     Table,
     Csv,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+enum ConfigProfile {
+    RedWiz,
+}
+
+impl ConfigProfile {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RedWiz => "red-wiz",
+        }
+    }
+
+    fn construct(self) -> &'static str {
+        match self {
+            Self::RedWiz => RED_WIZ_CONSTRUCT_URL,
+        }
+    }
+
+    fn api_prefix(self) -> &'static str {
+        match self {
+            Self::RedWiz => RED_WIZ_API_PREFIX,
+        }
+    }
 }
 
 impl OutputFormat {
@@ -97,6 +127,23 @@ enum Commands {
     Compatible(ListQueryArgs),
     Compare(CompareArgs),
     Why(CompareArgs),
+    Artifacts(ArtifactListArgs),
+    Validations(ValidationListArgs),
+    Capabilities,
+    Providers {
+        capability: String,
+    },
+    Requirements {
+        artifact_id: String,
+    },
+    Consumers {
+        artifact_id: String,
+    },
+    Blockers(BlockersArgs),
+    Eligibility {
+        track: String,
+        environment: String,
+    },
     Query(QueryArgs),
     Enter(ContextArgs),
     Update(UpdateCommand),
@@ -124,6 +171,7 @@ enum ConfigSubcommand {
     List,
     Get { key: String },
     Set { key: String, value: String },
+    Use { profile: ConfigProfile },
 }
 
 #[derive(Args, Clone)]
@@ -316,6 +364,49 @@ struct UploadArgs {
     stdin: bool,
 }
 
+#[derive(Args, Clone, Default)]
+struct PageArgs {
+    #[arg(long)]
+    limit: Option<usize>,
+    #[arg(long)]
+    cursor: Option<String>,
+}
+
+#[derive(Args, Clone, Default)]
+struct ArtifactListArgs {
+    #[arg(long)]
+    track: Option<String>,
+    #[arg(long = "subject-type")]
+    subject_type: Option<String>,
+    #[arg(long = "subject-name")]
+    subject_name: Option<String>,
+    #[arg(long = "subject-repo")]
+    subject_repo: Option<String>,
+    #[arg(long)]
+    status: Option<String>,
+    #[command(flatten)]
+    page: PageArgs,
+}
+
+#[derive(Args, Clone, Default)]
+struct ValidationListArgs {
+    #[arg(long)]
+    track: Option<String>,
+    #[arg(long)]
+    status: Option<String>,
+    #[arg(long)]
+    scope: Option<String>,
+    #[command(flatten)]
+    page: PageArgs,
+}
+
+#[derive(Args, Clone, Default)]
+struct BlockersArgs {
+    track: String,
+    #[arg(long)]
+    environment: Option<String>,
+}
+
 #[derive(Args)]
 struct IngestArgs {
     adapter: String,
@@ -346,9 +437,15 @@ struct IngestArgs {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    profile: Option<ConfigProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     construct: Option<String>,
     api_prefix: Option<String>,
     token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    token_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    token_command: Option<String>,
     sql_init: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     sql_packs: Vec<String>,
@@ -383,7 +480,7 @@ pub async fn run_cli() -> Result<()> {
         return Ok(());
     }
     let output_format = OutputFormat::from_cli(cli.output, cli.json);
-    let mut matrix = Matrix::load(cli.construct, cli.api_prefix, output_format)?;
+    let mut matrix = Matrix::load(cli.construct, cli.api_prefix, cli.profile, output_format)?;
     maybe_print_update_notice(&matrix, &cli.command).await;
     let output = match cli.command {
         Commands::Completion { .. } => unreachable!("completion exits before matrix is loaded"),
@@ -426,6 +523,34 @@ pub async fn run_cli() -> Result<()> {
             context_view_query(&matrix, args, ContextView::Compatible).await?
         }
         Commands::Compare(args) | Commands::Why(args) => compare_query(&matrix, args).await?,
+        Commands::Artifacts(args) => list_artifacts(&matrix, args).await?,
+        Commands::Validations(args) => list_validations(&matrix, args).await?,
+        Commands::Capabilities => matrix.get("/capabilities").await?,
+        Commands::Providers { capability } => {
+            matrix
+                .get(&format!("/capabilities/{}/providers", enc(&capability)))
+                .await?
+        }
+        Commands::Requirements { artifact_id } => {
+            matrix
+                .get(&format!("/artifacts/{}/requirements", enc(&artifact_id)))
+                .await?
+        }
+        Commands::Consumers { artifact_id } => {
+            matrix
+                .get(&format!("/artifacts/{}/consumers", enc(&artifact_id)))
+                .await?
+        }
+        Commands::Blockers(args) => blockers(&matrix, args).await?,
+        Commands::Eligibility { track, environment } => {
+            matrix
+                .get(&format!(
+                    "/tracks/{}/environments/{}/eligibility",
+                    enc(&track),
+                    enc(&environment)
+                ))
+                .await?
+        }
         Commands::Query(args) => query(&matrix, args).await?,
         Commands::Enter(context) => dispatch_enter(&matrix, context)?,
         Commands::Update(command) => update_command(&matrix, command).await?,
@@ -450,6 +575,8 @@ pub async fn run_enter_cli() -> Result<()> {
         construct: Option<String>,
         #[arg(long, env = "MATRIX_API_PREFIX")]
         api_prefix: Option<String>,
+        #[arg(long, env = "MATRIX_PROFILE", value_enum)]
+        profile: Option<ConfigProfile>,
         #[arg(short = 'o', long = "out", env = "MATRIX_OUTPUT", value_enum, default_value_t = OutputFormat::Human)]
         output: OutputFormat,
         #[arg(long, hide = true)]
@@ -460,7 +587,7 @@ pub async fn run_enter_cli() -> Result<()> {
 
     let cli = EnterCli::parse();
     let output_format = OutputFormat::from_cli(cli.output, cli.json);
-    let matrix = Matrix::load(cli.construct, cli.api_prefix, output_format)?;
+    let matrix = Matrix::load(cli.construct, cli.api_prefix, cli.profile, output_format)?;
     let output = enter(&matrix, cli.context.into()).await?;
     print_value(&output, matrix.output)?;
     Ok(())
@@ -530,6 +657,7 @@ impl Matrix {
     fn load(
         construct_override: Option<String>,
         prefix_override: Option<String>,
+        profile_override: Option<ConfigProfile>,
         output: OutputFormat,
     ) -> Result<Self> {
         let config_path = config_path()?;
@@ -539,12 +667,21 @@ impl Matrix {
         } else {
             Config::default()
         };
+        let profile = profile_override
+            .or_else(|| {
+                env::var("MATRIX_PROFILE")
+                    .ok()
+                    .and_then(|value| ConfigProfile::from_str(&value, true).ok())
+            })
+            .or(config.profile);
         let construct = construct_override
             .or_else(|| env::var("MATRIX_CONSTRUCT_URL").ok())
+            .or_else(|| profile.map(|profile| profile.construct().to_string()))
             .or_else(|| config.construct.clone())
             .map(|value| value.trim_end_matches('/').to_string());
         let api_prefix = prefix_override
             .or_else(|| env::var("MATRIX_API_PREFIX").ok())
+            .or_else(|| profile.map(|profile| profile.api_prefix().to_string()))
             .or_else(|| config.api_prefix.clone())
             .unwrap_or_else(|| "/v1/matrix".to_string())
             .trim_end_matches('/')
@@ -620,10 +757,7 @@ impl Matrix {
     async fn request(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {
         let url = format!("{}{}{}", self.construct()?, self.api_prefix, path);
         let mut request = self.client.request(method, &url);
-        if let Some(token) = env::var("MATRIX_TOKEN")
-            .ok()
-            .or_else(|| self.config.token.clone())
-        {
+        if let Some(token) = self.auth_token()? {
             request = request.bearer_auth(token);
         }
         if let Some(body) = body {
@@ -652,44 +786,127 @@ impl Matrix {
         }
         Ok(value)
     }
+
+    fn auth_token(&self) -> Result<Option<String>> {
+        if let Some(token) = env::var("MATRIX_TOKEN")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        {
+            return Ok(Some(token));
+        }
+        if let Some(token) = self
+            .config
+            .token
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+        {
+            return Ok(Some(token));
+        }
+        if let Some(path) = env::var("MATRIX_TOKEN_FILE")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| self.config.token_file.clone())
+        {
+            let token = fs::read_to_string(&path)
+                .with_context(|| format!("failed to read Matrix token file {path}"))?
+                .trim()
+                .to_string();
+            if !token.is_empty() {
+                return Ok(Some(token));
+            }
+        }
+        if let Some(command) = env::var("MATRIX_TOKEN_COMMAND")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| self.config.token_command.clone())
+        {
+            let output = ProcessCommand::new("sh")
+                .arg("-c")
+                .arg(&command)
+                .output()
+                .with_context(|| format!("failed to run Matrix token command {command:?}"))?;
+            if !output.status.success() {
+                bail!(
+                    "Matrix token command {command:?} exited with {}",
+                    output.status
+                );
+            }
+            let token = String::from_utf8(output.stdout)
+                .context("Matrix token command did not emit UTF-8")?
+                .trim()
+                .to_string();
+            if !token.is_empty() {
+                return Ok(Some(token));
+            }
+        }
+        Ok(None)
+    }
 }
 
 async fn config_command(matrix: &mut Matrix, command: ConfigCommand) -> Result<Value> {
     match command.command {
         ConfigSubcommand::List => Ok(json!({
             "configPath": matrix.config_path,
+            "profile": matrix.config.profile.map(ConfigProfile::as_str),
             "construct": matrix.config.construct,
             "apiPrefix": matrix.config.api_prefix,
             "hasToken": matrix.config.token.is_some(),
+            "tokenFile": matrix.config.token_file,
+            "hasTokenCommand": matrix.config.token_command.is_some(),
             "sqlInit": matrix.config.sql_init,
             "sqlPacks": matrix.config.sql_packs,
         })),
         ConfigSubcommand::Get { key } => match key.as_str() {
+            "profile" => Ok(json!({"profile": matrix.config.profile.map(ConfigProfile::as_str)})),
             "construct" => Ok(json!({"construct": matrix.config.construct})),
             "api-prefix" | "apiPrefix" => Ok(json!({"apiPrefix": matrix.config.api_prefix})),
             "token" => Ok(json!({"hasToken": matrix.config.token.is_some()})),
+            "token-file" | "tokenFile" => Ok(json!({"tokenFile": matrix.config.token_file})),
+            "token-command" | "tokenCommand" => {
+                Ok(json!({"hasTokenCommand": matrix.config.token_command.is_some()}))
+            }
             "sql-init" | "sqlInit" => Ok(json!({"sqlInit": matrix.config.sql_init})),
             "sql-pack" | "sql-packs" | "sqlPack" | "sqlPacks" => {
                 Ok(json!({"sqlPacks": matrix.config.sql_packs}))
             }
             _ => bail!(
-                "unknown config key {key:?}; expected construct, api-prefix, token, sql-init, sql-pack, or sql-packs"
+                "unknown config key {key:?}; expected profile, construct, api-prefix, token, token-file, token-command, sql-init, sql-pack, or sql-packs"
             ),
         },
         ConfigSubcommand::Set { key, value } => {
             match key.as_str() {
+                "profile" => {
+                    matrix.config.profile = Some(
+                        ConfigProfile::from_str(&value, true)
+                            .map_err(|_| anyhow!("unknown profile {value:?}; expected red-wiz"))?,
+                    )
+                }
                 "construct" => matrix.config.construct = Some(value),
                 "api-prefix" | "apiPrefix" => matrix.config.api_prefix = Some(value),
                 "token" => matrix.config.token = Some(value),
+                "token-file" | "tokenFile" => matrix.config.token_file = Some(value),
+                "token-command" | "tokenCommand" => matrix.config.token_command = Some(value),
                 "sql-init" | "sqlInit" => matrix.config.sql_init = Some(value),
                 "sql-pack" | "sqlPack" => matrix.config.sql_packs = vec![value],
                 "sql-packs" | "sqlPacks" => matrix.config.sql_packs = parse_sql_pack_list(&value),
                 _ => bail!(
-                    "unknown config key {key:?}; expected construct, api-prefix, token, sql-init, sql-pack, or sql-packs"
+                    "unknown config key {key:?}; expected profile, construct, api-prefix, token, token-file, token-command, sql-init, sql-pack, or sql-packs"
                 ),
             }
             matrix.save()?;
             Ok(json!({"saved": matrix.config_path}))
+        }
+        ConfigSubcommand::Use { profile } => {
+            matrix.config.profile = Some(profile);
+            matrix.config.construct = Some(profile.construct().to_string());
+            matrix.config.api_prefix = Some(profile.api_prefix().to_string());
+            matrix.save()?;
+            Ok(json!({
+                "saved": matrix.config_path,
+                "profile": profile.as_str(),
+                "construct": profile.construct(),
+                "apiPrefix": profile.api_prefix(),
+            }))
         }
     }
 }
@@ -1299,6 +1516,37 @@ fn revision_selector_query(selector: &RevisionSelectorArgs) -> Result<Vec<(&'sta
 async fn upload(matrix: &Matrix, args: UploadArgs) -> Result<Value> {
     let body = read_input(args.file, args.stdin)?;
     matrix.request(Method::POST, "/facts", Some(body)).await
+}
+
+async fn list_artifacts(matrix: &Matrix, args: ArtifactListArgs) -> Result<Value> {
+    let mut query = Vec::new();
+    push_query(&mut query, "track", args.track);
+    push_query(&mut query, "subjectType", args.subject_type);
+    push_query(&mut query, "subjectName", args.subject_name);
+    push_query(&mut query, "subjectRepo", args.subject_repo);
+    push_query(&mut query, "status", args.status);
+    push_page_query(&mut query, args.page);
+    let suffix = query_suffix(query);
+    matrix.get(&format!("/artifacts{suffix}")).await
+}
+
+async fn list_validations(matrix: &Matrix, args: ValidationListArgs) -> Result<Value> {
+    let mut query = Vec::new();
+    push_query(&mut query, "track", args.track);
+    push_query(&mut query, "status", args.status);
+    push_query(&mut query, "scope", args.scope);
+    push_page_query(&mut query, args.page);
+    let suffix = query_suffix(query);
+    matrix.get(&format!("/validations{suffix}")).await
+}
+
+async fn blockers(matrix: &Matrix, args: BlockersArgs) -> Result<Value> {
+    let mut query = Vec::new();
+    push_query(&mut query, "environment", args.environment);
+    let suffix = query_suffix(query);
+    matrix
+        .get(&format!("/tracks/{}/blockers{suffix}", enc(&args.track)))
+        .await
 }
 
 async fn ingest(matrix: &Matrix, args: IngestArgs) -> Result<Value> {
@@ -3728,13 +3976,21 @@ async fn fetch_facts(matrix: &Matrix, max_facts: usize) -> Result<Vec<Value>> {
         let body = matrix
             .get(&format!("/facts?{}", query_string(query)))
             .await?;
-        facts.extend(body["facts"].as_array().cloned().unwrap_or_default());
+        facts.extend(page_values(&body, "facts"));
         cursor = body["page"]["nextCursor"].as_str().map(ToString::to_string);
         if cursor.is_none() {
             break;
         }
     }
     Ok(facts)
+}
+
+fn page_values(body: &Value, primary_key: &str) -> Vec<Value> {
+    body.get(primary_key)
+        .or_else(|| body.get("items"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
 }
 
 fn read_input(file: Option<PathBuf>, stdin: bool) -> Result<Value> {
@@ -4379,6 +4635,27 @@ fn query_string(values: Vec<(&str, String)>) -> String {
         .join("&")
 }
 
+fn query_suffix(values: Vec<(&str, String)>) -> String {
+    if values.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", query_string(values))
+    }
+}
+
+fn push_query(query: &mut Vec<(&'static str, String)>, key: &'static str, value: Option<String>) {
+    if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+        query.push((key, value));
+    }
+}
+
+fn push_page_query(query: &mut Vec<(&'static str, String)>, page: PageArgs) {
+    if let Some(limit) = page.limit {
+        query.push(("limit", limit.to_string()));
+    }
+    push_query(query, "cursor", page.cursor);
+}
+
 fn enc(value: &str) -> String {
     urlencoding::encode(value).into_owned()
 }
@@ -4704,6 +4981,73 @@ mod tests {
             }
             _ => panic!("expected compare command"),
         }
+    }
+
+    #[test]
+    fn accepts_red_wiz_profile_and_compatibility_commands() {
+        let profiled =
+            Cli::try_parse_from(["matrix", "--profile", "red-wiz", "capabilities"]).unwrap();
+        assert_eq!(profiled.profile, Some(ConfigProfile::RedWiz));
+        match profiled.command {
+            Commands::Capabilities => {}
+            _ => panic!("expected capabilities command"),
+        }
+
+        let config = Cli::try_parse_from(["matrix", "config", "use", "red-wiz"]).unwrap();
+        match config.command {
+            Commands::Config(command) => match command.command {
+                ConfigSubcommand::Use { profile } => {
+                    assert_eq!(profile, ConfigProfile::RedWiz);
+                    assert_eq!(profile.construct(), RED_WIZ_CONSTRUCT_URL);
+                    assert_eq!(profile.api_prefix(), RED_WIZ_API_PREFIX);
+                }
+                _ => panic!("expected config use command"),
+            },
+            _ => panic!("expected config command"),
+        }
+
+        let artifacts = Cli::try_parse_from([
+            "matrix",
+            "artifacts",
+            "--track",
+            "odin",
+            "--subject-type",
+            "npm",
+            "--limit",
+            "10",
+        ])
+        .unwrap();
+        match artifacts.command {
+            Commands::Artifacts(args) => {
+                assert_eq!(args.track.as_deref(), Some("odin"));
+                assert_eq!(args.subject_type.as_deref(), Some("npm"));
+                assert_eq!(args.page.limit, Some(10));
+            }
+            _ => panic!("expected artifacts command"),
+        }
+
+        let blockers =
+            Cli::try_parse_from(["matrix", "blockers", "agent-admin", "--environment", "qa"])
+                .unwrap();
+        match blockers.command {
+            Commands::Blockers(args) => {
+                assert_eq!(args.track, "agent-admin");
+                assert_eq!(args.environment.as_deref(), Some("qa"));
+            }
+            _ => panic!("expected blockers command"),
+        }
+    }
+
+    #[test]
+    fn page_values_accepts_facts_or_items_pages() {
+        assert_eq!(
+            page_values(&json!({"facts": [{"id": "fact-1"}]}), "facts")[0]["id"],
+            "fact-1"
+        );
+        assert_eq!(
+            page_values(&json!({"items": [{"id": "item-1"}]}), "facts")[0]["id"],
+            "item-1"
+        );
     }
 
     #[test]
