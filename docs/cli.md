@@ -26,6 +26,52 @@ terminal-oriented formats.
 / `--out` is a global option, so it works before or after commands;
 command-local placement is recommended for readability.
 
+## Hosted Constructs
+
+Configure the hosted Red Wiz compatibility construct with the built-in profile:
+
+```bash
+matrix config use red-wiz
+matrix doctor
+```
+
+That stores `https://platform-api.red-wiz.stream` with the `/v1/compatibility`
+API prefix, so the CLI talks to platform-api as the public construct while the
+internal compatibility-service and MySQL ledger stay behind it.
+
+For authenticated writes or protected deployments, provide a bearer token with
+one of these sources:
+
+```bash
+MATRIX_TOKEN=... matrix upload facts.json
+MATRIX_TOKEN_FILE=~/.config/matrix/red-wiz.token matrix capabilities
+matrix config set token-file ~/.config/matrix/red-wiz.token
+matrix config set token-command 'op read op://platform/matrix/token'
+```
+
+Token values are used only for the outgoing `Authorization: Bearer` header and
+are not printed by `matrix config list`.
+
+## Compatibility Graph Commands
+
+When the configured construct exposes the `/v1/compatibility` API, Matrix can
+read the graph projections directly:
+
+```bash
+matrix capabilities
+matrix providers smart-contract-tuple:vdr
+matrix artifacts --track odin --subject-type smart-contract-tuple
+matrix validations --track odin --status failed
+matrix requirements smart-contract-tuple.vdr.0.1.1
+matrix consumers smart-contract-tuple.vdr.0.1.1
+matrix blockers odin --environment stage
+matrix eligibility odin stage
+```
+
+`matrix upload facts.json` and `matrix ingest <adapter> --upload` still submit
+normalized facts to `POST /facts` under the configured API prefix. With the Red
+Wiz profile that resolves to `POST /v1/compatibility/facts`.
+
 ## Context Queries
 
 `matrix query` and `matrix enter` detect the current git repository, branch,

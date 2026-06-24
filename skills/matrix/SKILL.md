@@ -18,15 +18,26 @@ zones, promotion levels, gates, facts, traces, producer evidence, or the
   fields. `-o` / `--out` is global, so prefer command-local placement such as
   `matrix doctor -o json`.
 - Do not invent a construct URL. Use `MATRIX_CONSTRUCT_URL`, `matrix config get
-  construct`, or a user-provided `--construct` value.
-- Do not print, persist, or echo tokens. Matrix uses `MATRIX_TOKEN` or a saved
-  config token for bearer authentication.
+  construct`, a built-in profile such as `matrix config use red-wiz`, or a
+  user-provided `--construct` value.
+- Do not print, persist, or echo tokens. Matrix uses `MATRIX_TOKEN`,
+  `MATRIX_TOKEN_FILE`, `MATRIX_TOKEN_COMMAND`, or saved config token sources for
+  bearer authentication.
 
 ## Common Workflows
 
 - Show configured state: `matrix config list`
+- Use the hosted Red Wiz compatibility construct: `matrix config use red-wiz`
 - Install shell completions: `matrix completion <shell>`
 - Check construct health: `matrix doctor`
+- List graph capabilities: `matrix capabilities`
+- List providers for a capability: `matrix providers <capability>`
+- List artifacts or validations: `matrix artifacts --track <track>` or
+  `matrix validations --track <track>`
+- Inspect an artifact: `matrix requirements <artifact-id>` or
+  `matrix consumers <artifact-id>`
+- Inspect promotion blockers: `matrix blockers <track> --environment <env>` or
+  `matrix eligibility <track> <env>`
 - List zones: `matrix list`
 - View a zone: `matrix view <zone>`
 - Check current repo compatibility:

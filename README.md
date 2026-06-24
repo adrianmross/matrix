@@ -82,6 +82,20 @@ matrix history release-bundle.api.1.0.0
 matrix enter
 ```
 
+Use the Red Wiz hosted compatibility construct through platform-api:
+
+```bash
+matrix config use red-wiz
+matrix doctor
+matrix capabilities
+matrix providers smart-contract-tuple:vdr
+matrix artifacts --track odin --subject-type smart-contract-tuple
+matrix requirements smart-contract-tuple.vdr.0.1.1
+matrix consumers smart-contract-tuple.vdr.0.1.1
+matrix blockers odin --environment stage
+matrix eligibility odin stage
+```
+
 Run a local construct:
 
 ```bash
@@ -141,6 +155,9 @@ read-only SQL over compatibility facts, and uses `matrix upload` or
 matrix config list
 matrix config set construct https://matrix.example.dev
 matrix config set api-prefix /v1/matrix
+matrix config use red-wiz
+matrix config set token-file ~/.config/matrix/red-wiz.token
+matrix config set token-command 'op read op://platform/matrix/token'
 matrix config set sql-pack ~/.config/matrix/packs/release.sql
 ```
 
@@ -148,7 +165,10 @@ Environment overrides:
 
 - `MATRIX_CONSTRUCT_URL`
 - `MATRIX_API_PREFIX`
+- `MATRIX_PROFILE`, for example `red-wiz`
 - `MATRIX_TOKEN`
+- `MATRIX_TOKEN_FILE`
+- `MATRIX_TOKEN_COMMAND`
 - `MATRIX_OUTPUT`
 - `MATRIX_SQL_INIT`
 - `MATRIX_SQL_PACKS`, comma-separated SQL pack paths
