@@ -62,15 +62,17 @@ jobs:
         run: |
           set -euo pipefail
           rust_target="${{ matrix.rust-target }}"
-          target_args=()
           release_dir="target/release"
           if [[ -n "${rust_target}" ]]; then
-            target_args=(--target "${rust_target}")
             release_dir="target/${rust_target}/release"
+            cargo build --release -p matrix --no-default-features --target "${rust_target}"
+            cargo build --release -p matrix-enter --target "${rust_target}"
+            cargo build --release -p matrix-construct --target "${rust_target}"
+          else
+            cargo build --release -p matrix --no-default-features
+            cargo build --release -p matrix-enter
+            cargo build --release -p matrix-construct
           fi
-          cargo build --release -p matrix --no-default-features "${target_args[@]}"
-          cargo build --release -p matrix-enter "${target_args[@]}"
-          cargo build --release -p matrix-construct "${target_args[@]}"
           echo "RELEASE_DIR=${release_dir}" >> "${GITHUB_ENV}"
       - name: Package binaries
         shell: bash
@@ -107,7 +109,7 @@ jobs:
           if [[ "${{ matrix.linux-static }}" == "true" ]]; then
             for binary in matrix matrix-enter matrix-construct; do
               file "smoke/${archive}/${binary}" | tee "smoke/${archive}/${binary}.file"
-              grep -q "statically linked" "smoke/${archive}/${binary}.file"
+              grep -Eq "statically linked|static-pie linked" "smoke/${archive}/${binary}.file"
             done
           fi
       - uses: actions/upload-artifact@v4
