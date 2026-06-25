@@ -227,8 +227,8 @@ Use `matrix update --check` for a machine-readable release check.
 Tags drive releases:
 
 ```bash
-git tag -a v0.3.15 -m "Release v0.3.15"
-git push origin v0.3.15
+git tag -a v0.3.16 -m "Release v0.3.16"
+git push origin v0.3.16
 ```
 
 The `Release` workflow builds `matrix`, `matrix-enter`, and `matrix-construct`
@@ -244,7 +244,7 @@ in the release notes. The workflow also builds and smokes the
 `ghcr.io/adrianmross/matrix-construct:<version>`.
 
 The `Tag Release` workflow is the preferred path for normal releases. Run it
-with `version=0.3.15` after bumping the Cargo package versions. It validates
+with `version=0.3.16` after bumping the Cargo package versions. It validates
 formatting, tests, clippy, version alignment, and tag uniqueness before pushing
 the annotated tag.
 
