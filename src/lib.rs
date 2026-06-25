@@ -130,6 +130,10 @@ enum Commands {
     Artifacts(ArtifactListArgs),
     Validations(ValidationListArgs),
     Capabilities,
+    Scopes,
+    Scope {
+        scope_id: String,
+    },
     Providers {
         capability: String,
     },
@@ -528,6 +532,8 @@ pub async fn run_cli() -> Result<()> {
         Commands::Artifacts(args) => list_artifacts(&matrix, args).await?,
         Commands::Validations(args) => list_validations(&matrix, args).await?,
         Commands::Capabilities => matrix.get("/capabilities").await?,
+        Commands::Scopes => matrix.get("/scopes").await?,
+        Commands::Scope { scope_id } => matrix.get(&format!("/scopes/{}", enc(&scope_id))).await?,
         Commands::Providers { capability } => {
             matrix
                 .get(&format!("/capabilities/{}/providers", enc(&capability)))
@@ -5037,6 +5043,20 @@ mod tests {
         match profiled.command {
             Commands::Capabilities => {}
             _ => panic!("expected capabilities command"),
+        }
+
+        let scopes = Cli::try_parse_from(["matrix", "--profile", "red-wiz", "scopes"]).unwrap();
+        match scopes.command {
+            Commands::Scopes => {}
+            _ => panic!("expected scopes command"),
+        }
+
+        let scope = Cli::try_parse_from(["matrix", "scope", "agent-admin/native-askar"]).unwrap();
+        match scope.command {
+            Commands::Scope { scope_id } => {
+                assert_eq!(scope_id, "agent-admin/native-askar");
+            }
+            _ => panic!("expected scope command"),
         }
 
         let config = Cli::try_parse_from(["matrix", "config", "use", "red-wiz"]).unwrap();

@@ -59,6 +59,8 @@ read the graph projections directly:
 
 ```bash
 matrix capabilities
+matrix scopes
+matrix scope odin/native-askar
 matrix providers smart-contract-tuple:vdr
 matrix artifacts --track odin --subject-type smart-contract-tuple
 matrix validations --track odin --status failed

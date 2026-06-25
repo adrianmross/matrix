@@ -15,6 +15,8 @@ matrix completion zsh
 
 ```bash
 matrix list
+matrix scopes
+matrix scope odin/native-askar
 matrix view runtime
 matrix current --zone runtime --level preview
 matrix gate --zone runtime --level stage

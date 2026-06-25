@@ -31,6 +31,8 @@ zones, promotion levels, gates, facts, traces, producer evidence, or the
 - Install shell completions: `matrix completion <shell>`
 - Check construct health: `matrix doctor`
 - List graph capabilities: `matrix capabilities`
+- List recursive compatibility scopes: `matrix scopes`
+- Inspect one scope or alias: `matrix scope <scope-id>`
 - List providers for a capability: `matrix providers <capability>`
 - List artifacts or validations: `matrix artifacts --track <track>` or
   `matrix validations --track <track>`
