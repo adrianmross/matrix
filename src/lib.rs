@@ -22,6 +22,7 @@ const MATRIX_HOMEBREW_FORMULA: &str = "adrianmross/tap/matrix";
 const MATRIX_LINUX_TARGET: &str = "x86_64-unknown-linux-gnu";
 const RED_WIZ_CONSTRUCT_URL: &str = "https://platform-api.red-wiz.stream";
 const RED_WIZ_API_PREFIX: &str = "/v1/compatibility";
+const RED_WIZ_TOKEN_COMMAND: &str = "wiz tool setup matrix --json --include-token";
 const UPDATE_CHECK_TTL: Duration = Duration::from_secs(60 * 60 * 24);
 
 #[cfg(feature = "interactive")]
@@ -83,6 +84,12 @@ impl ConfigProfile {
     fn api_prefix(self) -> &'static str {
         match self {
             Self::RedWiz => RED_WIZ_API_PREFIX,
+        }
+    }
+
+    fn token_command(self) -> Option<&'static str> {
+        match self {
+            Self::RedWiz => Some(RED_WIZ_TOKEN_COMMAND),
         }
     }
 }
@@ -461,6 +468,7 @@ struct Config {
 struct Matrix {
     config_path: PathBuf,
     config: Config,
+    profile: Option<ConfigProfile>,
     construct: Option<String>,
     api_prefix: String,
     output: OutputFormat,
@@ -697,6 +705,7 @@ impl Matrix {
         Ok(Self {
             config_path,
             config,
+            profile,
             construct,
             api_prefix,
             output,
@@ -827,6 +836,11 @@ impl Matrix {
             .ok()
             .filter(|value| !value.trim().is_empty())
             .or_else(|| self.config.token_command.clone())
+            .or_else(|| {
+                self.profile
+                    .and_then(ConfigProfile::token_command)
+                    .map(str::to_string)
+            })
         {
             let output = ProcessCommand::new("sh")
                 .arg("-c")
@@ -839,15 +853,63 @@ impl Matrix {
                     output.status
                 );
             }
-            let token = String::from_utf8(output.stdout)
-                .context("Matrix token command did not emit UTF-8")?
-                .trim()
-                .to_string();
-            if !token.is_empty() {
+            if let Some(token) = token_from_command_stdout(&command, output.stdout)? {
                 return Ok(Some(token));
             }
         }
         Ok(None)
+    }
+}
+
+fn token_from_command_stdout(command: &str, stdout: Vec<u8>) -> Result<Option<String>> {
+    let text = String::from_utf8(stdout).context("Matrix token command did not emit UTF-8")?;
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(text) {
+        return token_from_json_value(&value).map(Some).ok_or_else(|| {
+            anyhow!(
+                "Matrix token command {command:?} emitted JSON without a token; expected access_token, token, bearerToken, or a MATRIX_TOKEN environment entry"
+            )
+        });
+    }
+    Ok(Some(text.to_string()))
+}
+
+fn token_from_json_value(value: &Value) -> Option<String> {
+    for key in ["access_token", "token", "bearerToken", "bearer_token"] {
+        if let Some(token) = value
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(usable_token)
+        {
+            return Some(token);
+        }
+    }
+    value
+        .get("environment")
+        .and_then(Value::as_array)
+        .and_then(|entries| {
+            entries.iter().find_map(|entry| {
+                let name = entry.get("name").and_then(Value::as_str)?;
+                if name != "MATRIX_TOKEN" {
+                    return None;
+                }
+                entry
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .and_then(usable_token)
+            })
+        })
+}
+
+fn usable_token(value: &str) -> Option<String> {
+    let token = value.trim();
+    if token.is_empty() || token == "<token>" {
+        None
+    } else {
+        Some(token.to_string())
     }
 }
 
@@ -908,12 +970,14 @@ async fn config_command(matrix: &mut Matrix, command: ConfigCommand) -> Result<V
             matrix.config.profile = Some(profile);
             matrix.config.construct = Some(profile.construct().to_string());
             matrix.config.api_prefix = Some(profile.api_prefix().to_string());
+            matrix.config.token_command = profile.token_command().map(str::to_string);
             matrix.save()?;
             Ok(json!({
                 "saved": matrix.config_path,
                 "profile": profile.as_str(),
                 "construct": profile.construct(),
                 "apiPrefix": profile.api_prefix(),
+                "hasTokenCommand": matrix.config.token_command.is_some(),
             }))
         }
     }
@@ -5066,6 +5130,7 @@ mod tests {
                     assert_eq!(profile, ConfigProfile::RedWiz);
                     assert_eq!(profile.construct(), RED_WIZ_CONSTRUCT_URL);
                     assert_eq!(profile.api_prefix(), RED_WIZ_API_PREFIX);
+                    assert_eq!(profile.token_command(), Some(RED_WIZ_TOKEN_COMMAND));
                 }
                 _ => panic!("expected config use command"),
             },
@@ -5102,6 +5167,43 @@ mod tests {
             }
             _ => panic!("expected blockers command"),
         }
+    }
+
+    #[test]
+    fn extracts_token_command_output_from_raw_and_json() {
+        let raw = token_from_command_stdout("test", b"  raw-token\n".to_vec()).unwrap();
+        assert_eq!(raw.as_deref(), Some("raw-token"));
+
+        let credential_process = token_from_command_stdout(
+            "test",
+            br#"{"access_token":"json-token","expires_at":"2026-06-25T12:34:56Z"}"#.to_vec(),
+        )
+        .unwrap();
+        assert_eq!(credential_process.as_deref(), Some("json-token"));
+
+        let wiz_setup = token_from_command_stdout(
+            RED_WIZ_TOKEN_COMMAND,
+            br#"{
+              "environment": [
+                {"name":"MATRIX_CONSTRUCT_URL","value":"https://platform-api.red-wiz.stream"},
+                {"name":"MATRIX_TOKEN","secret":true,"value":"wiz-token"}
+              ]
+            }"#
+            .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(wiz_setup.as_deref(), Some("wiz-token"));
+    }
+
+    #[test]
+    fn rejects_json_token_command_without_a_real_token() {
+        let err = token_from_command_stdout(
+            RED_WIZ_TOKEN_COMMAND,
+            br#"{"environment":[{"name":"MATRIX_TOKEN","placeholder":true,"value":"<token>"}]}"#
+                .to_vec(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("emitted JSON without a token"));
     }
 
     #[test]

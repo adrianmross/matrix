@@ -87,6 +87,7 @@ matrix enter
 Use the Red Wiz hosted compatibility construct through platform-api:
 
 ```bash
+wiz auth login
 matrix config use red-wiz
 matrix doctor
 matrix capabilities
@@ -99,6 +100,10 @@ matrix consumers smart-contract-tuple.vdr.0.1.1
 matrix blockers odin --environment stage
 matrix eligibility odin stage
 ```
+
+The `red-wiz` profile stores the hosted construct URL, the `/v1/compatibility`
+API prefix, and a Wiz token command. Matrix asks `wiz` for the current token at
+request time instead of saving a bearer token in the Matrix config.
 
 Run a local construct:
 
@@ -176,6 +181,12 @@ Environment overrides:
 - `MATRIX_OUTPUT`
 - `MATRIX_SQL_INIT`
 - `MATRIX_SQL_PACKS`, comma-separated SQL pack paths
+
+`matrix config use red-wiz` configures Matrix to call
+`wiz tool setup matrix --json --include-token` when it needs a bearer token.
+For other platforms, use `MATRIX_TOKEN`, `MATRIX_TOKEN_FILE`, or
+`MATRIX_TOKEN_COMMAND`. Token commands can print a raw token, JSON with an
+`access_token` field, or JSON containing a `MATRIX_TOKEN` environment entry.
 
 ## Releases
 
