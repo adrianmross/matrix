@@ -90,6 +90,8 @@ Use the Red Wiz hosted compatibility construct through platform-api:
 matrix config use red-wiz
 matrix doctor
 matrix capabilities
+matrix scopes
+matrix scope odin/native-askar
 matrix providers smart-contract-tuple:vdr
 matrix artifacts --track odin --subject-type smart-contract-tuple
 matrix requirements smart-contract-tuple.vdr.0.1.1
