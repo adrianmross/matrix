@@ -1,0 +1,115 @@
+name: Compatibility Facts
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      MATRIX_CONSTRUCT_URL: https://platform-api.red-wiz.stream
+      MATRIX_API_PREFIX: /v1/compatibility
+      MATRIX_TOKEN: ${{ secrets.MATRIX_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Prepare Matrix metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            echo "VERSION=${GITHUB_REF_NAME}" >> "${GITHUB_ENV}"
+          else
+            echo "VERSION=${GITHUB_SHA}" >> "${GITHUB_ENV}"
+          fi
+
+      - name: Install Matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(gh release view --repo adrianmross/matrix --json tagName -q .tagName)"
+          gh release download "${version}" \
+            --repo adrianmross/matrix \
+            --pattern "matrix-${version#v}-x86_64-unknown-linux-gnu.tar.gz" \
+            --dir /tmp/matrix-install
+          tar -xzf "/tmp/matrix-install/matrix-${version#v}-x86_64-unknown-linux-gnu.tar.gz" \
+            -C /tmp/matrix-install
+          install "/tmp/matrix-install/matrix-${version#v}-x86_64-unknown-linux-gnu/matrix" \
+            /usr/local/bin/matrix
+
+      - name: Run tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Replace this with the repository's normal test command.
+          mkdir -p reports
+          cargo test --workspace --message-format=json > reports/cargo-test.json
+
+      - name: Publish JUnit facts
+        if: ${{ hashFiles('reports/junit.xml') != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          matrix ingest junit \
+            --file reports/junit.xml \
+            --repo "${GITHUB_REPOSITORY}" \
+            --component "${GITHUB_REPOSITORY#*/}" \
+            --version "${VERSION}" \
+            --sha "${GITHUB_SHA}" \
+            --ref "${GITHUB_REF}" \
+            --upload
+
+      - name: Generate custom Matrix facts
+        shell: bash
+        run: |
+          set -euo pipefail
+          component="${GITHUB_REPOSITORY#*/}"
+          observed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          jq -n \
+            --arg id "validation.${component}.ci" \
+            --arg component "${component}" \
+            --arg version "${VERSION}" \
+            --arg repo "${GITHUB_REPOSITORY}" \
+            --arg ref "${GITHUB_REF}" \
+            --arg sha "${GITHUB_SHA}" \
+            --arg observedAt "${observed_at}" \
+            --arg runUrl "${run_url}" \
+            '{
+              facts: [
+                {
+                  id: $id,
+                  zone: "test",
+                  kind: "validation",
+                  status: "passed",
+                  subjectType: "service",
+                  subjectName: $component,
+                  subjectVersion: $version,
+                  subjectRepo: $repo,
+                  source: {
+                    repo: $repo,
+                    ref: $ref,
+                    sha: $sha
+                  },
+                  observedAt: $observedAt,
+                  evidence: [
+                    {
+                      type: "github-actions",
+                      url: $runUrl
+                    }
+                  ]
+                }
+              ]
+            }' > matrix-facts.json
+
+      - name: Publish custom Matrix facts
+        shell: bash
+        run: matrix upload matrix-facts.json

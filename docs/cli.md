@@ -237,6 +237,8 @@ Producer guidance:
 `matrix ingest` converts common producer outputs into normalized Matrix facts.
 By default the command prints a fact batch; add `--upload` to submit the facts
 to the configured construct.
+For custom capability, requirement, consumer, or provenance facts, use the
+[producer onboarding guide](producer-onboarding.md).
 
 ```bash
 matrix ingest junit --file junit.xml
