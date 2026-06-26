@@ -31,16 +31,18 @@ command-local placement is recommended for readability.
 Configure the hosted Red Wiz compatibility construct with the built-in profile:
 
 ```bash
+wiz auth login
 matrix config use red-wiz
-matrix doctor
+matrix doctor -o json
 ```
 
 That stores `https://platform-api.red-wiz.stream` with the `/v1/compatibility`
 API prefix, so the CLI talks to platform-api as the public construct while the
 internal compatibility-service and MySQL ledger stay behind it.
+It also configures a Wiz token command and clears saved Matrix token/token-file
+values so old bearer tokens do not override the profile handoff.
 
-For authenticated writes or protected deployments, provide a bearer token with
-one of these sources:
+For non-profile deployments, provide a bearer token with one of these sources:
 
 ```bash
 MATRIX_TOKEN=... matrix upload facts.json
@@ -50,7 +52,7 @@ matrix config set token-command 'op read op://platform/matrix/token'
 ```
 
 Token values are used only for the outgoing `Authorization: Bearer` header and
-are not printed by `matrix config list`.
+are not printed by `matrix config list` or `matrix doctor`.
 
 ## Compatibility Graph Commands
 
