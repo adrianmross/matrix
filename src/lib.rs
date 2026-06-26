@@ -486,6 +486,47 @@ struct MatrixContext {
     reference: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AuthCandidate {
+    EnvToken(String),
+    ConfigToken(String),
+    EnvTokenFile(String),
+    ConfigTokenFile(String),
+    EnvTokenCommand(String),
+    ConfigTokenCommand(String),
+    ProfileTokenCommand(String),
+}
+
+impl AuthCandidate {
+    fn source(&self) -> &'static str {
+        match self {
+            Self::EnvToken(_) => "env-token",
+            Self::ConfigToken(_) => "config-token",
+            Self::EnvTokenFile(_) => "env-token-file",
+            Self::ConfigTokenFile(_) => "config-token-file",
+            Self::EnvTokenCommand(_) => "env-token-command",
+            Self::ConfigTokenCommand(_) => "config-token-command",
+            Self::ProfileTokenCommand(_) => "profile-token-command",
+        }
+    }
+
+    fn token_file(&self) -> Option<&str> {
+        match self {
+            Self::EnvTokenFile(path) | Self::ConfigTokenFile(path) => Some(path),
+            _ => None,
+        }
+    }
+
+    fn token_command(&self) -> Option<&str> {
+        match self {
+            Self::EnvTokenCommand(command)
+            | Self::ConfigTokenCommand(command)
+            | Self::ProfileTokenCommand(command) => Some(command),
+            _ => None,
+        }
+    }
+}
+
 pub async fn run_cli() -> Result<()> {
     let cli = Cli::parse();
     if let Commands::Completion { shell } = cli.command {
@@ -804,12 +845,12 @@ impl Matrix {
         Ok(value)
     }
 
-    fn auth_token(&self) -> Result<Option<String>> {
+    fn auth_candidate(&self) -> Option<AuthCandidate> {
         if let Some(token) = env::var("MATRIX_TOKEN")
             .ok()
             .filter(|value| !value.trim().is_empty())
         {
-            return Ok(Some(token));
+            return Some(AuthCandidate::EnvToken(token));
         }
         if let Some(token) = self
             .config
@@ -817,45 +858,72 @@ impl Matrix {
             .clone()
             .filter(|value| !value.trim().is_empty())
         {
-            return Ok(Some(token));
+            return Some(AuthCandidate::ConfigToken(token));
         }
         if let Some(path) = env::var("MATRIX_TOKEN_FILE")
             .ok()
             .filter(|value| !value.trim().is_empty())
-            .or_else(|| self.config.token_file.clone())
         {
-            let token = fs::read_to_string(&path)
-                .with_context(|| format!("failed to read Matrix token file {path}"))?
-                .trim()
-                .to_string();
-            if !token.is_empty() {
-                return Ok(Some(token));
-            }
+            return Some(AuthCandidate::EnvTokenFile(path));
+        }
+        if let Some(path) = self.config.token_file.clone() {
+            return Some(AuthCandidate::ConfigTokenFile(path));
         }
         if let Some(command) = env::var("MATRIX_TOKEN_COMMAND")
             .ok()
             .filter(|value| !value.trim().is_empty())
-            .or_else(|| self.config.token_command.clone())
-            .or_else(|| {
-                self.profile
-                    .and_then(ConfigProfile::token_command)
-                    .map(str::to_string)
-            })
         {
-            let output = ProcessCommand::new("sh")
-                .arg("-c")
-                .arg(&command)
-                .output()
-                .with_context(|| format!("failed to run Matrix token command {command:?}"))?;
-            if !output.status.success() {
-                bail!(
-                    "Matrix token command {command:?} exited with {}",
-                    output.status
-                );
+            return Some(AuthCandidate::EnvTokenCommand(command));
+        }
+        if let Some(command) = self.config.token_command.clone() {
+            return Some(AuthCandidate::ConfigTokenCommand(command));
+        }
+        self.profile
+            .and_then(ConfigProfile::token_command)
+            .map(str::to_string)
+            .map(AuthCandidate::ProfileTokenCommand)
+    }
+
+    fn resolve_auth_candidate(&self, candidate: &AuthCandidate) -> Result<Option<String>> {
+        match candidate {
+            AuthCandidate::EnvToken(token) | AuthCandidate::ConfigToken(token) => {
+                Ok(Some(token.clone()))
             }
-            if let Some(token) = token_from_command_stdout(&command, output.stdout)? {
-                return Ok(Some(token));
+            AuthCandidate::EnvTokenFile(path) | AuthCandidate::ConfigTokenFile(path) => {
+                let token = fs::read_to_string(path)
+                    .with_context(|| format!("failed to read Matrix token file {path}"))?
+                    .trim()
+                    .to_string();
+                if !token.is_empty() {
+                    return Ok(Some(token));
+                }
+                Ok(None)
             }
+            AuthCandidate::EnvTokenCommand(command)
+            | AuthCandidate::ConfigTokenCommand(command)
+            | AuthCandidate::ProfileTokenCommand(command) => {
+                let output = ProcessCommand::new("sh")
+                    .arg("-c")
+                    .arg(command)
+                    .output()
+                    .with_context(|| format!("failed to run Matrix token command {command:?}"))?;
+                if !output.status.success() {
+                    bail!(
+                        "Matrix token command {command:?} exited with {}",
+                        output.status
+                    );
+                }
+                if let Some(token) = token_from_command_stdout(command, output.stdout)? {
+                    return Ok(Some(token));
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    fn auth_token(&self) -> Result<Option<String>> {
+        if let Some(candidate) = self.auth_candidate() {
+            return self.resolve_auth_candidate(&candidate);
         }
         Ok(None)
     }
@@ -970,6 +1038,8 @@ async fn config_command(matrix: &mut Matrix, command: ConfigCommand) -> Result<V
             matrix.config.profile = Some(profile);
             matrix.config.construct = Some(profile.construct().to_string());
             matrix.config.api_prefix = Some(profile.api_prefix().to_string());
+            matrix.config.token = None;
+            matrix.config.token_file = None;
             matrix.config.token_command = profile.token_command().map(str::to_string);
             matrix.save()?;
             Ok(json!({
@@ -977,6 +1047,8 @@ async fn config_command(matrix: &mut Matrix, command: ConfigCommand) -> Result<V
                 "profile": profile.as_str(),
                 "construct": profile.construct(),
                 "apiPrefix": profile.api_prefix(),
+                "hasToken": matrix.config.token.is_some(),
+                "tokenFile": matrix.config.token_file,
                 "hasTokenCommand": matrix.config.token_command.is_some(),
             }))
         }
@@ -4049,17 +4121,46 @@ fn token_style(token: &str) -> Style {
 
 async fn doctor(matrix: &Matrix) -> Result<Value> {
     let construct = matrix.construct.clone();
-    let reachable = if construct.is_some() {
-        matrix.get("").await.map(|_| true).unwrap_or(false)
+    let reachability = if construct.is_some() {
+        match matrix.get("").await {
+            Ok(_) => json!({"reachable": true}),
+            Err(error) => json!({"reachable": false, "error": error.to_string()}),
+        }
     } else {
-        false
+        json!({"reachable": false, "error": "no construct configured"})
     };
     Ok(json!({
         "configPath": matrix.config_path,
+        "profile": matrix.profile.map(ConfigProfile::as_str),
         "construct": construct,
         "apiPrefix": matrix.api_prefix,
-        "reachable": reachable,
+        "auth": auth_diagnostic(matrix),
+        "reachable": reachability["reachable"].as_bool().unwrap_or(false),
+        "reachability": reachability,
     }))
+}
+
+fn auth_diagnostic(matrix: &Matrix) -> Value {
+    let Some(candidate) = matrix.auth_candidate() else {
+        return json!({
+            "configured": false,
+            "available": false,
+            "source": null,
+        });
+    };
+    let (available, error) = match matrix.resolve_auth_candidate(&candidate) {
+        Ok(Some(_)) => (true, None),
+        Ok(None) => (false, None),
+        Err(error) => (false, Some(error.to_string())),
+    };
+    json!({
+        "configured": true,
+        "available": available,
+        "source": candidate.source(),
+        "tokenFile": candidate.token_file(),
+        "tokenCommand": candidate.token_command(),
+        "error": error,
+    })
 }
 
 async fn red_pill(matrix: &Matrix) -> Result<Value> {
@@ -4818,6 +4919,18 @@ fn command_output(command: &str, args: &[&str]) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn test_matrix(config: Config, profile: Option<ConfigProfile>) -> Matrix {
+        Matrix {
+            config_path: PathBuf::from("/tmp/matrix-test-config.json"),
+            config,
+            profile,
+            construct: Some("https://matrix.example.test".to_string()),
+            api_prefix: "/v1/compatibility".to_string(),
+            output: OutputFormat::Json,
+            client: reqwest::Client::new(),
+        }
+    }
+
     #[test]
     fn accepts_output_before_and_after_top_level_commands() {
         let before = Cli::try_parse_from(["matrix", "-o", "json", "doctor"]).unwrap();
@@ -5204,6 +5317,85 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("emitted JSON without a token"));
+    }
+
+    #[test]
+    fn auth_diagnostic_reports_source_without_leaking_config_token() {
+        let matrix = test_matrix(
+            Config {
+                token: Some("secret-token".to_string()),
+                ..Config::default()
+            },
+            None,
+        );
+
+        let diagnostic = auth_diagnostic(&matrix);
+        assert_eq!(diagnostic["configured"], true);
+        assert_eq!(diagnostic["available"], true);
+        assert_eq!(diagnostic["source"], "config-token");
+        assert!(
+            !serde_json::to_string(&diagnostic)
+                .unwrap()
+                .contains("secret-token")
+        );
+    }
+
+    #[test]
+    fn red_wiz_profile_selects_profile_token_command_candidate() {
+        let matrix = test_matrix(Config::default(), Some(ConfigProfile::RedWiz));
+
+        let candidate = matrix.auth_candidate().expect("profile token command");
+        assert_eq!(candidate.source(), "profile-token-command");
+        assert_eq!(candidate.token_command(), Some(RED_WIZ_TOKEN_COMMAND));
+    }
+
+    #[tokio::test]
+    async fn config_use_red_wiz_replaces_stored_token_with_profile_command() {
+        let mut matrix = test_matrix(
+            Config {
+                token: Some("stale-token".to_string()),
+                token_file: Some("/tmp/stale-matrix-token".to_string()),
+                token_command: Some("old-command".to_string()),
+                ..Config::default()
+            },
+            None,
+        );
+        matrix.config_path = env::temp_dir().join(format!(
+            "matrix-test-config-use-{}-{}.json",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let output = config_command(
+            &mut matrix,
+            ConfigCommand {
+                command: ConfigSubcommand::Use {
+                    profile: ConfigProfile::RedWiz,
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(output["hasToken"], false);
+        assert_eq!(output["tokenFile"], Value::Null);
+        assert_eq!(output["hasTokenCommand"], true);
+        assert!(matrix.config.token.is_none());
+        assert!(matrix.config.token_file.is_none());
+        assert_eq!(
+            matrix.config.token_command.as_deref(),
+            Some(RED_WIZ_TOKEN_COMMAND)
+        );
+
+        let saved: Config =
+            serde_json::from_slice(&fs::read(&matrix.config_path).unwrap()).unwrap();
+        assert!(saved.token.is_none());
+        assert!(saved.token_file.is_none());
+        assert_eq!(saved.token_command.as_deref(), Some(RED_WIZ_TOKEN_COMMAND));
+        let _ = fs::remove_file(&matrix.config_path);
     }
 
     #[test]
