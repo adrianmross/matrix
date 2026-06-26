@@ -6204,6 +6204,58 @@ mod tests {
     }
 
     #[test]
+    fn producer_fact_batch_example_populates_query_views() {
+        let value: Value =
+            serde_json::from_str(include_str!("../examples/producers/fact-batch.json")).unwrap();
+        let facts = value["facts"].as_array().unwrap().clone();
+        let db = build_facts_db(&facts, &MatrixContext::default()).unwrap();
+
+        let capabilities = execute_readonly_sql(
+            &db,
+            "select capability, capability_version, component from capabilities order by capability",
+        )
+        .unwrap();
+        assert!(capabilities["rows"].as_array().unwrap().iter().any(|row| {
+            row["capability"] == "http-api:example-api"
+                && row["capability_version"] == "1"
+                && row["component"] == "example-api"
+        }));
+        assert!(capabilities["rows"].as_array().unwrap().iter().any(|row| {
+            row["capability"] == "sbom:example-api"
+                && row["capability_version"] == "1.2.3"
+                && row["component"] == "example-api"
+        }));
+
+        let requirements = execute_readonly_sql(
+            &db,
+            "select capability, capability_version, component from requirements order by capability",
+        )
+        .unwrap();
+        assert_eq!(
+            requirements["rows"][0],
+            json!({
+                "capability": "http-api:example-api",
+                "capability_version": "1",
+                "component": "example-worker"
+            })
+        );
+
+        let members = execute_readonly_sql(
+            &db,
+            "select component, version, digest from members order by component",
+        )
+        .unwrap();
+        assert_eq!(members["rows"][0]["component"], "example-api");
+        assert_eq!(members["rows"][0]["version"], "1.2.3");
+        assert!(
+            members["rows"][0]["digest"]
+                .as_str()
+                .unwrap()
+                .starts_with("sha256:")
+        );
+    }
+
+    #[test]
     fn exposes_context_aware_dependency_views() {
         let facts = vec![
             json!({

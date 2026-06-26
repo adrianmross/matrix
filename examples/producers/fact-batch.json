@@ -1,0 +1,123 @@
+{
+  "facts": [
+    {
+      "id": "validation.example-api.ci",
+      "zone": "test",
+      "kind": "validation",
+      "status": "passed",
+      "subjectType": "service",
+      "subjectName": "example-api",
+      "subjectVersion": "1.2.3",
+      "subjectRepo": "example/example-api",
+      "source": {
+        "repo": "example/example-api",
+        "ref": "refs/heads/main",
+        "sha": "0123456789abcdef0123456789abcdef01234567"
+      },
+      "observedAt": "2026-06-26T19:00:00Z",
+      "evidence": [
+        {
+          "type": "github-actions",
+          "url": "https://github.com/example/example-api/actions/runs/123456789"
+        }
+      ]
+    },
+    {
+      "id": "capability-provider.example-api.http",
+      "zone": "runtime",
+      "kind": "capability-provider",
+      "status": "ready",
+      "subjectType": "service",
+      "subjectName": "example-api",
+      "subjectVersion": "1.2.3",
+      "subjectRepo": "example/example-api",
+      "provides": [
+        {
+          "capability": "http-api:example-api",
+          "version": "1"
+        }
+      ],
+      "source": {
+        "repo": "example/example-api",
+        "ref": "refs/heads/main",
+        "sha": "0123456789abcdef0123456789abcdef01234567"
+      },
+      "observedAt": "2026-06-26T19:00:00Z",
+      "evidence": [
+        {
+          "type": "openapi",
+          "url": "https://github.com/example/example-api/actions/runs/123456789/artifacts/openapi.json",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ]
+    },
+    {
+      "id": "requirements.example-worker.example-api",
+      "zone": "runtime",
+      "kind": "artifact-requirements",
+      "status": "candidate",
+      "subjectType": "container-image",
+      "subjectName": "example-worker",
+      "subjectVersion": "1.2.3",
+      "subjectRepo": "example/example-worker",
+      "requires": [
+        {
+          "capability": "http-api:example-api",
+          "version": "1"
+        }
+      ],
+      "source": {
+        "repo": "example/example-worker",
+        "ref": "refs/heads/main",
+        "sha": "fedcba9876543210fedcba9876543210fedcba98"
+      },
+      "observedAt": "2026-06-26T19:05:00Z",
+      "evidence": [
+        {
+          "type": "deployment-manifest",
+          "url": "https://github.com/example/example-worker/actions/runs/123456790/artifacts/manifests.tar.gz"
+        }
+      ]
+    },
+    {
+      "id": "sbom.example-api.1.2.3",
+      "zone": "supply-chain",
+      "kind": "sbom",
+      "status": "observed",
+      "subjectType": "sbom",
+      "subjectName": "example-api",
+      "subjectVersion": "1.2.3",
+      "subjectRepo": "example/example-api",
+      "provides": [
+        {
+          "capability": "sbom:example-api",
+          "version": "1.2.3"
+        }
+      ],
+      "members": [
+        {
+          "component": "example-api",
+          "version": "1.2.3",
+          "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      ],
+      "source": {
+        "repo": "example/example-api",
+        "ref": "refs/tags/v1.2.3",
+        "sha": "0123456789abcdef0123456789abcdef01234567"
+      },
+      "observedAt": "2026-06-26T19:10:00Z",
+      "evidence": [
+        {
+          "type": "cyclonedx",
+          "url": "https://github.com/example/example-api/actions/runs/123456789/artifacts/bom.cdx.json",
+          "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        },
+        {
+          "type": "slsa-provenance",
+          "url": "https://github.com/example/example-api/attestations/123456789"
+        }
+      ]
+    }
+  ]
+}

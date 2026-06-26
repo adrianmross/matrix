@@ -116,6 +116,7 @@ matrix --construct http://127.0.0.1:8080 list
 
 - [CLI guide](docs/cli.md)
 - [Popular commands](docs/cli-popular-cmds.md)
+- [Producer onboarding](docs/producer-onboarding.md)
 - [Interactive REPL](docs/cli-repl.md)
 
 ## Producers
@@ -142,6 +143,10 @@ the context detected from git or the input file.
 For tox and nox, Matrix treats the runner output as environment/session
 orchestration evidence. Attach JUnit reports with `--junit-file` or
 `--junit-glob` for the canonical test-case facts.
+
+For custom producer facts, start with the
+[producer onboarding guide](docs/producer-onboarding.md) and the copyable
+[fact batch example](examples/producers/fact-batch.json).
 
 ## Codex Plugin
 
