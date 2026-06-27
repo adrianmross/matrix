@@ -45,6 +45,17 @@ bearer tokens do not override the profile handoff. `wiz tool setup matrix` is
 the beginner wrapper for setup and smoke guidance; Matrix stores the narrower
 credential command for per-request auth.
 
+Token commands inherit the Matrix process environment. If you set
+`XDG_CONFIG_HOME` to isolate Matrix during a smoke test, that also changes where
+`wiz auth token` looks for its login config. Either run `wiz auth login` inside
+the same temporary config home, or override the command for that test:
+
+```bash
+MATRIX_TOKEN_COMMAND='env -u XDG_CONFIG_HOME wiz auth token --audience platform-api --format json' \
+  XDG_CONFIG_HOME="$(mktemp -d)/config" \
+  matrix doctor
+```
+
 For non-profile deployments, provide a bearer token with one of these sources:
 
 ```bash

@@ -104,6 +104,10 @@ matrix eligibility odin stage
 The `red-wiz` profile stores the hosted construct URL, the `/v1/compatibility`
 API prefix, and a Wiz token command. Matrix asks `wiz` for the current token at
 request time instead of saving a bearer token in the Matrix config.
+If you isolate Matrix with a temporary `XDG_CONFIG_HOME`, remember that the
+token command inherits that environment too. Either log `wiz` in under the same
+temporary config home, or override the command for the smoke test:
+`MATRIX_TOKEN_COMMAND='env -u XDG_CONFIG_HOME wiz auth token --audience platform-api --format json'`.
 
 Run a local construct:
 
@@ -192,6 +196,11 @@ Environment overrides:
 token.
 It also clears any saved Matrix `token` or `token-file` value so stale bearer
 tokens do not override the profile handoff.
+Token commands inherit the Matrix process environment. For isolated tests that
+set `XDG_CONFIG_HOME` only to keep Matrix config temporary, either authenticate
+Wiz inside that same config home or run the credential helper through
+`env -u XDG_CONFIG_HOME wiz auth token --audience platform-api --format json`
+so it can use the normal Wiz login state.
 For other platforms, use `MATRIX_TOKEN`, `MATRIX_TOKEN_FILE`, or
 `MATRIX_TOKEN_COMMAND`. Token commands can print a raw token, JSON with an
 `access_token` field, or JSON with a `token`, `bearerToken`, or `bearer_token`
