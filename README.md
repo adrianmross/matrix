@@ -234,7 +234,7 @@ The Homebrew formula installs the released `matrix`, `matrix-enter`, and
 Linux x86_64 users can install the static release archive directly:
 
 ```bash
-version=0.3.18
+version=0.3.19
 target=x86_64-unknown-linux-gnu
 curl -LO "https://github.com/adrianmross/matrix/releases/download/v${version}/matrix-${version}-${target}.tar.gz"
 curl -LO "https://github.com/adrianmross/matrix/releases/download/v${version}/matrix-${version}-${target}.tar.gz.sha256"
@@ -265,7 +265,7 @@ matrix completion fish > ~/.config/fish/completions/matrix.fish
 operator installs. Container deployments should use the release image:
 
 ```bash
-docker pull ghcr.io/adrianmross/matrix-construct:0.3.18
+docker pull ghcr.io/adrianmross/matrix-construct:0.3.19
 ```
 
 ## Releases
@@ -307,8 +307,8 @@ Use `matrix update --check` for a machine-readable release check.
 Tags drive releases:
 
 ```bash
-git tag -a v0.3.18 -m "Release v0.3.18"
-git push origin v0.3.18
+git tag -a v0.3.19 -m "Release v0.3.19"
+git push origin v0.3.19
 ```
 
 The `Release` workflow builds `matrix`, `matrix-enter`, and `matrix-construct`
@@ -324,7 +324,7 @@ in the release notes. The workflow also builds and smokes the
 `ghcr.io/adrianmross/matrix-construct:<version>`.
 
 The `Tag Release` workflow is the preferred path for normal releases. Run it
-with `version=0.3.18` after bumping the Cargo package versions. It validates
+with `version=0.3.19` after bumping the Cargo package versions. It validates
 formatting, tests, clippy, version alignment, and tag uniqueness before pushing
 the annotated tag.
 
