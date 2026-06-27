@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     env, fs,
     io::{self, IsTerminal, Read},
     path::{Path, PathBuf},
@@ -131,9 +132,14 @@ enum Commands {
     Tags(ListQueryArgs),
     Upstream(ListQueryArgs),
     Downstream(ListQueryArgs),
-    Compatible(ListQueryArgs),
+    Compatible(CompatibleArgs),
     Compare(CompareArgs),
-    Why(CompareArgs),
+    Path(GraphPathArgs),
+    WorksWith(GraphPairArgs),
+    Status(GraphStatusArgs),
+    Why(GraphPairArgs),
+    #[command(alias = "graphql")]
+    Graph(GraphQueryArgs),
     Artifacts(ArtifactListArgs),
     Validations(ValidationListArgs),
     Capabilities,
@@ -341,6 +347,8 @@ struct ListQueryArgs {
 struct VersionQueryArgs {
     #[arg(value_name = "COMPONENT")]
     component_filter: Option<String>,
+    #[arg(long = "for", value_name = "COMPONENT")]
+    for_component: Option<String>,
     #[arg(long, default_value_t = 1000)]
     max_facts: usize,
     #[arg(long, default_value_t = 50)]
@@ -368,6 +376,66 @@ struct CompareArgs {
     limit: usize,
     #[command(flatten)]
     context: ContextArgs,
+}
+
+#[derive(Args, Clone)]
+struct CompatibleArgs {
+    #[arg(value_name = "LEFT")]
+    left: Option<String>,
+    #[arg(value_name = "RIGHT")]
+    right: Option<String>,
+    #[arg(long, default_value_t = 1000)]
+    max_facts: usize,
+    #[arg(long, default_value_t = 50)]
+    limit: usize,
+    #[arg(long)]
+    all: bool,
+    #[arg(long = "type")]
+    type_filter: Option<String>,
+    #[arg(long)]
+    include_applications: bool,
+    #[arg(long)]
+    include_dependencies: bool,
+    #[command(flatten)]
+    context: ContextArgs,
+}
+
+#[derive(Args, Clone)]
+struct GraphPathArgs {
+    source: String,
+    target: String,
+    #[arg(long, default_value_t = 1000)]
+    max_facts: usize,
+    #[arg(long, default_value_t = 5)]
+    limit: usize,
+}
+
+#[derive(Args, Clone)]
+struct GraphPairArgs {
+    left: String,
+    right: String,
+    #[arg(long, default_value_t = 1000)]
+    max_facts: usize,
+    #[arg(long, default_value_t = 5)]
+    limit: usize,
+}
+
+#[derive(Args, Clone)]
+struct GraphStatusArgs {
+    component: String,
+    #[arg(long, default_value_t = 1000)]
+    max_facts: usize,
+    #[arg(long, default_value_t = 10)]
+    limit: usize,
+}
+
+#[derive(Args, Clone)]
+struct GraphQueryArgs {
+    query: String,
+    #[arg(long, default_value_t = 1000)]
+    max_facts: usize,
+    #[arg(long, default_value_t = 10)]
+    limit: usize,
 }
 
 #[derive(Args, Clone)]
@@ -574,10 +642,13 @@ pub async fn run_cli() -> Result<()> {
         Commands::Downstream(args) => {
             context_view_query(&matrix, args, ContextView::Downstream).await?
         }
-        Commands::Compatible(args) => {
-            context_view_query(&matrix, args, ContextView::Compatible).await?
-        }
-        Commands::Compare(args) | Commands::Why(args) => compare_query(&matrix, args).await?,
+        Commands::Compatible(args) => compatible_command(&matrix, args).await?,
+        Commands::Compare(args) => compare_query(&matrix, args).await?,
+        Commands::Path(args) => graph_path_command(&matrix, args).await?,
+        Commands::WorksWith(args) => works_with_command(&matrix, args).await?,
+        Commands::Status(args) => graph_status_command(&matrix, args).await?,
+        Commands::Why(args) => graph_why_command(&matrix, args).await?,
+        Commands::Graph(args) => graph_query_command(&matrix, args).await?,
         Commands::Artifacts(args) => list_artifacts(&matrix, args).await?,
         Commands::Validations(args) => list_validations(&matrix, args).await?,
         Commands::Capabilities => matrix.get("/capabilities").await?,
@@ -1822,6 +1893,22 @@ async fn list_components_query(matrix: &Matrix, args: ListQueryArgs) -> Result<V
 }
 
 async fn list_versions_query(matrix: &Matrix, args: VersionQueryArgs) -> Result<Value> {
+    if let Some(for_component) = args.for_component.clone() {
+        let component = args
+            .component_filter
+            .clone()
+            .ok_or_else(|| anyhow!("matrix versions --for requires a component argument"))?;
+        return graph_versions_for_command(
+            matrix,
+            GraphPairArgs {
+                left: for_component,
+                right: component,
+                max_facts: args.max_facts,
+                limit: args.limit,
+            },
+        )
+        .await;
+    }
     let options = args.component_options();
     let context = MatrixContext::detect_browsing(args.context);
     let db = query_db(matrix, args.max_facts, &context).await?;
@@ -1860,6 +1947,116 @@ async fn compare_query(matrix: &Matrix, args: CompareArgs) -> Result<Value> {
     execute_readonly_sql(&db, &sql)
 }
 
+async fn compatible_command(matrix: &Matrix, args: CompatibleArgs) -> Result<Value> {
+    match (args.left.clone(), args.right.clone()) {
+        (Some(left), Some(right)) => {
+            works_with_command(
+                matrix,
+                GraphPairArgs {
+                    left,
+                    right,
+                    max_facts: args.max_facts,
+                    limit: args.limit.clamp(1, 25),
+                },
+            )
+            .await
+        }
+        (None, None) => {
+            context_view_query(matrix, args.list_options(), ContextView::Compatible).await
+        }
+        _ => bail!("matrix compatible expects both components or neither"),
+    }
+}
+
+async fn graph_path_command(matrix: &Matrix, args: GraphPathArgs) -> Result<Value> {
+    let graph = load_graph(matrix, args.max_facts).await?;
+    graph.path_answer(&args.source, &args.target, args.limit.max(1))
+}
+
+async fn works_with_command(matrix: &Matrix, args: GraphPairArgs) -> Result<Value> {
+    let graph = load_graph(matrix, args.max_facts).await?;
+    graph.works_with_answer(&args.left, &args.right, args.limit.max(1))
+}
+
+async fn graph_why_command(matrix: &Matrix, args: GraphPairArgs) -> Result<Value> {
+    let graph = load_graph(matrix, args.max_facts).await?;
+    let mut answer = graph.works_with_answer(&args.left, &args.right, args.limit.max(1))?;
+    if let Some(object) = answer.as_object_mut() {
+        object.insert("kind".to_string(), json!("graph-why"));
+        object.insert(
+            "hint".to_string(),
+            json!("Evidence is carried on each path edge; missing paths mean Matrix lacks a connecting fact chain, not necessarily real-world incompatibility."),
+        );
+    }
+    Ok(answer)
+}
+
+async fn graph_status_command(matrix: &Matrix, args: GraphStatusArgs) -> Result<Value> {
+    let graph = load_graph(matrix, args.max_facts).await?;
+    graph.status_answer(&args.component, args.limit.max(1))
+}
+
+async fn graph_versions_for_command(matrix: &Matrix, args: GraphPairArgs) -> Result<Value> {
+    let graph = load_graph(matrix, args.max_facts).await?;
+    graph.versions_for_answer(&args.right, &args.left, args.limit.max(1))
+}
+
+async fn graph_query_command(matrix: &Matrix, args: GraphQueryArgs) -> Result<Value> {
+    let request = parse_graph_query(&args.query)?;
+    match request {
+        GraphRequest::Path { source, target } => {
+            graph_path_command(
+                matrix,
+                GraphPathArgs {
+                    source,
+                    target,
+                    max_facts: args.max_facts,
+                    limit: args.limit,
+                },
+            )
+            .await
+        }
+        GraphRequest::WorksWith { left, right } => {
+            works_with_command(
+                matrix,
+                GraphPairArgs {
+                    left,
+                    right,
+                    max_facts: args.max_facts,
+                    limit: args.limit,
+                },
+            )
+            .await
+        }
+        GraphRequest::Status { component } => {
+            graph_status_command(
+                matrix,
+                GraphStatusArgs {
+                    component,
+                    max_facts: args.max_facts,
+                    limit: args.limit,
+                },
+            )
+            .await
+        }
+        GraphRequest::VersionsFor {
+            component,
+            for_component,
+        } => {
+            graph_versions_for_command(
+                matrix,
+                GraphPairArgs {
+                    left: for_component,
+                    right: component,
+                    max_facts: args.max_facts,
+                    limit: args.limit,
+                },
+            )
+            .await
+        }
+    }
+}
+
 async fn query_db(
     matrix: &Matrix,
     max_facts: usize,
@@ -1868,6 +2065,619 @@ async fn query_db(
     let facts = fetch_facts(matrix, max_facts).await?;
     let sql_init = matrix.sql_init()?;
     build_facts_db_with_init(&facts, context, sql_init.as_deref())
+}
+
+async fn load_graph(matrix: &Matrix, max_facts: usize) -> Result<GraphIndex> {
+    let db = query_db(matrix, max_facts, &MatrixContext::default()).await?;
+    GraphIndex::from_db(&db)
+}
+
+#[derive(Clone, Debug)]
+struct GraphNode {
+    key: String,
+    component: String,
+    version: Option<String>,
+    identity: Option<String>,
+    subject_name: Option<String>,
+    repo: Option<String>,
+    status: Option<String>,
+    last_observed_at: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct GraphEdge {
+    source: String,
+    target: String,
+    relationship: String,
+    capability: Option<String>,
+    capability_version: Option<String>,
+    source_version: Option<String>,
+    target_version: Option<String>,
+    source_fact_id: Option<String>,
+    target_fact_id: Option<String>,
+    status: Option<String>,
+    observed_at: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct GraphPath {
+    edges: Vec<GraphEdge>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct GraphIndex {
+    nodes: BTreeMap<String, GraphNode>,
+    aliases: HashMap<String, String>,
+    outgoing: HashMap<String, Vec<GraphEdge>>,
+    incoming: HashMap<String, Vec<GraphEdge>>,
+}
+
+#[derive(Clone, Debug)]
+struct GraphRef {
+    raw: String,
+    name: String,
+    version: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+enum GraphRequest {
+    Path {
+        source: String,
+        target: String,
+    },
+    WorksWith {
+        left: String,
+        right: String,
+    },
+    Status {
+        component: String,
+    },
+    VersionsFor {
+        component: String,
+        for_component: String,
+    },
+}
+
+impl GraphIndex {
+    fn from_db(db: &Connection) -> Result<Self> {
+        let mut graph = Self::default();
+        graph.load_nodes(db)?;
+        graph.load_edges(db)?;
+        Ok(graph)
+    }
+
+    fn load_nodes(&mut self, db: &Connection) -> Result<()> {
+        let mut stmt = db.prepare(
+            "select component, canonical_component, identity, subject_name, repo,
+                    version, status, max(observed_at) as last_observed_at
+             from components
+             where component is not null and component != ''
+             group by component, canonical_component, identity, subject_name, repo, version, status
+             order by last_observed_at desc",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(GraphNode {
+                key: graph_key(&row.get::<_, String>(0)?),
+                component: row.get::<_, String>(0)?,
+                version: row.get::<_, Option<String>>(5)?,
+                identity: row.get::<_, Option<String>>(2)?,
+                subject_name: row.get::<_, Option<String>>(3)?,
+                repo: row.get::<_, Option<String>>(4)?,
+                status: row.get::<_, Option<String>>(6)?,
+                last_observed_at: row.get::<_, Option<String>>(7)?,
+            })
+        })?;
+        for node in rows {
+            self.add_node(node?);
+        }
+
+        let mut stmt = db.prepare(
+            "select identity, canonical_component, subject_name, repo, alias
+             from identity_aliases
+             where alias is not null and alias != ''",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (identity, canonical_component, subject_name, repo, alias) = row?;
+            let key = canonical_component
+                .or_else(|| subject_name.clone().map(|value| component_key(&value)))
+                .or_else(|| repo.clone().map(|value| component_key(&value)))
+                .or_else(|| identity.clone().map(|value| component_key(&value)));
+            if let Some(key) = key {
+                self.add_alias(&alias, &graph_key(&key));
+            }
+        }
+        Ok(())
+    }
+
+    fn add_node(&mut self, node: GraphNode) {
+        let key = node.key.clone();
+        let replace = self
+            .nodes
+            .get(&key)
+            .map(|existing| {
+                node.last_observed_at > existing.last_observed_at
+                    || (existing.version.is_none() && node.version.is_some())
+            })
+            .unwrap_or(true);
+        self.add_alias(&node.component, &key);
+        if let Some(value) = node.subject_name.clone() {
+            self.add_alias(&value, &key);
+        }
+        if let Some(value) = node.repo.clone() {
+            self.add_alias(&value, &key);
+        }
+        if let Some(value) = node.identity.clone() {
+            self.add_alias(&value, &key);
+        }
+        if replace {
+            self.nodes.insert(key, node);
+        }
+    }
+
+    fn add_alias(&mut self, alias: &str, key: &str) {
+        for value in alias_variants(alias) {
+            self.aliases.entry(value).or_insert_with(|| key.to_string());
+        }
+    }
+
+    fn load_edges(&mut self, db: &Connection) -> Result<()> {
+        let sql = "
+            select r.component as source_component, p.component as target_component,
+                   'requires' as relationship, r.capability, r.capability_version,
+                   r.version as source_version, p.version as target_version,
+                   r.fact_id as source_fact_id, p.fact_id as target_fact_id,
+                   coalesce(p.status, r.status) as status,
+                   null as observed_at
+            from requirements r
+            join capabilities p
+              on p.capability = r.capability
+             and (r.capability_version is null or p.capability_version = r.capability_version)
+            where r.component is not null and p.component is not null
+            union all
+            select fact_component as source_component, component as target_component,
+                   'contains' as relationship, null as capability, null as capability_version,
+                   fact_version as source_version, version as target_version,
+                   fact_id as source_fact_id, fact_id as target_fact_id,
+                   fact_status as status, null as observed_at
+            from members
+            where fact_component is not null and component is not null";
+        let mut stmt = db.prepare(sql)?;
+        let rows = stmt.query_map([], |row| {
+            Ok(GraphEdge {
+                source: graph_key(&row.get::<_, String>(0)?),
+                target: graph_key(&row.get::<_, String>(1)?),
+                relationship: row.get::<_, String>(2)?,
+                capability: row.get::<_, Option<String>>(3)?,
+                capability_version: row.get::<_, Option<String>>(4)?,
+                source_version: row.get::<_, Option<String>>(5)?,
+                target_version: row.get::<_, Option<String>>(6)?,
+                source_fact_id: row.get::<_, Option<String>>(7)?,
+                target_fact_id: row.get::<_, Option<String>>(8)?,
+                status: row.get::<_, Option<String>>(9)?,
+                observed_at: row.get::<_, Option<String>>(10)?,
+            })
+        })?;
+        let mut seen = BTreeSet::new();
+        for row in rows {
+            let edge = row?;
+            let reverse_member = if edge.relationship == "contains" {
+                Some(GraphEdge {
+                    source: edge.target.clone(),
+                    target: edge.source.clone(),
+                    relationship: "member-of".to_string(),
+                    capability: edge.capability.clone(),
+                    capability_version: edge.capability_version.clone(),
+                    source_version: edge.target_version.clone(),
+                    target_version: edge.source_version.clone(),
+                    source_fact_id: edge.target_fact_id.clone(),
+                    target_fact_id: edge.source_fact_id.clone(),
+                    status: edge.status.clone(),
+                    observed_at: edge.observed_at.clone(),
+                })
+            } else {
+                None
+            };
+            self.add_edge(edge, &mut seen);
+            if let Some(edge) = reverse_member {
+                self.add_edge(edge, &mut seen);
+            }
+        }
+        Ok(())
+    }
+
+    fn add_edge(&mut self, edge: GraphEdge, seen: &mut BTreeSet<String>) {
+        let dedupe_key = format!(
+            "{}\0{}\0{}\0{}\0{}",
+            edge.source,
+            edge.target,
+            edge.relationship,
+            edge.capability.clone().unwrap_or_default(),
+            edge.capability_version.clone().unwrap_or_default()
+        );
+        if seen.insert(dedupe_key) {
+            self.outgoing
+                .entry(edge.source.clone())
+                .or_default()
+                .push(edge.clone());
+            self.incoming
+                .entry(edge.target.clone())
+                .or_default()
+                .push(edge);
+        }
+    }
+
+    fn resolve(&self, value: &str) -> GraphRef {
+        let parsed = parse_graph_ref(value);
+        let key = self
+            .aliases
+            .get(&graph_alias_key(&parsed.name))
+            .cloned()
+            .unwrap_or_else(|| graph_key(&parsed.name));
+        GraphRef {
+            raw: parsed.raw,
+            name: key,
+            version: parsed.version,
+        }
+    }
+
+    fn path_answer(&self, source: &str, target: &str, limit: usize) -> Result<Value> {
+        let source_ref = self.resolve(source);
+        let target_ref = self.resolve(target);
+        let paths = self.find_paths(&source_ref.name, &target_ref.name, limit);
+        Ok(json!({
+            "kind": "graph-path",
+            "source": self.node_value(&source_ref.name, source),
+            "target": self.node_value(&target_ref.name, target),
+            "status": if paths.is_empty() { "unknown" } else { "connected" },
+            "found": !paths.is_empty(),
+            "pathCount": paths.len(),
+            "paths": paths.iter().map(|path| self.path_value(path)).collect::<Vec<_>>(),
+            "missing": if paths.is_empty() { json!(["no known fact path connects these components"]) } else { json!([]) },
+        }))
+    }
+
+    fn works_with_answer(&self, left: &str, right: &str, limit: usize) -> Result<Value> {
+        let left_ref = self.resolve(left);
+        let right_ref = self.resolve(right);
+        let forward = self.find_paths(&left_ref.name, &right_ref.name, limit);
+        let reverse = self.find_paths(&right_ref.name, &left_ref.name, limit);
+        let (direction, paths) = if !forward.is_empty() {
+            ("left_to_right", forward)
+        } else if !reverse.is_empty() {
+            ("right_to_left", reverse)
+        } else {
+            ("none", Vec::new())
+        };
+        let compatible = paths
+            .iter()
+            .flat_map(|path| path.edges.iter())
+            .all(|edge| !is_invalid_status(edge.status.as_deref()));
+        Ok(json!({
+            "kind": "graph-works-with",
+            "left": self.node_value(&left_ref.name, left),
+            "right": self.node_value(&right_ref.name, right),
+            "status": if paths.is_empty() {
+                "unknown"
+            } else if compatible {
+                "compatible"
+            } else {
+                "blocked"
+            },
+            "compatible": !paths.is_empty() && compatible,
+            "direction": direction,
+            "pathCount": paths.len(),
+            "paths": paths.iter().map(|path| self.path_value(path)).collect::<Vec<_>>(),
+            "missing": if paths.is_empty() { json!(["no known compatibility path connects these components"]) } else { json!([]) },
+        }))
+    }
+
+    fn status_answer(&self, component: &str, limit: usize) -> Result<Value> {
+        let component_ref = self.resolve(component);
+        let outgoing = self
+            .outgoing
+            .get(&component_ref.name)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .take(limit)
+            .map(|edge| self.edge_value(&edge))
+            .collect::<Vec<_>>();
+        let incoming = self
+            .incoming
+            .get(&component_ref.name)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .take(limit)
+            .map(|edge| self.edge_value(&edge))
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "kind": "graph-status",
+            "component": self.node_value(&component_ref.name, component),
+            "outgoing": outgoing,
+            "incoming": incoming,
+            "outgoingCount": self.outgoing.get(&component_ref.name).map(Vec::len).unwrap_or(0),
+            "incomingCount": self.incoming.get(&component_ref.name).map(Vec::len).unwrap_or(0),
+        }))
+    }
+
+    fn versions_for_answer(
+        &self,
+        component: &str,
+        for_component: &str,
+        limit: usize,
+    ) -> Result<Value> {
+        let component_ref = self.resolve(component);
+        let for_ref = self.resolve(for_component);
+        let mut versions = BTreeSet::new();
+        for path in self
+            .find_paths(&for_ref.name, &component_ref.name, limit)
+            .into_iter()
+            .chain(self.find_paths(&component_ref.name, &for_ref.name, limit))
+        {
+            for edge in path.edges {
+                if edge.source == component_ref.name
+                    && let Some(version) = edge.source_version
+                {
+                    versions.insert(version);
+                }
+                if edge.target == component_ref.name
+                    && let Some(version) = edge.target_version
+                {
+                    versions.insert(version);
+                }
+            }
+        }
+        if versions.is_empty()
+            && let Some(node) = self.nodes.get(&component_ref.name)
+            && let Some(version) = node.version.clone()
+        {
+            versions.insert(version);
+        }
+        Ok(json!({
+            "kind": "graph-versions-for",
+            "component": self.node_value(&component_ref.name, component),
+            "for": self.node_value(&for_ref.name, for_component),
+            "versions": versions.into_iter().take(limit).collect::<Vec<_>>(),
+        }))
+    }
+
+    fn find_paths(&self, source: &str, target: &str, limit: usize) -> Vec<GraphPath> {
+        if source == target {
+            return vec![GraphPath { edges: Vec::new() }];
+        }
+        const MAX_DEPTH: usize = 6;
+        let mut paths = Vec::new();
+        let mut queue = VecDeque::from([(source.to_string(), Vec::<GraphEdge>::new())]);
+        while let Some((current, path)) = queue.pop_front() {
+            if path.len() >= MAX_DEPTH {
+                continue;
+            }
+            for edge in self.outgoing.get(&current).cloned().unwrap_or_default() {
+                if path.iter().any(|seen| seen.source == edge.target) || edge.target == source {
+                    continue;
+                }
+                let mut next_path = path.clone();
+                next_path.push(edge.clone());
+                if edge.target == target {
+                    paths.push(GraphPath { edges: next_path });
+                    if paths.len() >= limit {
+                        return paths;
+                    }
+                } else {
+                    queue.push_back((edge.target.clone(), next_path));
+                }
+            }
+        }
+        paths
+    }
+
+    fn path_value(&self, path: &GraphPath) -> Value {
+        let nodes = path
+            .node_keys()
+            .into_iter()
+            .map(|key| self.node_value(&key, &key))
+            .collect::<Vec<_>>();
+        json!({
+            "length": path.edges.len(),
+            "nodes": nodes,
+            "edges": path.edges.iter().map(|edge| self.edge_value(edge)).collect::<Vec<_>>(),
+        })
+    }
+
+    fn node_value(&self, key: &str, requested: &str) -> Value {
+        if let Some(node) = self.nodes.get(key) {
+            json!({
+                "requested": requested,
+                "key": node.key,
+                "component": node.component,
+                "version": node.version,
+                "identity": node.identity,
+                "subjectName": node.subject_name,
+                "repo": node.repo,
+                "status": node.status,
+                "lastObservedAt": node.last_observed_at,
+            })
+        } else {
+            json!({
+                "requested": requested,
+                "key": key,
+                "component": key,
+                "version": null,
+                "status": "unknown",
+            })
+        }
+    }
+
+    fn edge_value(&self, edge: &GraphEdge) -> Value {
+        json!({
+            "from": self.node_value(&edge.source, &edge.source),
+            "to": self.node_value(&edge.target, &edge.target),
+            "relationship": edge.relationship,
+            "capability": edge.capability,
+            "capabilityVersion": edge.capability_version,
+            "sourceVersion": edge.source_version,
+            "targetVersion": edge.target_version,
+            "sourceFactId": edge.source_fact_id,
+            "targetFactId": edge.target_fact_id,
+            "status": edge.status,
+            "observedAt": edge.observed_at,
+        })
+    }
+}
+
+impl GraphPath {
+    fn node_keys(&self) -> Vec<String> {
+        let mut nodes = Vec::new();
+        if let Some(first) = self.edges.first() {
+            nodes.push(first.source.clone());
+        }
+        for edge in &self.edges {
+            nodes.push(edge.target.clone());
+        }
+        nodes
+    }
+}
+
+fn parse_graph_ref(value: &str) -> GraphRef {
+    let raw = value.trim().to_string();
+    let (name, version) = split_graph_version(&raw);
+    GraphRef { raw, name, version }
+}
+
+fn split_graph_version(value: &str) -> (String, Option<String>) {
+    if let Some(index) = value.rfind('@')
+        && index > 0
+        && !value[index + 1..].contains('/')
+    {
+        return (
+            value[..index].to_string(),
+            Some(value[index + 1..].to_string()),
+        );
+    }
+    (value.to_string(), None)
+}
+
+fn graph_key(value: &str) -> String {
+    component_key(value).to_ascii_lowercase()
+}
+
+fn graph_alias_key(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn alias_variants(value: &str) -> Vec<String> {
+    let trimmed = value.trim();
+    let mut variants = BTreeSet::new();
+    if !trimmed.is_empty() {
+        variants.insert(trimmed.to_ascii_lowercase());
+        variants.insert(component_key(trimmed).to_ascii_lowercase());
+    }
+    variants.into_iter().collect()
+}
+
+fn is_invalid_status(status: Option<&str>) -> bool {
+    matches!(
+        status.map(|value| value.to_ascii_lowercase()),
+        Some(value) if matches!(value.as_str(), "incompatible" | "failed" | "invalid" | "blocked")
+    )
+}
+
+fn parse_graph_query(query: &str) -> Result<GraphRequest> {
+    let trimmed = normalize_graph_query(query);
+    if let Some((source, target)) = trimmed.split_once("->") {
+        return Ok(GraphRequest::Path {
+            source: source.trim().trim_matches('"').to_string(),
+            target: target.trim().trim_matches('"').to_string(),
+        });
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("path") {
+        return Ok(GraphRequest::Path {
+            source: graph_query_arg(trimmed, "from")
+                .or_else(|| graph_query_arg(trimmed, "source"))
+                .ok_or_else(|| anyhow!("path query requires from/source"))?,
+            target: graph_query_arg(trimmed, "to")
+                .or_else(|| graph_query_arg(trimmed, "target"))
+                .ok_or_else(|| anyhow!("path query requires to/target"))?,
+        });
+    }
+    if lower.starts_with("workswith") || lower.starts_with("works_with") {
+        return Ok(GraphRequest::WorksWith {
+            left: graph_query_arg(trimmed, "left")
+                .ok_or_else(|| anyhow!("worksWith query requires left"))?,
+            right: graph_query_arg(trimmed, "right")
+                .ok_or_else(|| anyhow!("worksWith query requires right"))?,
+        });
+    }
+    if lower.starts_with("status") {
+        return Ok(GraphRequest::Status {
+            component: graph_query_arg(trimmed, "component")
+                .or_else(|| graph_query_arg(trimmed, "name"))
+                .ok_or_else(|| anyhow!("status query requires component/name"))?,
+        });
+    }
+    if lower.starts_with("versions") {
+        return Ok(GraphRequest::VersionsFor {
+            component: graph_query_arg(trimmed, "component")
+                .ok_or_else(|| anyhow!("versions query requires component"))?,
+            for_component: graph_query_arg(trimmed, "for")
+                .or_else(|| graph_query_arg(trimmed, "forComponent"))
+                .ok_or_else(|| anyhow!("versions query requires for/forComponent"))?,
+        });
+    }
+    bail!(
+        "unsupported graph query; use `a -> b`, `path(from:\"a\", to:\"b\")`, `worksWith(left:\"a\", right:\"b\")`, `status(component:\"a\")`, or `versions(component:\"a\", for:\"b\")`"
+    )
+}
+
+fn normalize_graph_query(query: &str) -> &str {
+    let trimmed = query.trim();
+    if trimmed.contains("->") {
+        return trimmed;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    for field in ["path", "workswith", "works_with", "status", "versions"] {
+        if let Some(index) = lower.find(field) {
+            let before = lower[..index].chars().next_back();
+            let after = lower[index + field.len()..].chars().next();
+            let starts_field = before
+                .is_none_or(|character| !(character.is_ascii_alphanumeric() || character == '_'));
+            let ends_field = after
+                .is_none_or(|character| !(character.is_ascii_alphanumeric() || character == '_'))
+                || after == Some('(');
+            if starts_field && ends_field {
+                return trimmed[index..].trim_start();
+            }
+        }
+    }
+    trimmed
+}
+
+fn graph_query_arg(query: &str, name: &str) -> Option<String> {
+    let lower = query.to_ascii_lowercase();
+    let needle = format!("{}:", name.to_ascii_lowercase());
+    let start = lower.find(&needle)? + needle.len();
+    let rest = query[start..].trim_start();
+    if let Some(rest) = rest.strip_prefix('"') {
+        let end = rest.find('"')?;
+        return Some(rest[..end].to_string());
+    }
+    if let Some(rest) = rest.strip_prefix('\'') {
+        let end = rest.find('\'')?;
+        return Some(rest[..end].to_string());
+    }
+    let end = rest.find([',', ')', '}']).unwrap_or(rest.len());
+    Some(rest[..end].trim().to_string()).filter(|value| !value.is_empty())
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1896,6 +2706,20 @@ impl VersionQueryArgs {
             type_filter: self.type_filter.clone(),
             include_applications: self.include_applications,
             include_dependencies: self.include_dependencies,
+        }
+    }
+}
+
+impl CompatibleArgs {
+    fn list_options(&self) -> ListQueryArgs {
+        ListQueryArgs {
+            max_facts: self.max_facts,
+            limit: self.limit,
+            all: self.all,
+            type_filter: self.type_filter.clone(),
+            include_applications: self.include_applications,
+            include_dependencies: self.include_dependencies,
+            context: self.context.clone(),
         }
     }
 }
@@ -4492,6 +5316,14 @@ fn print_human_object(object: &serde_json::Map<String, Value>) {
         print_fact_get_human(object);
         return;
     }
+    if object
+        .get("kind")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.starts_with("graph-"))
+    {
+        print!("{}", graph_answer_human_text(object));
+        return;
+    }
     if let Some(saved) = object.get("saved").and_then(Value::as_str) {
         println!("Saved {saved}");
         return;
@@ -4553,6 +5385,178 @@ fn print_fact_history_human(object: &serde_json::Map<String, Value>) {
 
 fn print_fact_get_human(object: &serde_json::Map<String, Value>) {
     print!("{}", fact_get_human_text(object));
+}
+
+fn graph_answer_human_text(object: &serde_json::Map<String, Value>) -> String {
+    match object.get("kind").and_then(Value::as_str) {
+        Some("graph-path") => graph_path_human_text(object, "Path"),
+        Some("graph-works-with") => graph_path_human_text(object, "Works with"),
+        Some("graph-why") => graph_path_human_text(object, "Why"),
+        Some("graph-status") => graph_status_human_text(object),
+        Some("graph-versions-for") => graph_versions_human_text(object),
+        _ => {
+            let mut text = String::new();
+            for (key, value) in object {
+                text.push_str(&format!(
+                    "{}: {}\n",
+                    human_label(key),
+                    human_inline_value(value)
+                ));
+            }
+            text
+        }
+    }
+}
+
+fn graph_path_human_text(object: &serde_json::Map<String, Value>, title: &str) -> String {
+    let status = object
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let paths = object
+        .get("paths")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut text = format!("{title}: {status}\n");
+    if paths.is_empty() {
+        text.push_str("No known compatibility path.\n");
+        if let Some(missing) = object.get("missing").and_then(Value::as_array) {
+            for item in missing {
+                text.push_str(&format!("- {}\n", human_inline_value(item)));
+            }
+        }
+        return text;
+    }
+
+    for (index, path) in paths.iter().enumerate() {
+        let nodes = path
+            .get("nodes")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let node_labels = nodes.iter().map(graph_node_label).collect::<Vec<_>>();
+        text.push_str(&format!(
+            "{}. {}\n",
+            index + 1,
+            if node_labels.is_empty() {
+                "same component".to_string()
+            } else {
+                node_labels.join(" -> ")
+            }
+        ));
+        if let Some(edges) = path.get("edges").and_then(Value::as_array) {
+            for edge in edges {
+                text.push_str(&format!("   {}\n", graph_edge_label(edge)));
+            }
+        }
+    }
+    text
+}
+
+fn graph_status_human_text(object: &serde_json::Map<String, Value>) -> String {
+    let component = object
+        .get("component")
+        .map(graph_node_label)
+        .unwrap_or_else(|| "unknown".to_string());
+    let outgoing_count = object
+        .get("outgoingCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let incoming_count = object
+        .get("incomingCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let mut text =
+        format!("Status: {component}\nOutgoing: {outgoing_count}\nIncoming: {incoming_count}\n");
+    for (label, key) in [("Outgoing", "outgoing"), ("Incoming", "incoming")] {
+        let edges = object
+            .get(key)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if edges.is_empty() {
+            continue;
+        }
+        text.push_str(&format!("{label} edges\n"));
+        for edge in edges {
+            text.push_str(&format!("- {}\n", graph_edge_label(&edge)));
+        }
+    }
+    text
+}
+
+fn graph_versions_human_text(object: &serde_json::Map<String, Value>) -> String {
+    let component = object
+        .get("component")
+        .map(graph_node_label)
+        .unwrap_or_else(|| "unknown".to_string());
+    let for_component = object
+        .get("for")
+        .map(graph_node_label)
+        .unwrap_or_else(|| "unknown".to_string());
+    let versions = object
+        .get("versions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut text = format!("Versions: {component} for {for_component}\n");
+    if versions.is_empty() {
+        text.push_str("No known matching versions.\n");
+    } else {
+        for version in versions {
+            text.push_str(&format!("- {}\n", human_inline_value(&version)));
+        }
+    }
+    text
+}
+
+fn graph_node_label(value: &Value) -> String {
+    let Some(object) = value.as_object() else {
+        return human_inline_value(value);
+    };
+    let component = object
+        .get("component")
+        .and_then(Value::as_str)
+        .or_else(|| object.get("key").and_then(Value::as_str))
+        .unwrap_or("unknown");
+    if let Some(version) = object.get("version").and_then(Value::as_str) {
+        format!("{component} {version}")
+    } else {
+        component.to_string()
+    }
+}
+
+fn graph_edge_label(value: &Value) -> String {
+    let Some(object) = value.as_object() else {
+        return human_inline_value(value);
+    };
+    let from = object
+        .get("from")
+        .map(graph_node_label)
+        .unwrap_or_else(|| "?".to_string());
+    let to = object
+        .get("to")
+        .map(graph_node_label)
+        .unwrap_or_else(|| "?".to_string());
+    let relationship = object
+        .get("relationship")
+        .and_then(Value::as_str)
+        .unwrap_or("relates-to");
+    let mut label = format!("{from} {relationship} {to}");
+    if let Some(capability) = object.get("capability").and_then(Value::as_str) {
+        label.push_str(&format!(" via {capability}"));
+        if let Some(version) = object.get("capabilityVersion").and_then(Value::as_str) {
+            label.push_str(&format!(" {version}"));
+        }
+    }
+    if let Some(status) = object.get("status").and_then(Value::as_str) {
+        label.push_str(&format!(" [{status}]"));
+    }
+    if let Some(fact_id) = object.get("sourceFactId").and_then(Value::as_str) {
+        label.push_str(&format!(" ({fact_id})"));
+    }
+    label
 }
 
 fn fact_get_human_text(object: &serde_json::Map<String, Value>) -> String {
@@ -5195,6 +6199,77 @@ mod tests {
                 assert_eq!(args.target_version.as_deref(), Some("0.19.2"));
             }
             _ => panic!("expected compare command"),
+        }
+    }
+
+    #[test]
+    fn accepts_graph_answer_commands() {
+        let path = Cli::try_parse_from(["matrix", "path", "aphrodite", "eunomia"]).unwrap();
+        match path.command {
+            Commands::Path(args) => {
+                assert_eq!(args.source, "aphrodite");
+                assert_eq!(args.target, "eunomia");
+            }
+            _ => panic!("expected path command"),
+        }
+
+        let works_with =
+            Cli::try_parse_from(["matrix", "works-with", "putto", "aphrodite"]).unwrap();
+        match works_with.command {
+            Commands::WorksWith(args) => {
+                assert_eq!(args.left, "putto");
+                assert_eq!(args.right, "aphrodite");
+            }
+            _ => panic!("expected works-with command"),
+        }
+
+        let compatible =
+            Cli::try_parse_from(["matrix", "compatible", "aphrodite", "putto"]).unwrap();
+        match compatible.command {
+            Commands::Compatible(args) => {
+                assert_eq!(args.left.as_deref(), Some("aphrodite"));
+                assert_eq!(args.right.as_deref(), Some("putto"));
+            }
+            _ => panic!("expected compatible command"),
+        }
+
+        let versions =
+            Cli::try_parse_from(["matrix", "versions", "putto", "--for", "aphrodite"]).unwrap();
+        match versions.command {
+            Commands::Versions(args) => {
+                assert_eq!(args.component_filter.as_deref(), Some("putto"));
+                assert_eq!(args.for_component.as_deref(), Some("aphrodite"));
+            }
+            _ => panic!("expected versions command"),
+        }
+
+        let why = Cli::try_parse_from(["matrix", "why", "aphrodite", "eunomia"]).unwrap();
+        match why.command {
+            Commands::Why(args) => {
+                assert_eq!(args.left, "aphrodite");
+                assert_eq!(args.right, "eunomia");
+            }
+            _ => panic!("expected why command"),
+        }
+
+        let graph = Cli::try_parse_from(["matrix", "graph", "aphrodite -> eunomia"]).unwrap();
+        match graph.command {
+            Commands::Graph(args) => assert_eq!(args.query, "aphrodite -> eunomia"),
+            _ => panic!("expected graph command"),
+        }
+
+        let graphql = Cli::try_parse_from([
+            "matrix",
+            "graphql",
+            "{ path(from:\"aphrodite\", to:\"eunomia\") { status } }",
+            "-o",
+            "json",
+        ])
+        .unwrap();
+        assert_eq!(graphql.output, OutputFormat::Json);
+        match graphql.command {
+            Commands::Graph(args) => assert!(args.query.contains("path")),
+            _ => panic!("expected graphql alias command"),
         }
     }
 
@@ -6226,6 +7301,124 @@ mod tests {
                 .unwrap()
                 .starts_with("sha256:")
         );
+    }
+
+    fn graph_fixture() -> GraphIndex {
+        let facts = vec![
+            json!({
+                "id": "aphrodite.1.2.0",
+                "track": "odin",
+                "status": "passed",
+                "subject": {"type": "service", "name": "aphrodite", "version": "1.2.0", "repo": "red-wiz/aphrodite"},
+                "requires": [
+                    {"capability": "eos-platform", "version": "24.6"},
+                    {"capability": "putto-client", "version": "0.8"}
+                ]
+            }),
+            json!({
+                "id": "eos.24.6.0",
+                "track": "odin",
+                "status": "passed",
+                "subject": {"type": "release-bundle", "name": "eos", "version": "24.6.0", "repo": "red-wiz/eos"},
+                "provides": [{"capability": "eos-platform", "version": "24.6"}],
+                "members": [
+                    {"component": "eunomia", "version": "3.1.0"},
+                    {"component": "aglaea", "version": "5.0.0"},
+                    {"component": "athena", "version": "2.4.0"}
+                ]
+            }),
+            json!({
+                "id": "eunomia.3.1.0",
+                "track": "odin",
+                "status": "passed",
+                "subject": {"type": "service", "name": "eunomia", "version": "3.1.0", "repo": "red-wiz/eunomia"}
+            }),
+            json!({
+                "id": "putto.0.8.1",
+                "track": "odin",
+                "status": "passed",
+                "subject": {"type": "service", "name": "putto", "version": "0.8.1", "repo": "red-wiz/putto"},
+                "provides": [{"capability": "putto-client", "version": "0.8"}]
+            }),
+        ];
+        let db = build_facts_db(&facts, &MatrixContext::default()).unwrap();
+        GraphIndex::from_db(&db).unwrap()
+    }
+
+    #[test]
+    fn graph_finds_implicit_paths_through_release_bundles() {
+        let graph = graph_fixture();
+
+        let path = graph.path_answer("aphrodite", "eunomia", 5).unwrap();
+        assert_eq!(path["found"], true);
+        assert_eq!(path["paths"][0]["nodes"][0]["component"], "aphrodite");
+        assert_eq!(path["paths"][0]["nodes"][1]["component"], "eos");
+        assert_eq!(path["paths"][0]["nodes"][2]["component"], "eunomia");
+        assert_eq!(path["paths"][0]["edges"][0]["relationship"], "requires");
+        assert_eq!(path["paths"][0]["edges"][1]["relationship"], "contains");
+
+        let siblings = graph.path_answer("aglaea", "athena", 5).unwrap();
+        assert_eq!(siblings["found"], true);
+        assert_eq!(
+            siblings["paths"][0]["edges"][0]["relationship"],
+            "member-of"
+        );
+        assert_eq!(siblings["paths"][0]["edges"][1]["relationship"], "contains");
+    }
+
+    #[test]
+    fn graph_answers_works_with_and_versions_for() {
+        let graph = graph_fixture();
+
+        let works_with = graph.works_with_answer("putto", "aphrodite", 5).unwrap();
+        assert_eq!(works_with["compatible"], true);
+        assert_eq!(works_with["direction"], "right_to_left");
+        assert_eq!(
+            works_with["paths"][0]["edges"][0]["capability"],
+            "putto-client"
+        );
+
+        let versions = graph
+            .versions_for_answer("eunomia", "aphrodite", 5)
+            .unwrap();
+        assert_eq!(versions["versions"], json!(["3.1.0"]));
+    }
+
+    #[test]
+    fn parses_graphql_like_queries_for_agents() {
+        match parse_graph_query("{ path(from:\"aphrodite\", to:\"eunomia\") { status paths { nodes { component version } } } }").unwrap() {
+            GraphRequest::Path { source, target } => {
+                assert_eq!(source, "aphrodite");
+                assert_eq!(target, "eunomia");
+            }
+            _ => panic!("expected path request"),
+        }
+
+        match parse_graph_query(
+            "query Matrix($ignored:String) { versions(component:\"putto\", for:\"aphrodite\") { versions } }",
+        )
+        .unwrap()
+        {
+            GraphRequest::VersionsFor {
+                component,
+                for_component,
+            } => {
+                assert_eq!(component, "putto");
+                assert_eq!(for_component, "aphrodite");
+            }
+            _ => panic!("expected versions request"),
+        }
+    }
+
+    #[test]
+    fn renders_graph_answers_as_readable_human_text() {
+        let graph = graph_fixture();
+        let path = graph.path_answer("aphrodite", "eunomia", 5).unwrap();
+        let text = graph_answer_human_text(path.as_object().unwrap());
+
+        assert!(text.starts_with("Path: connected"));
+        assert!(text.contains("aphrodite 1.2.0 -> eos 24.6.0 -> eunomia 3.1.0"));
+        assert!(text.contains("aphrodite 1.2.0 requires eos 24.6.0 via eos-platform 24.6"));
     }
 
     #[test]

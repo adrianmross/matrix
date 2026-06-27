@@ -78,6 +78,10 @@ matrix view runtime
 matrix current --zone runtime --level preview
 matrix gate --zone runtime --level stage
 matrix trace --zone runtime --subject payments-api
+matrix path aphrodite eunomia
+matrix works-with putto aphrodite
+matrix versions eunomia --for aphrodite
+matrix graphql '{ path(from:"aphrodite", to:"eunomia") { status paths { nodes { component version } } } }' -o json
 matrix upload facts.json
 matrix query 'select id, zone, status, subject_name from facts limit 20'
 matrix history release-bundle.api.1.0.0
@@ -99,6 +103,12 @@ matrix requirements smart-contract-tuple.vdr.0.1.1
 matrix consumers smart-contract-tuple.vdr.0.1.1
 matrix blockers odin --environment stage
 matrix eligibility odin stage
+matrix path aphrodite eunomia
+matrix works-with putto aphrodite
+matrix compatible aphrodite putto
+matrix versions eunomia --for aphrodite
+matrix why aphrodite eunomia
+matrix graphql '{ path(from:"aphrodite", to:"eunomia") { status paths { nodes { component version } } } }' -o json
 ```
 
 The `red-wiz` profile stores the hosted construct URL, the `/v1/compatibility`

@@ -70,6 +70,58 @@ are not printed by `matrix config list` or `matrix doctor`.
 
 ## Compatibility Graph Commands
 
+For common compatibility questions, use the answer-oriented graph commands
+first. Matrix infers known paths from `requires`, `provides`, and tuple
+`members`; you do not need to spell out an intermediate bundle such as EOS when
+the facts already describe that path.
+
+```bash
+matrix path aphrodite eunomia
+matrix works-with putto aphrodite
+matrix compatible aphrodite putto
+matrix versions eunomia --for aphrodite
+matrix why aphrodite eunomia
+matrix status aphrodite
+```
+
+Examples of the questions these answer:
+
+```bash
+# What version of Eunomia is Aphrodite using?
+matrix versions eunomia --for aphrodite
+
+# Which Putto facts connect to Aphrodite?
+matrix works-with putto aphrodite
+
+# Why does Matrix think Aphrodite and Eunomia are connected?
+matrix why aphrodite eunomia
+
+# What is connected to Aphrodite right now?
+matrix status aphrodite
+```
+
+For agents and scripts, every command supports structured output:
+
+```bash
+matrix path aphrodite eunomia -o json
+matrix works-with putto aphrodite -o json
+matrix versions eunomia --for aphrodite -o json
+```
+
+Matrix also accepts a small GraphQL-style query surface for agent promptability
+and script readability. Selection sets are accepted so the command can look
+like GraphQL, while Matrix still returns the standard JSON answer shape.
+
+```bash
+matrix graphql '{ path(from:"aphrodite", to:"eunomia") { status paths { nodes { component version } } } }' -o json
+matrix graphql '{ worksWith(left:"putto", right:"aphrodite") { status paths { edges { capability } } } }' -o json
+matrix graphql '{ versions(component:"eunomia", for:"aphrodite") { versions } }' -o json
+matrix graph 'aphrodite -> eunomia' -o json
+```
+
+Use the lower-level API projection commands when you need exact construct
+objects rather than an inferred answer:
+
 When the configured construct exposes the `/v1/compatibility` API, Matrix can
 read the graph projections directly:
 
@@ -319,7 +371,7 @@ matrix upstream --repo example/payments-api --version v1.6.3
 matrix downstream --repo example/auth-service --version v2.1.0
 matrix compatible --repo example/payments-api --version v1.6.3
 matrix compare example/ledger-service --repo example/payments-api --version v1.6.3
-matrix why ledger-service --repo example/payments-api --version v1.6.3
+matrix why payments-api ledger-service
 ```
 
 By default, component and version browsing hides repo-level `application` SBOM
@@ -327,10 +379,15 @@ subjects and dependency-only subjects such as `@scope/core`. Use `--all`,
 `--type`, `--include-applications`, or `--include-dependencies` when you need
 the full evidence inventory.
 
-`compare` and `why` compare the current context to a target component, subject,
-or repo. They report both directions: facts where the current context requires
-the target, and facts where the target requires something provided by the
-current context. Use `--target-version` to pin the target side.
+`compare` compares the current context to a target component, subject, or repo.
+It reports both directions: facts where the current context requires the target,
+and facts where the target requires something provided by the current context.
+Use `--target-version` to pin the target side.
+
+`why`, `path`, `works-with`, and pair-form `compatible` answer between two
+components directly. They infer intermediate bundles from Matrix facts, so a
+query such as `matrix why aphrodite eunomia` can show the Aphrodite to EOS to
+Eunomia evidence path without a `--through eos` flag.
 
 ## SQL Packs
 

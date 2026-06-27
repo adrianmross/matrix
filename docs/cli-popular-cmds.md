@@ -23,6 +23,27 @@ matrix gate --zone runtime --level stage
 matrix trace --zone runtime --subject payments-api
 ```
 
+## Answer Compatibility Questions
+
+```bash
+matrix path aphrodite eunomia
+matrix works-with putto aphrodite
+matrix compatible aphrodite putto
+matrix versions eunomia --for aphrodite
+matrix why aphrodite eunomia
+matrix status aphrodite
+```
+
+For agents and scripts:
+
+```bash
+matrix path aphrodite eunomia -o json
+matrix works-with putto aphrodite -o json
+matrix versions eunomia --for aphrodite -o json
+matrix graphql '{ path(from:"aphrodite", to:"eunomia") { status paths { nodes { component version } } } }' -o json
+matrix graphql '{ versions(component:"eunomia", for:"aphrodite") { versions } }' -o json
+```
+
 ## Work In A Repository
 
 Matrix detects the current git repo, ref, tag, and SHA. Override context when
@@ -36,7 +57,7 @@ matrix upstream --repo example/payments-api --version v1.6.3
 matrix downstream --repo example/auth-service --version v2.1.0
 matrix compatible --repo example/payments-api --version v1.6.3
 matrix compare example/ledger-service --repo example/payments-api --version v1.6.3
-matrix why ledger-service --repo example/payments-api --version v1.6.3
+matrix why payments-api ledger-service
 ```
 
 ## Publish Producer Evidence
