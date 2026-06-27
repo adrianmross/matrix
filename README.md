@@ -82,9 +82,13 @@ matrix path aphrodite eunomia
 matrix works-with putto aphrodite
 matrix versions eunomia --for aphrodite
 matrix resolve aphrodite
+matrix sync --max-facts 5000
+matrix cache status
 matrix query -f queries/current-runtime.sql -o json
+matrix query -f queries/current-runtime.sql --offline -o json
 matrix graphql '{ path(from:"aphrodite", to:"eunomia") { status paths { nodes { component version } } } }' -o json
 matrix graphql -f queries/aphrodite-path.graphql -o json
+matrix graphql -f queries/aphrodite-path.graphql --offline -o json
 matrix upload facts.json
 matrix query 'select id, zone, status, subject_name from facts limit 20'
 matrix history release-bundle.api.1.0.0
@@ -112,6 +116,10 @@ matrix compatible aphrodite putto
 matrix versions eunomia --for aphrodite
 matrix why aphrodite eunomia
 matrix resolve aphrodite
+matrix sync --max-facts 10000
+matrix cache status
+matrix path aphrodite eunomia --offline
+matrix query 'select id, zone, status from facts limit 20' --offline
 matrix graphql '{ path(from:"aphrodite", to:"eunomia") { status paths { nodes { component version } } } }' -o json
 matrix graphql -f queries/aphrodite-path.graphql -o json
 ```
@@ -123,6 +131,19 @@ If you isolate Matrix with a temporary `XDG_CONFIG_HOME`, remember that the
 token command inherits that environment too. Either log `wiz` in under the same
 temporary config home, or override the command for the smoke test:
 `MATRIX_TOKEN_COMMAND='env -u XDG_CONFIG_HOME wiz auth token --audience platform-api --format json'`.
+
+For fast local exploration or agent runs, populate the persistent fact cache:
+
+```bash
+matrix sync --max-facts 10000
+matrix cache status
+matrix query 'select id, zone, status from facts limit 20' --offline
+matrix path aphrodite eunomia --offline
+```
+
+Online local SQL and graph commands refresh the cache after fetching facts.
+`--offline` reads only the cached snapshot, and `matrix cache clear` removes the
+active construct/profile cache file.
 
 Run a local construct:
 
