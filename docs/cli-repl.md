@@ -40,7 +40,12 @@ matrix> .examples
 matrix> .members release-bundle.api.1.0.0
 matrix> .deref release-bundle.api.1.0.0
 matrix> .compare ledger-service
-matrix> .why example/ledger-service --target-version v2.4.0
+matrix> .path aphrodite eunomia
+matrix> .works-with putto aphrodite
+matrix> .why aphrodite eunomia
+matrix> .resolve aphrodite
+matrix> .read queries/current-runtime.sql
+matrix> .graphql -f queries/aphrodite-path.graphql
 matrix> .mode json
 matrix> .mode yaml
 matrix> .refresh
@@ -63,8 +68,17 @@ clears the current local session context.
 - `.deref <fact-id>`: show member, requirement, and provide edges for a fact.
 - `.history <fact-id>`: show accepted revisions and supersession metadata for a
   fact.
-- `.compare <target>` or `.why <target>`: compare the active context to a
-  target component, subject, or repo.
+- `.compare <target>`: compare the active context to a target component,
+  subject, or repo.
+- `.path <from> <to>`, `.works-with <a> <b>`, `.why <a> <b>`: answer graph
+  compatibility questions from the session fact cache.
+- `.resolve <name>`: show how a repo, package, identity, or short component name
+  resolves into graph nodes.
+- `.graph <query>` or `.graphql <query>`: run GraphQL-style graph queries from
+  the session fact cache.
+- `.graph -f <file>` or `.graphql -f <file>`: run a saved graph query file.
+- `.read <file>`, `.load <file>`, or `.source <file>`: run a saved SQL query
+  file against the session cache.
 - `.mode human|table|json|yaml|csv`: change result rendering.
 - `.x`: toggle expanded records.
 - `.timing`: toggle query timings.

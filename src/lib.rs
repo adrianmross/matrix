@@ -137,6 +137,7 @@ enum Commands {
     Path(GraphPathArgs),
     WorksWith(GraphPairArgs),
     Status(GraphStatusArgs),
+    Resolve(GraphResolveArgs),
     Why(GraphPairArgs),
     #[command(alias = "graphql")]
     Graph(GraphQueryArgs),
@@ -309,7 +310,15 @@ impl From<EnterContextArgs> for ContextArgs {
 
 #[derive(Args)]
 struct QueryArgs {
-    sql: String,
+    #[arg(value_name = "SQL", required_unless_present = "file")]
+    sql: Option<String>,
+    #[arg(
+        short = 'f',
+        long = "file",
+        value_name = "FILE",
+        conflicts_with = "sql"
+    )]
+    file: Option<PathBuf>,
     #[arg(long, default_value_t = 1000)]
     max_facts: usize,
     #[command(flatten)]
@@ -431,11 +440,26 @@ struct GraphStatusArgs {
 
 #[derive(Args, Clone)]
 struct GraphQueryArgs {
-    query: String,
+    #[arg(value_name = "QUERY", required_unless_present = "file")]
+    query: Option<String>,
+    #[arg(
+        short = 'f',
+        long = "file",
+        value_name = "FILE",
+        conflicts_with = "query"
+    )]
+    file: Option<PathBuf>,
     #[arg(long, default_value_t = 1000)]
     max_facts: usize,
     #[arg(long, default_value_t = 10)]
     limit: usize,
+}
+
+#[derive(Args, Clone)]
+struct GraphResolveArgs {
+    component: String,
+    #[arg(long, default_value_t = 1000)]
+    max_facts: usize,
 }
 
 #[derive(Args, Clone)]
@@ -647,6 +671,7 @@ pub async fn run_cli() -> Result<()> {
         Commands::Path(args) => graph_path_command(&matrix, args).await?,
         Commands::WorksWith(args) => works_with_command(&matrix, args).await?,
         Commands::Status(args) => graph_status_command(&matrix, args).await?,
+        Commands::Resolve(args) => graph_resolve_command(&matrix, args).await?,
         Commands::Why(args) => graph_why_command(&matrix, args).await?,
         Commands::Graph(args) => graph_query_command(&matrix, args).await?,
         Commands::Artifacts(args) => list_artifacts(&matrix, args).await?,
@@ -1840,7 +1865,7 @@ async fn query(matrix: &Matrix, args: QueryArgs) -> Result<Value> {
     let context = MatrixContext::detect(args.context);
     let sql_init = matrix.sql_init()?;
     let db = build_facts_db_with_init(&facts, &context, sql_init.as_deref())?;
-    execute_readonly_sql(&db, &args.sql)
+    execute_readonly_sql(&db, &query_text(args.sql, args.file, "SQL query")?)
 }
 
 #[derive(Clone, Copy)]
@@ -1996,64 +2021,46 @@ async fn graph_status_command(matrix: &Matrix, args: GraphStatusArgs) -> Result<
     graph.status_answer(&args.component, args.limit.max(1))
 }
 
+async fn graph_resolve_command(matrix: &Matrix, args: GraphResolveArgs) -> Result<Value> {
+    let graph = load_graph(matrix, args.max_facts).await?;
+    graph.resolve_answer(&args.component)
+}
+
 async fn graph_versions_for_command(matrix: &Matrix, args: GraphPairArgs) -> Result<Value> {
     let graph = load_graph(matrix, args.max_facts).await?;
     graph.versions_for_answer(&args.right, &args.left, args.limit.max(1))
 }
 
 async fn graph_query_command(matrix: &Matrix, args: GraphQueryArgs) -> Result<Value> {
-    let request = parse_graph_query(&args.query)?;
-    match request {
-        GraphRequest::Path { source, target } => {
-            graph_path_command(
-                matrix,
-                GraphPathArgs {
-                    source,
-                    target,
-                    max_facts: args.max_facts,
-                    limit: args.limit,
-                },
-            )
-            .await
-        }
-        GraphRequest::WorksWith { left, right } => {
-            works_with_command(
-                matrix,
-                GraphPairArgs {
-                    left,
-                    right,
-                    max_facts: args.max_facts,
-                    limit: args.limit,
-                },
-            )
-            .await
-        }
-        GraphRequest::Status { component } => {
-            graph_status_command(
-                matrix,
-                GraphStatusArgs {
-                    component,
-                    max_facts: args.max_facts,
-                    limit: args.limit,
-                },
-            )
-            .await
-        }
-        GraphRequest::VersionsFor {
-            component,
-            for_component,
-        } => {
-            graph_versions_for_command(
-                matrix,
-                GraphPairArgs {
-                    left: for_component,
-                    right: component,
-                    max_facts: args.max_facts,
-                    limit: args.limit,
-                },
-            )
-            .await
-        }
+    let query = query_text(args.query, args.file, "graph query")?;
+    graph_query_value(matrix, &query, args.max_facts, args.limit).await
+}
+
+async fn graph_query_value(
+    matrix: &Matrix,
+    query: &str,
+    max_facts: usize,
+    limit: usize,
+) -> Result<Value> {
+    let graph = load_graph(matrix, max_facts).await?;
+    graph.execute_request(parse_graph_query(query)?, limit.max(1))
+}
+
+fn query_text(inline: Option<String>, file: Option<PathBuf>, label: &str) -> Result<String> {
+    match (inline, file) {
+        (Some(value), None) if !value.trim().is_empty() => Ok(value),
+        (None, Some(file)) => fs::read_to_string(&file)
+            .with_context(|| format!("failed to read {label} file {}", file.display()))
+            .map(|value| value.trim().to_string())
+            .and_then(|value| {
+                if value.is_empty() {
+                    bail!("{label} file was empty")
+                } else {
+                    Ok(value)
+                }
+            }),
+        (Some(_), Some(_)) => bail!("provide {label} inline or with --file, not both"),
+        _ => bail!("provide {label} inline or with --file"),
     }
 }
 
@@ -2108,6 +2115,7 @@ struct GraphPath {
 struct GraphIndex {
     nodes: BTreeMap<String, GraphNode>,
     aliases: HashMap<String, String>,
+    alias_matches: HashMap<String, BTreeSet<String>>,
     outgoing: HashMap<String, Vec<GraphEdge>>,
     incoming: HashMap<String, Vec<GraphEdge>>,
 }
@@ -2144,6 +2152,18 @@ impl GraphIndex {
         graph.load_nodes(db)?;
         graph.load_edges(db)?;
         Ok(graph)
+    }
+
+    fn execute_request(&self, request: GraphRequest, limit: usize) -> Result<Value> {
+        match request {
+            GraphRequest::Path { source, target } => self.path_answer(&source, &target, limit),
+            GraphRequest::WorksWith { left, right } => self.works_with_answer(&left, &right, limit),
+            GraphRequest::Status { component } => self.status_answer(&component, limit),
+            GraphRequest::VersionsFor {
+                component,
+                for_component,
+            } => self.versions_for_answer(&component, &for_component, limit),
+        }
     }
 
     fn load_nodes(&mut self, db: &Connection) -> Result<()> {
@@ -2225,6 +2245,10 @@ impl GraphIndex {
 
     fn add_alias(&mut self, alias: &str, key: &str) {
         for value in alias_variants(alias) {
+            self.alias_matches
+                .entry(value.clone())
+                .or_default()
+                .insert(key.to_string());
             self.aliases.entry(value).or_insert_with(|| key.to_string());
         }
     }
@@ -2327,6 +2351,104 @@ impl GraphIndex {
             name: key,
             version: parsed.version,
         }
+    }
+
+    fn resolve_answer(&self, value: &str) -> Result<Value> {
+        let parsed = parse_graph_ref(value);
+        let alias_key = graph_alias_key(&parsed.name);
+        let resolved = self.resolve(value);
+        let matches = self
+            .alias_matches
+            .get(&alias_key)
+            .cloned()
+            .unwrap_or_else(|| BTreeSet::from([resolved.name.clone()]))
+            .into_iter()
+            .map(|key| {
+                json!({
+                    "node": self.node_value(&key, value),
+                    "aliasKinds": self.alias_kinds_for(&key, &parsed.name),
+                    "outgoingCount": self.outgoing.get(&key).map(Vec::len).unwrap_or(0),
+                    "incomingCount": self.incoming.get(&key).map(Vec::len).unwrap_or(0),
+                })
+            })
+            .collect::<Vec<_>>();
+        let ambiguous = matches.len() > 1;
+        Ok(json!({
+            "kind": "graph-resolve",
+            "requested": value,
+            "name": parsed.name,
+            "version": parsed.version,
+            "resolved": self.node_value(&resolved.name, value),
+            "ambiguous": ambiguous,
+            "matchCount": matches.len(),
+            "matches": matches,
+            "warnings": self.resolution_warnings(value, &resolved.name, ambiguous),
+        }))
+    }
+
+    fn alias_kinds_for(&self, key: &str, requested: &str) -> Vec<String> {
+        let Some(node) = self.nodes.get(key) else {
+            return Vec::new();
+        };
+        let requested = graph_alias_key(requested);
+        let mut kinds = Vec::new();
+        if graph_alias_key(&node.component) == requested {
+            kinds.push("component".to_string());
+        }
+        if node
+            .subject_name
+            .as_deref()
+            .is_some_and(|value| graph_alias_key(value) == requested)
+        {
+            kinds.push("subject-name".to_string());
+        }
+        if node
+            .repo
+            .as_deref()
+            .is_some_and(|value| graph_alias_key(value) == requested)
+        {
+            kinds.push("repo".to_string());
+        }
+        if node
+            .identity
+            .as_deref()
+            .is_some_and(|value| graph_alias_key(value) == requested)
+        {
+            kinds.push("identity".to_string());
+        }
+        if kinds.is_empty() && graph_key(requested.as_str()) == node.key {
+            kinds.push("component-key".to_string());
+        }
+        kinds
+    }
+
+    fn resolution_warnings(
+        &self,
+        requested: &str,
+        resolved_key: &str,
+        ambiguous: bool,
+    ) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if ambiguous {
+            warnings.push("multiple graph nodes match this name; use a more specific repo, package, identity, or component".to_string());
+        }
+        if let Some(node) = self.nodes.get(resolved_key) {
+            let kinds = self.alias_kinds_for(resolved_key, requested);
+            if graph_alias_key(requested) != graph_alias_key(&node.component)
+                || !kinds.iter().any(|kind| kind == "component")
+            {
+                let through = if kinds.is_empty() {
+                    "alias".to_string()
+                } else {
+                    kinds.join(", ")
+                };
+                warnings.push(format!(
+                    "{requested:?} resolved to component {:?} through {through}",
+                    node.component
+                ));
+            }
+        }
+        warnings
     }
 
     fn path_answer(&self, source: &str, target: &str, limit: usize) -> Result<Value> {
@@ -3205,6 +3327,32 @@ impl<'a> ReplSession<'a> {
         Ok(())
     }
 
+    fn run_sql_file(&self, path: &str) -> Result<()> {
+        let sql =
+            fs::read_to_string(path).with_context(|| format!("failed to read SQL file {path}"))?;
+        self.run_sql(sql.trim().trim_end_matches(';').trim())
+    }
+
+    fn graph(&self) -> Result<GraphIndex> {
+        GraphIndex::from_db(&self.db)
+    }
+
+    fn print_value(&self, value: &Value) -> Result<()> {
+        match self.output_mode {
+            OutputMode::Human => print_human_value(value),
+            OutputMode::Json => print_json(value)?,
+            OutputMode::Yaml => print_yaml(value)?,
+            OutputMode::Csv | OutputMode::Table => print_generic_table(value),
+        }
+        Ok(())
+    }
+
+    fn run_graph_query(&self, query: &str, limit: usize) -> Result<()> {
+        let graph = self.graph()?;
+        let value = graph.execute_request(parse_graph_query(query)?, limit.max(1))?;
+        self.print_value(&value)
+    }
+
     async fn handle_command(&mut self, raw: &str) -> Result<bool> {
         let command = raw.trim();
         let command = command
@@ -3234,6 +3382,14 @@ impl<'a> ReplSession<'a> {
             "tags" => self.list_tags()?,
             "use" => self.use_context_choice(parts.collect::<Vec<_>>())?,
             "status" => self.print_status()?,
+            "read" | "load" | "source" => {
+                let path = parts.collect::<Vec<_>>().join(" ");
+                if path.is_empty() {
+                    eprintln!("Usage: .read <query.sql>");
+                } else {
+                    self.run_sql_file(&path)?;
+                }
+            }
             "tables" | "views" => self.run_sql(
                 "select name, type from sqlite_master where type in ('table', 'view') order by type, name",
             )?,
@@ -3284,13 +3440,83 @@ impl<'a> ReplSession<'a> {
                     print_value(&value, self.matrix.output)?;
                 }
             }
-            "compare" | "why" => {
+            "compare" => {
                 let args = parts.collect::<Vec<_>>();
                 if args.is_empty() {
-                    eprintln!("Usage: .{name} <component|repo|subject> [--target-version <version>]");
+                    eprintln!("Usage: .compare <component|repo|subject> [--target-version <version>]");
                 } else {
                     let (target, target_version) = parse_compare_repl_args(args)?;
                     self.run_sql(&compare_query_sql(&target, target_version.as_deref(), 50))?;
+                }
+            }
+            "path" => {
+                let args = parts.collect::<Vec<_>>();
+                match args.as_slice() {
+                    [source, target] => {
+                        let value = self.graph()?.path_answer(source, target, 5)?;
+                        self.print_value(&value)?;
+                    }
+                    [source, target, "--limit", limit] => {
+                        let value = self.graph()?.path_answer(
+                            source,
+                            target,
+                            limit.parse::<usize>().unwrap_or(5).max(1),
+                        )?;
+                        self.print_value(&value)?;
+                    }
+                    _ => eprintln!("Usage: .path <from-component> <to-component> [--limit N]"),
+                }
+            }
+            "works-with" | "works" | "compatible" => {
+                let args = parts.collect::<Vec<_>>();
+                match args.as_slice() {
+                    [left, right] => {
+                        let value = self.graph()?.works_with_answer(left, right, 5)?;
+                        self.print_value(&value)?;
+                    }
+                    [left, right, "--limit", limit] => {
+                        let value = self.graph()?.works_with_answer(
+                            left,
+                            right,
+                            limit.parse::<usize>().unwrap_or(5).max(1),
+                        )?;
+                        self.print_value(&value)?;
+                    }
+                    _ => eprintln!("Usage: .works-with <component-a> <component-b> [--limit N]"),
+                }
+            }
+            "why" => {
+                let args = parts.collect::<Vec<_>>();
+                match args.as_slice() {
+                    [left, right] => {
+                        let mut value = self.graph()?.works_with_answer(left, right, 5)?;
+                        if let Some(object) = value.as_object_mut() {
+                            object.insert("kind".to_string(), json!("graph-why"));
+                        }
+                        self.print_value(&value)?;
+                    }
+                    _ => eprintln!("Usage: .why <component-a> <component-b>"),
+                }
+            }
+            "resolve" => {
+                let component = parts.collect::<Vec<_>>().join(" ");
+                if component.is_empty() {
+                    eprintln!("Usage: .resolve <component|repo|package|identity>");
+                } else {
+                    let value = self.graph()?.resolve_answer(&component)?;
+                    self.print_value(&value)?;
+                }
+            }
+            "graph" | "graphql" => {
+                let query = parts.collect::<Vec<_>>().join(" ");
+                if query.is_empty() {
+                    eprintln!("Usage: .graph <query> or .graph -f <query.graphql>");
+                } else if let Some(path) = query.strip_prefix("-f ").or_else(|| query.strip_prefix("--file ")) {
+                    let query = fs::read_to_string(path.trim())
+                        .with_context(|| format!("failed to read graph query file {}", path.trim()))?;
+                    self.run_graph_query(&query, 10)?;
+                } else {
+                    self.run_graph_query(&query, 10)?;
                 }
             }
             "examples" => print_repl_examples(),
@@ -4617,7 +4843,13 @@ Matrix shell commands
   .history <fact-id> --relative -1
                             Show a selected revision by offset from current
   .compare <target>         Compare active context to a component/repo/subject
-  .why <target>             Alias for .compare
+  .path <from> <to>         Find an inferred compatibility path
+  .works-with <a> <b>       Check whether two components connect
+  .why <a> <b>              Explain pair compatibility
+  .resolve <name>           Explain component/repo/package alias resolution
+  .graph <query>            Run a GraphQL-style graph query
+  .graph -f <file>          Run a saved graph query file
+  .read <file>              Run a saved SQL query file
   .examples                 Show copyable query examples
   .explain <sql>            Run EXPLAIN QUERY PLAN
   red, red-pill, .exit      Exit
@@ -4715,14 +4947,21 @@ impl MatrixCompleter {
             ".examples",
             ".explain",
             ".gate",
+            ".graph",
+            ".graphql",
             ".get",
             ".help",
             ".history",
+            ".load",
             ".limit",
             ".members",
             ".mode",
+            ".path",
+            ".read",
             ".refresh",
+            ".resolve",
             ".schema",
+            ".source",
             ".status",
             ".component",
             ".components",
@@ -4768,6 +5007,8 @@ impl MatrixCompleter {
             "facts",
             "fact_id",
             "from",
+            "graph",
+            "graphql",
             "group",
             "get",
             "history",
@@ -4775,18 +5016,23 @@ impl MatrixCompleter {
             "incompatible",
             "json",
             "kind",
+            "load",
             "limit",
             "members",
             "observed_at",
             "accepted_at",
             "order",
+            "path",
             "provides",
+            "read",
             "red",
             "repo",
+            "resolve",
             "ref",
             "requirements",
             "requires",
             "select",
+            "source",
             "source_repository",
             "source_repo",
             "source_sha",
@@ -5394,6 +5640,7 @@ fn graph_answer_human_text(object: &serde_json::Map<String, Value>) -> String {
         Some("graph-why") => graph_path_human_text(object, "Why"),
         Some("graph-status") => graph_status_human_text(object),
         Some("graph-versions-for") => graph_versions_human_text(object),
+        Some("graph-resolve") => graph_resolve_human_text(object),
         _ => {
             let mut text = String::new();
             for (key, value) in object {
@@ -5506,6 +5753,51 @@ fn graph_versions_human_text(object: &serde_json::Map<String, Value>) -> String 
     } else {
         for version in versions {
             text.push_str(&format!("- {}\n", human_inline_value(&version)));
+        }
+    }
+    text
+}
+
+fn graph_resolve_human_text(object: &serde_json::Map<String, Value>) -> String {
+    let requested = object
+        .get("requested")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let resolved = object
+        .get("resolved")
+        .map(graph_node_label)
+        .unwrap_or_else(|| "unknown".to_string());
+    let ambiguous = object
+        .get("ambiguous")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut text = format!("Resolve: {requested} -> {resolved}\n");
+    if ambiguous {
+        text.push_str("Ambiguous: yes\n");
+    }
+    if let Some(warnings) = object.get("warnings").and_then(Value::as_array)
+        && !warnings.is_empty()
+    {
+        text.push_str("Warnings\n");
+        for warning in warnings {
+            text.push_str(&format!("- {}\n", human_inline_value(warning)));
+        }
+    }
+    if let Some(matches) = object.get("matches").and_then(Value::as_array)
+        && !matches.is_empty()
+    {
+        text.push_str("Matches\n");
+        for item in matches {
+            let node = item
+                .get("node")
+                .map(graph_node_label)
+                .unwrap_or_else(|| human_inline_value(item));
+            let kinds = item
+                .get("aliasKinds")
+                .map(human_inline_value)
+                .filter(|value| !value.is_empty() && value != "-")
+                .unwrap_or_else(|| "alias".to_string());
+            text.push_str(&format!("- {node} ({kinds})\n"));
         }
     }
     text
@@ -5950,6 +6242,18 @@ mod tests {
     }
 
     #[test]
+    fn accepts_query_file_input() {
+        let cli = Cli::try_parse_from(["matrix", "query", "-f", "queries/current.sql"]).unwrap();
+        match cli.command {
+            Commands::Query(args) => {
+                assert!(args.sql.is_none());
+                assert_eq!(args.file, Some(PathBuf::from("queries/current.sql")));
+            }
+            _ => panic!("expected query command"),
+        }
+    }
+
+    #[test]
     fn accepts_fact_view_commands() {
         let members = Cli::try_parse_from([
             "matrix",
@@ -6254,7 +6558,19 @@ mod tests {
 
         let graph = Cli::try_parse_from(["matrix", "graph", "aphrodite -> eunomia"]).unwrap();
         match graph.command {
-            Commands::Graph(args) => assert_eq!(args.query, "aphrodite -> eunomia"),
+            Commands::Graph(args) => {
+                assert_eq!(args.query.as_deref(), Some("aphrodite -> eunomia"))
+            }
+            _ => panic!("expected graph command"),
+        }
+
+        let graph_file =
+            Cli::try_parse_from(["matrix", "graphql", "-f", "queries/path.graphql"]).unwrap();
+        match graph_file.command {
+            Commands::Graph(args) => {
+                assert!(args.query.is_none());
+                assert_eq!(args.file, Some(PathBuf::from("queries/path.graphql")));
+            }
             _ => panic!("expected graph command"),
         }
 
@@ -6268,8 +6584,14 @@ mod tests {
         .unwrap();
         assert_eq!(graphql.output, OutputFormat::Json);
         match graphql.command {
-            Commands::Graph(args) => assert!(args.query.contains("path")),
+            Commands::Graph(args) => assert!(args.query.as_deref().unwrap().contains("path")),
             _ => panic!("expected graphql alias command"),
+        }
+
+        let resolve = Cli::try_parse_from(["matrix", "resolve", "aphrodite"]).unwrap();
+        match resolve.command {
+            Commands::Resolve(args) => assert_eq!(args.component, "aphrodite"),
+            _ => panic!("expected resolve command"),
         }
     }
 
@@ -7382,6 +7704,20 @@ mod tests {
             .versions_for_answer("eunomia", "aphrodite", 5)
             .unwrap();
         assert_eq!(versions["versions"], json!(["3.1.0"]));
+    }
+
+    #[test]
+    fn graph_resolve_explains_alias_matches() {
+        let graph = graph_fixture();
+
+        let resolved = graph.resolve_answer("red-wiz/eunomia").unwrap();
+        assert_eq!(resolved["kind"], "graph-resolve");
+        assert_eq!(resolved["resolved"]["component"], "eunomia");
+        assert_eq!(resolved["matches"][0]["aliasKinds"], json!(["repo"]));
+
+        let text = graph_answer_human_text(resolved.as_object().unwrap());
+        assert!(text.contains("Resolve: red-wiz/eunomia -> eunomia 3.1.0"));
+        assert!(text.contains("through repo"));
     }
 
     #[test]

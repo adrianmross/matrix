@@ -27,8 +27,12 @@ zones, promotion levels, gates, facts, traces, producer evidence, or the
   `matrix path <from> <to> -o json`, `matrix works-with <a> <b> -o json`,
   `matrix versions <component> --for <component> -o json`, or
   `matrix why <a> <b> -o json`.
+- Use `matrix resolve <name> -o json` when a query term might be a repo,
+  package, identity, or short component alias.
 - For agent-readable query prompts, `matrix graphql '<query>' -o json` accepts
   GraphQL-style fields such as `path`, `worksWith`, `status`, and `versions`.
+- Use `matrix graphql -f <file> -o json` and `matrix query -f <file> -o json`
+  for reusable agent/script query files.
 
 ## Common Workflows
 
@@ -65,8 +69,13 @@ zones, promotion levels, gates, facts, traces, producer evidence, or the
   `matrix versions <component> --for <other-component>`
 - Explain pair compatibility:
   `matrix why <component-a> <component-b>`
+- Explain name resolution:
+  `matrix resolve <component-or-alias>`
 - Run a GraphQL-style graph query:
   `matrix graphql '{ path(from:"aphrodite", to:"eunomia") { status paths { nodes { component version } } } }' -o json`
+- Run a saved graph or SQL query:
+  `matrix graphql -f queries/path.graphql -o json` or
+  `matrix query -f queries/current.sql -o json`
 - Query facts:
   `matrix query 'select id, zone, status from facts limit 20'`
 - Publish facts:

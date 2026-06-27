@@ -32,6 +32,7 @@ matrix compatible aphrodite putto
 matrix versions eunomia --for aphrodite
 matrix why aphrodite eunomia
 matrix status aphrodite
+matrix resolve aphrodite
 ```
 
 For agents and scripts:
@@ -41,6 +42,7 @@ matrix path aphrodite eunomia -o json
 matrix works-with putto aphrodite -o json
 matrix versions eunomia --for aphrodite -o json
 matrix graphql '{ path(from:"aphrodite", to:"eunomia") { status paths { nodes { component version } } } }' -o json
+matrix graphql -f queries/aphrodite-path.graphql -o json
 matrix graphql '{ versions(component:"eunomia", for:"aphrodite") { versions } }' -o json
 ```
 
@@ -85,6 +87,7 @@ matrix query --zone runtime 'select * from zone where type==service and status==
 matrix query --repo example/payments-api 'select * from upstream'
 matrix query --repo example/auth-service 'select * from downstream'
 matrix query 'select alias, identity from identity_aliases order by alias limit 25'
+matrix query -f queries/current-runtime.sql -o json
 ```
 
 ## Fact Bundles
