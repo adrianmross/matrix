@@ -209,6 +209,55 @@ field.
 Use `matrix doctor -o json` to inspect the active profile, construct URL, API
 prefix, redacted auth source, token-command health, and construct reachability.
 
+## Install
+
+macOS users should prefer Homebrew:
+
+```bash
+brew tap adrianmross/tap
+brew install matrix
+```
+
+The Homebrew formula installs the released `matrix`, `matrix-enter`, and
+`matrix-construct` binaries from the prebuilt GitHub Release archives.
+
+Linux x86_64 users can install the static release archive directly:
+
+```bash
+version=0.3.18
+target=x86_64-unknown-linux-gnu
+curl -LO "https://github.com/adrianmross/matrix/releases/download/v${version}/matrix-${version}-${target}.tar.gz"
+curl -LO "https://github.com/adrianmross/matrix/releases/download/v${version}/matrix-${version}-${target}.tar.gz.sha256"
+sha256sum -c "matrix-${version}-${target}.tar.gz.sha256"
+tar -xzf "matrix-${version}-${target}.tar.gz"
+install "matrix-${version}-${target}/matrix" "$HOME/.local/bin/matrix"
+install "matrix-${version}-${target}/matrix-enter" "$HOME/.local/bin/matrix-enter"
+install "matrix-${version}-${target}/matrix-construct" "$HOME/.local/bin/matrix-construct"
+```
+
+If you prefer a source install:
+
+```bash
+cargo install --locked --git https://github.com/adrianmross/matrix matrix --force
+cargo install --locked --git https://github.com/adrianmross/matrix matrix-enter --force
+cargo install --locked --git https://github.com/adrianmross/matrix matrix-construct --force
+```
+
+Install shell completions from the CLI:
+
+```bash
+matrix completion zsh > "${fpath[1]}/_matrix"
+matrix completion bash > ~/.local/share/bash-completion/completions/matrix
+matrix completion fish > ~/.config/fish/completions/matrix.fish
+```
+
+`matrix-construct` is included in every archive for local development and
+operator installs. Container deployments should use the release image:
+
+```bash
+docker pull ghcr.io/adrianmross/matrix-construct:0.3.18
+```
+
 ## Releases
 
 `matrix --version` prints the installed CLI version. `matrix-enter --version`
