@@ -150,7 +150,7 @@ Wiz profile that resolves to `POST /v1/compatibility/facts`.
 ## Local Fact Cache
 
 Use `matrix sync` when you want fast repeated exploration, offline-friendly
-agent runs, or a stable local snapshot while you iterate on SQL and graph
+agent runs, or a stable local SQLite database while you iterate on SQL and graph
 queries:
 
 ```bash
@@ -166,16 +166,17 @@ matrix graphql -f queries/aphrodite-path.graphql --offline -o json
 matrix cache clear
 ```
 
-The cache is stored under Matrix's OS cache directory and is keyed by the active
-profile, construct URL, and API prefix. Cache metadata records the construct,
-API prefix, profile, fetch time, fact count, and `--max-facts` used to populate
-the snapshot. `matrix cache status -o json` reports the cache path, age, and
-whether the snapshot is older than Matrix's freshness hint.
+The cache is a SQLite database stored under Matrix's OS cache directory and is
+keyed by the active profile, construct URL, and API prefix. Cache metadata
+records the construct, API prefix, profile, schema version, fetch time, fact
+count, and `--max-facts` used to populate the database. `matrix cache status -o
+json` reports the cache path, file size, age, and whether the database is older
+than Matrix's freshness hint.
 
 Online local SQL and graph commands fetch from the construct and refresh the
-cache. Add `--offline` to use only the persisted snapshot. Add
-`--refresh-cache` when you want the command invocation to make the refresh
-intent explicit.
+cache. Add `--offline` to open only the persisted SQLite database. Add
+`--refresh-cache` when you want the command invocation to make the refresh intent
+explicit.
 
 ## Context Queries
 
@@ -445,7 +446,7 @@ where fact_id = 'release-bundle.api.1.0.0';
 ```
 
 `sql-init` is the legacy single-file hook. `sql-pack` sets one reusable pack,
-and `sql-packs` sets an ordered comma-separated list. Pack files are applied to
-the local in-memory query database and may only create views. Use them for
-project, team, or org-specific rollups while keeping normal Matrix queries plain
-SQL. See `examples/sql-packs/release-bundle.sql` for a small pack.
+and `sql-packs` sets an ordered comma-separated list. Pack files are applied as
+session-local SQLite temp views and may only create views. Use them for project,
+team, or org-specific rollups while keeping normal Matrix queries plain SQL. See
+`examples/sql-packs/release-bundle.sql` for a small pack.

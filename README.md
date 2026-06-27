@@ -132,7 +132,8 @@ token command inherits that environment too. Either log `wiz` in under the same
 temporary config home, or override the command for the smoke test:
 `MATRIX_TOKEN_COMMAND='env -u XDG_CONFIG_HOME wiz auth token --audience platform-api --format json'`.
 
-For fast local exploration or agent runs, populate the persistent fact cache:
+For fast local exploration or agent runs, populate the persistent SQLite fact
+cache:
 
 ```bash
 matrix sync --max-facts 10000
@@ -142,8 +143,8 @@ matrix path aphrodite eunomia --offline
 ```
 
 Online local SQL and graph commands refresh the cache after fetching facts.
-`--offline` reads only the cached snapshot, and `matrix cache clear` removes the
-active construct/profile cache file.
+`--offline` opens the cached SQLite database directly, and `matrix cache clear`
+removes the active construct/profile cache file.
 
 Run a local construct:
 

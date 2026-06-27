@@ -57,8 +57,8 @@ matrix graphql -f queries/aphrodite-path.graphql --offline -o json
 ```
 
 Use this when you are iterating on saved SQL/GraphQL files, demoing without a
-network dependency, or giving an agent a stable fact snapshot. Run `matrix sync`
-again when you want fresh facts.
+network dependency, or giving an agent a stable SQLite fact cache. Run
+`matrix sync` again when you want fresh facts.
 
 ## Work In A Repository
 

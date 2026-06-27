@@ -645,18 +645,9 @@ struct FactLoadOptions {
     refresh_cache: bool,
 }
 
-#[derive(Clone, Debug)]
-struct CachedFacts {
-    facts: Vec<Value>,
+struct CachedDb {
+    db: Connection,
     cache: FactCacheSummary,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct FactCacheFile {
-    version: u32,
-    metadata: FactCacheMetadata,
-    facts: Vec<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -665,6 +656,7 @@ struct FactCacheMetadata {
     construct: Option<String>,
     api_prefix: String,
     profile: Option<ConfigProfile>,
+    schema_version: u32,
     fetched_at_unix: u64,
     fact_count: usize,
     max_facts: usize,
@@ -1930,18 +1922,10 @@ async fn blockers(matrix: &Matrix, args: BlockersArgs) -> Result<Value> {
 }
 
 async fn sync_cache(matrix: &Matrix, args: SyncArgs) -> Result<Value> {
-    let cached = load_facts(
-        matrix,
-        args.max_facts,
-        FactLoadOptions {
-            offline: false,
-            refresh_cache: true,
-        },
-    )
-    .await?;
+    let cache = sync_facts_to_cache(matrix, args.max_facts).await?;
     Ok(json!({
         "kind": "fact-cache-sync",
-        "cache": cached.cache.to_value(),
+        "cache": cache.to_value(),
     }))
 }
 
@@ -1997,12 +1981,10 @@ async fn ingest(matrix: &Matrix, args: IngestArgs) -> Result<Value> {
 }
 
 async fn query(matrix: &Matrix, args: QueryArgs) -> Result<Value> {
-    let cached = load_facts(matrix, args.max_facts, (&args.cache).into()).await?;
     let context = MatrixContext::detect(args.context);
-    let sql_init = matrix.sql_init()?;
-    let db = build_facts_db_with_init(&cached.facts, &context, sql_init.as_deref())?;
+    let (db, cache) = query_db(matrix, args.max_facts, &context, (&args.cache).into()).await?;
     let result = execute_readonly_sql(&db, &query_text(args.sql, args.file, "SQL query")?)?;
-    Ok(with_cache_summary(result, &cached.cache))
+    Ok(with_cache_summary(result, &cache))
 }
 
 #[derive(Clone, Copy)]
@@ -2012,13 +1994,11 @@ enum FactView {
 }
 
 async fn fact_view_query(matrix: &Matrix, args: FactQueryArgs, view: FactView) -> Result<Value> {
-    let cached = load_facts(matrix, args.max_facts, (&args.cache).into()).await?;
     let context = MatrixContext::detect(args.context);
-    let sql_init = matrix.sql_init()?;
-    let db = build_facts_db_with_init(&cached.facts, &context, sql_init.as_deref())?;
+    let (db, cache) = query_db(matrix, args.max_facts, &context, (&args.cache).into()).await?;
     let sql = fact_view_sql(&args.fact_id, view);
     let result = execute_readonly_sql(&db, &sql)?;
-    Ok(with_cache_summary(result, &cached.cache))
+    Ok(with_cache_summary(result, &cache))
 }
 
 fn fact_view_sql(fact_id: &str, view: FactView) -> String {
@@ -2235,10 +2215,33 @@ async fn query_db(
     context: &MatrixContext,
     options: FactLoadOptions,
 ) -> Result<(Connection, FactCacheSummary)> {
-    let cached = load_facts(matrix, max_facts, options).await?;
-    let sql_init = matrix.sql_init()?;
-    let db = build_facts_db_with_init(&cached.facts, context, sql_init.as_deref())?;
-    Ok((db, cached.cache))
+    let cached = load_query_db(matrix, max_facts, context, options).await?;
+    Ok((cached.db, cached.cache))
+}
+
+async fn load_query_db(
+    matrix: &Matrix,
+    max_facts: usize,
+    context: &MatrixContext,
+    options: FactLoadOptions,
+) -> Result<CachedDb> {
+    if options.offline && options.refresh_cache {
+        bail!("--offline cannot be combined with --refresh-cache");
+    }
+    let source = if options.offline {
+        FactCacheSource::Cache
+    } else {
+        sync_facts_to_cache(matrix, max_facts).await?;
+        FactCacheSource::Live
+    };
+    let path = fact_cache_path(matrix)?;
+    let db = open_fact_cache_db(&path, context, matrix.sql_init()?.as_deref()).with_context(|| {
+        format!(
+            "no usable Matrix SQLite fact cache for this construct/profile; run `matrix sync --max-facts {max_facts}`"
+        )
+    })?;
+    let cache = fact_cache_summary_from_db(&path, source)?;
+    Ok(CachedDb { db, cache })
 }
 
 async fn load_graph(
@@ -3343,7 +3346,6 @@ struct ReplSession<'a> {
     matrix: &'a Matrix,
     context: MatrixContext,
     sql_init: Option<String>,
-    facts: Vec<Value>,
     choices: Vec<ContextChoice>,
     db: Connection,
     cache: FactCacheSummary,
@@ -3359,15 +3361,14 @@ struct ReplSession<'a> {
 impl<'a> ReplSession<'a> {
     async fn new(matrix: &'a Matrix, context: MatrixContext) -> Result<Self> {
         let max_facts = 1000;
-        let cached = load_facts(matrix, max_facts, FactLoadOptions::default()).await?;
-        let fact_count = cached.facts.len();
         let sql_init = matrix.sql_init()?;
+        let cached = load_query_db(matrix, max_facts, &context, FactLoadOptions::default()).await?;
+        let fact_count = cached.cache.fact_count();
         Ok(Self {
             matrix,
-            db: build_facts_db_with_init(&cached.facts, &context, sql_init.as_deref())?,
+            db: cached.db,
             context,
             sql_init,
-            facts: cached.facts,
             choices: Vec::new(),
             cache: cached.cache,
             max_facts,
@@ -3390,17 +3391,16 @@ impl<'a> ReplSession<'a> {
     }
 
     async fn reload(&mut self, options: FactLoadOptions) -> Result<()> {
-        let cached = load_facts(self.matrix, self.max_facts, options).await?;
-        self.fact_count = cached.facts.len();
-        self.facts = cached.facts;
+        let cached = load_query_db(self.matrix, self.max_facts, &self.context, options).await?;
+        self.fact_count = cached.cache.fact_count();
+        self.db = cached.db;
         self.cache = cached.cache;
-        self.db = build_facts_db_with_init(&self.facts, &self.context, self.sql_init.as_deref())?;
         self.last_refresh = SystemTime::now();
         Ok(())
     }
 
     fn rebuild_context(&mut self) -> Result<()> {
-        self.db = build_facts_db_with_init(&self.facts, &self.context, self.sql_init.as_deref())?;
+        prepare_query_views(&self.db, &self.context, self.sql_init.as_deref())?;
         Ok(())
     }
 
@@ -4039,12 +4039,24 @@ fn build_facts_db(facts: &[Value], context: &MatrixContext) -> Result<Connection
     build_facts_db_with_init(facts, context, None)
 }
 
+#[cfg(test)]
 fn build_facts_db_with_init(
     facts: &[Value],
     context: &MatrixContext,
     sql_init: Option<&str>,
 ) -> Result<Connection> {
     let db = Connection::open_in_memory()?;
+    populate_facts_table(&db, facts)?;
+    prepare_query_views(&db, context, sql_init)?;
+    Ok(db)
+}
+
+fn populate_facts_table(db: &Connection, facts: &[Value]) -> Result<()> {
+    create_facts_table(db)?;
+    insert_facts(db, facts)
+}
+
+fn create_facts_table(db: &Connection) -> Result<()> {
     db.execute_batch(
         "create table facts (
           id text, zone text, kind text, status text,
@@ -4054,9 +4066,16 @@ fn build_facts_db_with_init(
           subject_type text, subject_name text, channel text,
           tag text, observed_at text, accepted_at text,
           requires text, provides text, aliases text, json text not null
-        );",
+        );
+        create index if not exists idx_matrix_facts_zone on facts(zone, observed_at);
+        create index if not exists idx_matrix_facts_component on facts(component, repo, version);
+        create index if not exists idx_matrix_facts_identity on facts(identity);
+        create index if not exists idx_matrix_facts_status on facts(status);",
     )?;
-    let mut zones = Vec::new();
+    Ok(())
+}
+
+fn insert_facts(db: &Connection, facts: &[Value]) -> Result<()> {
     for record in facts {
         let fact = record
             .get("fact")
@@ -4066,12 +4085,6 @@ fn build_facts_db_with_init(
             .or_else(|| text_at(record, &["track"]))
             .or_else(|| text_at(fact, &["zone"]))
             .or_else(|| text_at(record, &["zone"]));
-        if let Some(zone) = zone.clone()
-            && is_sql_identifier(&zone)
-            && !zones.contains(&zone)
-        {
-            zones.push(zone);
-        }
         let subject_type =
             text_at(fact, &["subjectType"]).or_else(|| text_at(fact, &["subject", "type"]));
         let subject_name =
@@ -4146,29 +4159,67 @@ fn build_facts_db_with_init(
             ],
         )?;
     }
-    create_matrix_views(&db, context, &zones)?;
+    Ok(())
+}
+
+fn prepare_query_views(
+    db: &Connection,
+    context: &MatrixContext,
+    sql_init: Option<&str>,
+) -> Result<()> {
+    drop_query_views(db)?;
+    let zones = zones_from_db(db)?;
+    create_matrix_views(db, context, &zones)?;
     if let Some(sql) = sql_init {
-        apply_sql_init(&db, sql)?;
+        apply_sql_init(db, sql)?;
     }
-    Ok(db)
+    Ok(())
+}
+
+fn zones_from_db(db: &Connection) -> Result<Vec<String>> {
+    let mut stmt = db.prepare("select distinct zone from facts where zone is not null")?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows
+        .into_iter()
+        .filter(|zone| is_sql_identifier(zone))
+        .collect())
+}
+
+fn drop_query_views(db: &Connection) -> Result<()> {
+    let mut stmt = db.prepare("select name from sqlite_temp_master where type = 'view'")?;
+    let views = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+    for view in views {
+        if is_sql_identifier(&view) {
+            db.execute_batch(&format!(
+                "drop view if exists temp.{};",
+                quote_identifier(&view)
+            ))?;
+        }
+    }
+    Ok(())
 }
 
 fn create_matrix_views(db: &Connection, context: &MatrixContext, zones: &[String]) -> Result<()> {
     db.execute_batch(
-        "create view zones as
+        "create temp view zones as
           select zone, count(*) as facts,
                  sum(case when status in ('compatible', 'passed', 'observed', 'candidate') then 1 else 0 end) as valid,
                  sum(case when status in ('incompatible', 'failed') then 1 else 0 end) as invalid
           from facts
           where zone is not null
           group by zone;
-        create view subjects as
+        create temp view subjects as
           select type, component, canonical_component, identity, subject_class, repo, count(*) as facts,
                  max(observed_at) as last_observed_at
           from facts
           where component is not null
           group by type, component, canonical_component, identity, subject_class, repo;
-        create view components as
+        create temp view components as
           select zone, type, subject_class, component, canonical_component, identity,
                  subject_name, repo, version, status,
                  case
@@ -4179,7 +4230,7 @@ fn create_matrix_views(db: &Connection, context: &MatrixContext, zones: &[String
                  observed_at, accepted_at, id
           from facts
           where component is not null;
-        create view identities as
+        create temp view identities as
           select identity, canonical_component, subject_class,
                  min(type) as type,
                  min(subject_name) as subject_name,
@@ -4189,7 +4240,7 @@ fn create_matrix_views(db: &Connection, context: &MatrixContext, zones: &[String
           from facts
           where identity is not null
           group by identity, canonical_component, subject_class;
-        create view identity_aliases as
+        create temp view identity_aliases as
           select distinct identity, canonical_component, subject_class, type,
                  subject_name, repo, subject_name as alias, 'subject_name' as alias_kind
           from facts
@@ -4211,27 +4262,27 @@ fn create_matrix_views(db: &Connection, context: &MatrixContext, zones: &[String
           from facts f, json_each(coalesce(f.aliases, '[]')) item
           where f.identity is not null and item.value is not null
             and item.value != '';
-        create view valid_facts as
+        create temp view valid_facts as
           select * from facts
           where status in ('compatible', 'passed', 'observed', 'candidate', 'valid', 'ready');
-        create view invalid_facts as
+        create temp view invalid_facts as
           select * from facts
           where status in ('incompatible', 'failed', 'invalid', 'blocked');
-        create view requirements as
+        create temp view requirements as
           select f.id as fact_id, f.zone, f.type, f.subject_class, f.component,
                  f.canonical_component, f.identity, f.subject_name, f.repo, f.version, f.status,
                  json_extract(item.value, '$.capability') as capability,
                  json_extract(item.value, '$.version') as capability_version,
                  item.value as requirement
           from facts f, json_each(coalesce(f.requires, '[]')) item;
-        create view capabilities as
+        create temp view capabilities as
           select f.id as fact_id, f.zone, f.type, f.subject_class, f.component,
                  f.canonical_component, f.identity, f.subject_name, f.repo, f.version, f.status,
                  json_extract(item.value, '$.capability') as capability,
                  json_extract(item.value, '$.version') as capability_version,
                  item.value as provides
           from facts f, json_each(coalesce(f.provides, '[]')) item;
-        create view members as
+        create temp view members as
           select f.id as fact_id, f.zone, f.type as fact_type, f.component as fact_component,
                  f.repo as fact_repo, f.version as fact_version, f.status as fact_status,
                  json_extract(item.value, '$.component') as component,
@@ -4246,7 +4297,7 @@ fn create_matrix_views(db: &Connection, context: &MatrixContext, zones: &[String
                  json_extract(item.value, '$.aliases') as aliases,
                  item.value as member
           from facts f, json_each(coalesce(json_extract(f.json, '$.fact.members'), json_extract(f.json, '$.members'), '[]')) item;
-        create view deref as
+        create temp view deref as
           select 'member' as edge, fact_id, zone, fact_type, fact_component, fact_repo,
                  fact_version, fact_status, 'component' as target_type,
                  component as target, version as target_version, null as capability,
@@ -4283,7 +4334,7 @@ fn create_matrix_views(db: &Connection, context: &MatrixContext, zones: &[String
         .map(|zone| format!("zone = {}", sql_literal(zone)))
         .unwrap_or_else(|| "0".to_string());
     db.execute_batch(&format!(
-        "create view context as select
+        "create temp view context as select
            {} as zone,
            {} as repo,
            {} as component,
@@ -4291,10 +4342,10 @@ fn create_matrix_views(db: &Connection, context: &MatrixContext, zones: &[String
            {} as tag,
            {} as sha,
            {} as ref;
-         create view active as select * from facts where {active_where};
-         create view current as select * from active;
-         create view zone as select * from facts where {zone_where};
-         create view upstream as
+         create temp view active as select * from facts where {active_where};
+         create temp view current as select * from active;
+         create temp view zone as select * from facts where {zone_where};
+         create temp view upstream as
            select min(r.fact_id) as current_fact_id,
                   r.zone as current_zone,
                   r.component as current_component,
@@ -4322,7 +4373,7 @@ fn create_matrix_views(db: &Connection, context: &MatrixContext, zones: &[String
            group by r.zone, r.component, r.repo, r.version, r.capability, r.capability_version,
                     p.zone, p.type, p.subject_class, p.component, p.canonical_component,
                     p.identity, p.subject_name, p.repo, p.version, p.status;
-         create view downstream as
+         create temp view downstream as
            select min(p.fact_id) as current_fact_id,
                   p.zone as current_zone,
                   p.component as current_component,
@@ -4350,7 +4401,7 @@ fn create_matrix_views(db: &Connection, context: &MatrixContext, zones: &[String
            group by p.zone, p.component, p.repo, p.version, p.capability, p.capability_version,
                     r.zone, r.type, r.subject_class, r.component, r.canonical_component,
                     r.identity, r.subject_name, r.repo, r.version, r.status;
-         create view compatible_with_current as
+         create temp view compatible_with_current as
            select distinct * from downstream
            where status in ('compatible', 'passed', 'observed', 'candidate', 'valid', 'ready');",
         sql_literal_opt(active_zone.as_deref()),
@@ -4388,7 +4439,7 @@ fn create_matrix_views(db: &Connection, context: &MatrixContext, zones: &[String
             continue;
         }
         db.execute_batch(&format!(
-            "create view {} as select * from facts where zone = {};",
+            "create temp view {} as select * from facts where zone = {};",
             quote_identifier(zone),
             sql_literal(zone)
         ))?;
@@ -4399,21 +4450,23 @@ fn create_matrix_views(db: &Connection, context: &MatrixContext, zones: &[String
 
 fn apply_sql_init(db: &Connection, sql: &str) -> Result<()> {
     for statement in sql.split(';') {
-        let statement = strip_sql_line_comments(statement)
-            .trim()
-            .to_ascii_lowercase();
+        let statement = strip_sql_line_comments(statement).trim().to_string();
+        let lower = statement.to_ascii_lowercase();
         if statement.is_empty() {
             continue;
         }
-        if !(statement.starts_with("create view ")
-            || statement.starts_with("create temp view ")
-            || statement.starts_with("create temporary view "))
+        let statement = if lower.starts_with("create temp view ")
+            || lower.starts_with("create temporary view ")
         {
+            statement
+        } else if lower.starts_with("create view ") {
+            format!("create temp view {}", &statement["create view ".len()..])
+        } else {
             bail!("Matrix SQL init only allows CREATE VIEW statements");
-        }
+        };
+        db.execute_batch(&format!("{statement};"))
+            .context("failed to apply Matrix SQL init views")?;
     }
-    db.execute_batch(sql)
-        .context("failed to apply Matrix SQL init views")?;
     Ok(())
 }
 
@@ -5457,93 +5510,158 @@ async fn fetch_facts(matrix: &Matrix, max_facts: usize) -> Result<Vec<Value>> {
     Ok(facts)
 }
 
-async fn load_facts(
-    matrix: &Matrix,
-    max_facts: usize,
-    options: FactLoadOptions,
-) -> Result<CachedFacts> {
-    if options.offline && options.refresh_cache {
-        bail!("--offline cannot be combined with --refresh-cache");
-    }
-    if options.offline {
-        return read_cached_facts(matrix, max_facts);
-    }
-
+async fn sync_facts_to_cache(matrix: &Matrix, max_facts: usize) -> Result<FactCacheSummary> {
     let facts = fetch_facts(matrix, max_facts).await?;
-    let cache = write_fact_cache(matrix, facts.clone(), max_facts)?;
-    Ok(CachedFacts { facts, cache })
+    write_fact_cache_db(matrix, &facts, max_facts)
 }
 
-fn read_cached_facts(matrix: &Matrix, max_facts: usize) -> Result<CachedFacts> {
-    let path = fact_cache_path(matrix)?;
-    let cache = read_fact_cache_file(&path).with_context(|| {
-        format!(
-            "no usable Matrix fact cache for this construct/profile; run `matrix sync --max-facts {max_facts}`"
-        )
-    })?;
-    let mut facts = cache.facts;
-    if facts.len() > max_facts {
-        facts.truncate(max_facts);
-    }
-    let summary = FactCacheSummary::from_metadata(FactCacheSource::Cache, path, cache.metadata);
-    Ok(CachedFacts {
-        facts,
-        cache: summary,
-    })
-}
-
-fn write_fact_cache(
+fn write_fact_cache_db(
     matrix: &Matrix,
-    facts: Vec<Value>,
+    facts: &[Value],
     max_facts: usize,
 ) -> Result<FactCacheSummary> {
-    let path = fact_cache_path(matrix)?;
+    let final_path = fact_cache_path(matrix)?;
+    if let Some(parent) = final_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temp_path = final_path.with_extension(format!("sqlite.tmp.{}", process::id()));
+    let _ = fs::remove_file(&temp_path);
+    let db = Connection::open(&temp_path)?;
+    db.execute_batch(
+        "pragma journal_mode = delete;
+         pragma synchronous = normal;",
+    )?;
+    populate_facts_table(&db, facts)?;
     let metadata = FactCacheMetadata {
         construct: matrix.construct.clone(),
         api_prefix: matrix.api_prefix.clone(),
         profile: matrix.profile,
+        schema_version: 2,
         fetched_at_unix: unix_now()?,
         fact_count: facts.len(),
         max_facts,
     };
-    let cache = FactCacheFile {
-        version: 1,
-        metadata: metadata.clone(),
-        facts,
-    };
-    write_fact_cache_file(&path, &cache)?;
+    write_fact_cache_metadata(&db, &metadata)?;
+    db.execute_batch("pragma optimize;")?;
+    drop(db);
+    fs::rename(&temp_path, &final_path).with_context(|| {
+        format!(
+            "failed to replace Matrix fact cache {}",
+            final_path.display()
+        )
+    })?;
     Ok(FactCacheSummary::from_metadata(
         FactCacheSource::Live,
-        path,
+        final_path,
         metadata,
     ))
 }
 
-fn read_fact_cache_file(path: &Path) -> Result<FactCacheFile> {
-    let cache: FactCacheFile = serde_json::from_slice(&fs::read(path)?)
-        .with_context(|| format!("failed to parse Matrix fact cache {}", path.display()))?;
-    if cache.version != 1 {
+fn open_fact_cache_db(
+    path: &Path,
+    context: &MatrixContext,
+    sql_init: Option<&str>,
+) -> Result<Connection> {
+    let db = Connection::open(path)
+        .with_context(|| format!("failed to open Matrix SQLite fact cache {}", path.display()))?;
+    let metadata = read_fact_cache_metadata(&db)?;
+    if metadata.schema_version != 2 {
         bail!(
-            "unsupported Matrix fact cache version {} in {}",
-            cache.version,
+            "unsupported Matrix SQLite fact cache schema {} in {}; run `matrix sync`",
+            metadata.schema_version,
             path.display()
         );
     }
-    Ok(cache)
+    prepare_query_views(&db, context, sql_init)?;
+    Ok(db)
 }
 
-fn write_fact_cache_file(path: &Path, cache: &FactCacheFile) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+fn write_fact_cache_metadata(db: &Connection, metadata: &FactCacheMetadata) -> Result<()> {
+    db.execute_batch(
+        "create table matrix_cache_metadata (
+           key text primary key,
+           value text not null
+         );",
+    )?;
+    let fields = [
+        ("construct", metadata.construct.clone().unwrap_or_default()),
+        ("apiPrefix", metadata.api_prefix.clone()),
+        (
+            "profile",
+            metadata
+                .profile
+                .map(ConfigProfile::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        ),
+        ("schemaVersion", metadata.schema_version.to_string()),
+        ("fetchedAtUnix", metadata.fetched_at_unix.to_string()),
+        ("factCount", metadata.fact_count.to_string()),
+        ("maxFacts", metadata.max_facts.to_string()),
+    ];
+    for (key, value) in fields {
+        db.execute(
+            "insert into matrix_cache_metadata (key, value) values (?1, ?2)",
+            params![key, value],
+        )?;
     }
-    fs::write(path, serde_json::to_vec_pretty(cache)?)?;
     Ok(())
+}
+
+fn read_fact_cache_metadata(db: &Connection) -> Result<FactCacheMetadata> {
+    let mut stmt = db.prepare("select key, value from matrix_cache_metadata")?;
+    let entries = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<HashMap<_, _>, _>>()?;
+    let profile = entries
+        .get("profile")
+        .filter(|value| !value.is_empty())
+        .and_then(|value| ConfigProfile::from_str(value, true).ok());
+    Ok(FactCacheMetadata {
+        construct: entries
+            .get("construct")
+            .filter(|value| !value.is_empty())
+            .cloned(),
+        api_prefix: entries
+            .get("apiPrefix")
+            .cloned()
+            .unwrap_or_else(|| "/v1/matrix".to_string()),
+        profile,
+        schema_version: entries
+            .get("schemaVersion")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0),
+        fetched_at_unix: entries
+            .get("fetchedAtUnix")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0),
+        fact_count: entries
+            .get("factCount")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0),
+        max_facts: entries
+            .get("maxFacts")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0),
+    })
+}
+
+fn fact_cache_summary_from_db(path: &Path, source: FactCacheSource) -> Result<FactCacheSummary> {
+    let db = Connection::open(path)?;
+    let metadata = read_fact_cache_metadata(&db)?;
+    Ok(FactCacheSummary::from_metadata(
+        source,
+        path.to_path_buf(),
+        metadata,
+    ))
 }
 
 fn fact_cache_status(matrix: &Matrix) -> Result<Value> {
     let path = fact_cache_path(matrix)?;
-    let summary = match read_fact_cache_file(&path) {
-        Ok(cache) => FactCacheSummary::from_metadata(FactCacheSource::Cache, path, cache.metadata),
+    let summary = match fact_cache_summary_from_db(&path, FactCacheSource::Cache) {
+        Ok(cache) => cache,
         Err(_) => FactCacheSummary {
             source: FactCacheSource::Missing,
             path,
@@ -5563,7 +5681,10 @@ fn clear_fact_cache(matrix: &Matrix, all: bool) -> Result<Value> {
             for entry in fs::read_dir(&root)? {
                 let entry = entry?;
                 let path = entry.path();
-                if path.extension().and_then(|value| value.to_str()) == Some("json") {
+                if matches!(
+                    path.extension().and_then(|value| value.to_str()),
+                    Some("sqlite" | "json")
+                ) {
                     fs::remove_file(&path)?;
                     removed += 1;
                 }
@@ -5589,7 +5710,7 @@ fn fact_cache_dir() -> Result<PathBuf> {
 }
 
 fn fact_cache_path(matrix: &Matrix) -> Result<PathBuf> {
-    Ok(fact_cache_dir()?.join(format!("{}.json", fact_cache_key(matrix))))
+    Ok(fact_cache_dir()?.join(format!("{}.sqlite", fact_cache_key(matrix))))
 }
 
 fn fact_cache_key(matrix: &Matrix) -> String {
@@ -5637,19 +5758,32 @@ impl FactCacheSummary {
 
     fn to_value(&self) -> Value {
         let metadata = self.metadata.as_ref();
+        let size_bytes = fs::metadata(&self.path).ok().map(|metadata| metadata.len());
         json!({
             "source": self.source.as_str(),
             "path": self.path.display().to_string(),
             "exists": self.source != FactCacheSource::Missing,
+            "format": if self.source == FactCacheSource::Missing { Value::Null } else { json!("sqlite") },
+            "sizeBytes": size_bytes,
+            "sizeHuman": size_bytes.map(human_bytes),
             "construct": metadata.and_then(|value| value.construct.clone()),
             "apiPrefix": metadata.map(|value| value.api_prefix.clone()),
             "profile": metadata.and_then(|value| value.profile.map(ConfigProfile::as_str)),
+            "schemaVersion": metadata.map(|value| value.schema_version),
             "fetchedAtUnix": metadata.map(|value| value.fetched_at_unix),
             "ageSeconds": self.age_seconds,
             "stale": self.stale,
             "factCount": metadata.map(|value| value.fact_count),
             "maxFacts": metadata.map(|value| value.max_facts),
         })
+    }
+
+    #[cfg(feature = "interactive")]
+    fn fact_count(&self) -> usize {
+        self.metadata
+            .as_ref()
+            .map(|metadata| metadata.fact_count)
+            .unwrap_or(0)
     }
 }
 
@@ -5660,6 +5794,21 @@ impl FactCacheSource {
             Self::Cache => "cache",
             Self::Missing => "missing",
         }
+    }
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
     }
 }
 
@@ -6077,9 +6226,12 @@ fn print_cache_command_human(object: &serde_json::Map<String, Value>) {
                 for key in [
                     "source",
                     "exists",
+                    "format",
+                    "sizeHuman",
                     "profile",
                     "construct",
                     "apiPrefix",
+                    "schemaVersion",
                     "factCount",
                     "maxFacts",
                     "ageSeconds",
@@ -7360,25 +7512,68 @@ mod tests {
 
     #[test]
     fn fact_cache_round_trips_metadata_and_facts() {
-        let path = env::temp_dir().join(format!("matrix-cache-test-{}.json", process::id()));
-        let cache = FactCacheFile {
-            version: 1,
-            metadata: FactCacheMetadata {
+        let path = env::temp_dir().join(format!("matrix-cache-test-{}.sqlite", process::id()));
+        let facts = vec![json!({
+            "id": "fact-1",
+            "zone": "runtime",
+            "status": "passed",
+            "subjectType": "service",
+            "subjectName": "ledger-service"
+        })];
+        let db = Connection::open(&path).unwrap();
+        populate_facts_table(&db, &facts).unwrap();
+        write_fact_cache_metadata(
+            &db,
+            &FactCacheMetadata {
                 construct: Some("https://matrix.example.test".to_string()),
                 api_prefix: "/v1/compatibility".to_string(),
                 profile: Some(ConfigProfile::RedWiz),
+                schema_version: 2,
                 fetched_at_unix: unix_now().unwrap(),
                 fact_count: 1,
                 max_facts: 1000,
             },
-            facts: vec![json!({"id": "fact-1", "zone": "runtime"})],
-        };
-        write_fact_cache_file(&path, &cache).unwrap();
-        let read = read_fact_cache_file(&path).unwrap();
+        )
+        .unwrap();
+        drop(db);
+        let db = open_fact_cache_db(&path, &MatrixContext::default(), None).unwrap();
+        let metadata = read_fact_cache_metadata(&db).unwrap();
+        let count: i64 = db
+            .query_row("select count(*) from facts", [], |row| row.get(0))
+            .unwrap();
+        let zones: i64 = db
+            .query_row("select count(*) from zones", [], |row| row.get(0))
+            .unwrap();
+        let persisted_views: i64 = db
+            .query_row(
+                "select count(*) from sqlite_master where type = 'view'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         let _ = fs::remove_file(&path);
-        assert_eq!(read.version, 1);
-        assert_eq!(read.metadata.profile, Some(ConfigProfile::RedWiz));
-        assert_eq!(read.facts[0]["id"], "fact-1");
+        assert_eq!(metadata.schema_version, 2);
+        assert_eq!(metadata.profile, Some(ConfigProfile::RedWiz));
+        assert_eq!(metadata.fact_count, 1);
+        assert_eq!(count, 1);
+        assert_eq!(zones, 1);
+        assert_eq!(persisted_views, 0);
+    }
+
+    #[test]
+    fn human_bytes_formats_cache_sizes() {
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(2048), "2.0 KiB");
+    }
+
+    #[test]
+    fn fact_cache_path_uses_sqlite_extension() {
+        let matrix = test_matrix(Config::default(), Some(ConfigProfile::RedWiz));
+        let path = fact_cache_path(&matrix).unwrap();
+        assert_eq!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("sqlite")
+        );
     }
 
     #[test]
