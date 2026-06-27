@@ -23,6 +23,12 @@ zones, promotion levels, gates, facts, traces, producer evidence, or the
 - Do not print, persist, or echo tokens. Matrix uses `MATRIX_TOKEN`,
   `MATRIX_TOKEN_FILE`, `MATRIX_TOKEN_COMMAND`, or saved config token sources for
   bearer authentication.
+- For "what works with what" questions, prefer answer commands before SQL:
+  `matrix path <from> <to> -o json`, `matrix works-with <a> <b> -o json`,
+  `matrix versions <component> --for <component> -o json`, or
+  `matrix why <a> <b> -o json`.
+- For agent-readable query prompts, `matrix graphql '<query>' -o json` accepts
+  GraphQL-style fields such as `path`, `worksWith`, `status`, and `versions`.
 
 ## Common Workflows
 
@@ -51,6 +57,16 @@ zones, promotion levels, gates, facts, traces, producer evidence, or the
   `matrix gate --zone <zone> --level <level>`
 - Trace evidence:
   `matrix trace --zone <zone> --subject <subject>`
+- Find an inferred component path:
+  `matrix path <from-component> <to-component>`
+- Check whether two components work together:
+  `matrix works-with <component-a> <component-b>`
+- List versions of a component seen with another component:
+  `matrix versions <component> --for <other-component>`
+- Explain pair compatibility:
+  `matrix why <component-a> <component-b>`
+- Run a GraphQL-style graph query:
+  `matrix graphql '{ path(from:"aphrodite", to:"eunomia") { status paths { nodes { component version } } } }' -o json`
 - Query facts:
   `matrix query 'select id, zone, status from facts limit 20'`
 - Publish facts:
