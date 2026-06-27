@@ -147,6 +147,36 @@ matrix eligibility odin stage
 normalized facts to `POST /facts` under the configured API prefix. With the Red
 Wiz profile that resolves to `POST /v1/compatibility/facts`.
 
+## Local Fact Cache
+
+Use `matrix sync` when you want fast repeated exploration, offline-friendly
+agent runs, or a stable local snapshot while you iterate on SQL and graph
+queries:
+
+```bash
+matrix sync --max-facts 10000
+matrix cache status
+matrix query 'select id, zone, status from facts limit 20' --offline
+matrix query -f queries/current-runtime.sql --offline -o json
+matrix path aphrodite eunomia --offline
+matrix works-with putto aphrodite --offline
+matrix why aphrodite eunomia --offline
+matrix resolve aphrodite --offline
+matrix graphql -f queries/aphrodite-path.graphql --offline -o json
+matrix cache clear
+```
+
+The cache is stored under Matrix's OS cache directory and is keyed by the active
+profile, construct URL, and API prefix. Cache metadata records the construct,
+API prefix, profile, fetch time, fact count, and `--max-facts` used to populate
+the snapshot. `matrix cache status -o json` reports the cache path, age, and
+whether the snapshot is older than Matrix's freshness hint.
+
+Online local SQL and graph commands fetch from the construct and refresh the
+cache. Add `--offline` to use only the persisted snapshot. Add
+`--refresh-cache` when you want the command invocation to make the refresh
+intent explicit.
+
 ## Context Queries
 
 `matrix query` and `matrix enter` detect the current git repository, branch,
@@ -157,6 +187,7 @@ matrix query --zone runtime --repo example/payments-api \
   'select * from zone where type==service and status!=failed'
 
 matrix query -f queries/current-runtime.sql -o json
+matrix query -f queries/current-runtime.sql --offline -o json
 
 matrix enter --zone runtime --repo example/ledger-service
 ```

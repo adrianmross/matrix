@@ -49,6 +49,7 @@ matrix> .graphql -f queries/aphrodite-path.graphql
 matrix> .mode json
 matrix> .mode yaml
 matrix> .refresh
+matrix> .offline
 matrix> blue
 matrix> red
 ```
@@ -84,6 +85,8 @@ clears the current local session context.
 - `.timing`: toggle query timings.
 - `.limit <n>`: change the fact fetch limit and refresh the cache.
 - `.refresh`: reload facts from the construct.
+- `.offline`: reload facts from the local persistent cache without contacting
+  the construct.
 - `.context`: show the active zone, repo, component, version, tag, ref, and SHA.
 - `.context <field> <value>`: set `zone`, `repo`, `component`, `version`,
   `tag`, `sha`, or `ref` without leaving the REPL.

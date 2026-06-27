@@ -46,6 +46,20 @@ matrix graphql -f queries/aphrodite-path.graphql -o json
 matrix graphql '{ versions(component:"eunomia", for:"aphrodite") { versions } }' -o json
 ```
 
+## Work Fast With A Local Snapshot
+
+```bash
+matrix sync --max-facts 10000
+matrix cache status
+matrix query 'select id, zone, status from facts limit 20' --offline
+matrix path aphrodite eunomia --offline
+matrix graphql -f queries/aphrodite-path.graphql --offline -o json
+```
+
+Use this when you are iterating on saved SQL/GraphQL files, demoing without a
+network dependency, or giving an agent a stable fact snapshot. Run `matrix sync`
+again when you want fresh facts.
+
 ## Work In A Repository
 
 Matrix detects the current git repo, ref, tag, and SHA. Override context when

@@ -1,6 +1,7 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque, hash_map::DefaultHasher},
     env, fs,
+    hash::{Hash, Hasher},
     io::{self, IsTerminal, Read},
     path::{Path, PathBuf},
     process::{self, Command as ProcessCommand, Stdio},
@@ -25,6 +26,7 @@ const RED_WIZ_CONSTRUCT_URL: &str = "https://platform-api.red-wiz.stream";
 const RED_WIZ_API_PREFIX: &str = "/v1/compatibility";
 const RED_WIZ_TOKEN_COMMAND: &str = "wiz auth token --audience platform-api --format json";
 const UPDATE_CHECK_TTL: Duration = Duration::from_secs(60 * 60 * 24);
+const FACT_CACHE_STALE_AFTER: Duration = Duration::from_secs(60 * 60 * 24);
 
 #[cfg(feature = "interactive")]
 use comfy_table::{Table, presets::UTF8_FULL};
@@ -162,6 +164,8 @@ enum Commands {
         track: String,
         environment: String,
     },
+    Sync(SyncArgs),
+    Cache(CacheCommand),
     Query(QueryArgs),
     Enter(ContextArgs),
     Update(UpdateCommand),
@@ -322,6 +326,8 @@ struct QueryArgs {
     #[arg(long, default_value_t = 1000)]
     max_facts: usize,
     #[command(flatten)]
+    cache: FactCacheArgs,
+    #[command(flatten)]
     context: ContextArgs,
 }
 
@@ -330,6 +336,8 @@ struct FactQueryArgs {
     fact_id: String,
     #[arg(long, default_value_t = 1000)]
     max_facts: usize,
+    #[command(flatten)]
+    cache: FactCacheArgs,
     #[command(flatten)]
     context: ContextArgs,
 }
@@ -348,6 +356,8 @@ struct ListQueryArgs {
     include_applications: bool,
     #[arg(long)]
     include_dependencies: bool,
+    #[command(flatten)]
+    cache: FactCacheArgs,
     #[command(flatten)]
     context: ContextArgs,
 }
@@ -371,6 +381,8 @@ struct VersionQueryArgs {
     #[arg(long)]
     include_dependencies: bool,
     #[command(flatten)]
+    cache: FactCacheArgs,
+    #[command(flatten)]
     context: ContextArgs,
 }
 
@@ -383,6 +395,8 @@ struct CompareArgs {
     max_facts: usize,
     #[arg(long, default_value_t = 50)]
     limit: usize,
+    #[command(flatten)]
+    cache: FactCacheArgs,
     #[command(flatten)]
     context: ContextArgs,
 }
@@ -406,6 +420,8 @@ struct CompatibleArgs {
     #[arg(long)]
     include_dependencies: bool,
     #[command(flatten)]
+    cache: FactCacheArgs,
+    #[command(flatten)]
     context: ContextArgs,
 }
 
@@ -417,6 +433,8 @@ struct GraphPathArgs {
     max_facts: usize,
     #[arg(long, default_value_t = 5)]
     limit: usize,
+    #[command(flatten)]
+    cache: FactCacheArgs,
 }
 
 #[derive(Args, Clone)]
@@ -427,6 +445,8 @@ struct GraphPairArgs {
     max_facts: usize,
     #[arg(long, default_value_t = 5)]
     limit: usize,
+    #[command(flatten)]
+    cache: FactCacheArgs,
 }
 
 #[derive(Args, Clone)]
@@ -436,6 +456,8 @@ struct GraphStatusArgs {
     max_facts: usize,
     #[arg(long, default_value_t = 10)]
     limit: usize,
+    #[command(flatten)]
+    cache: FactCacheArgs,
 }
 
 #[derive(Args, Clone)]
@@ -453,6 +475,8 @@ struct GraphQueryArgs {
     max_facts: usize,
     #[arg(long, default_value_t = 10)]
     limit: usize,
+    #[command(flatten)]
+    cache: FactCacheArgs,
 }
 
 #[derive(Args, Clone)]
@@ -460,6 +484,43 @@ struct GraphResolveArgs {
     component: String,
     #[arg(long, default_value_t = 1000)]
     max_facts: usize,
+    #[command(flatten)]
+    cache: FactCacheArgs,
+}
+
+#[derive(Args, Clone, Default)]
+struct FactCacheArgs {
+    #[arg(
+        long,
+        help = "Use the local fact cache without contacting the construct"
+    )]
+    offline: bool,
+    #[arg(
+        long = "refresh-cache",
+        help = "Fetch fresh facts and replace the local cache"
+    )]
+    refresh_cache: bool,
+}
+
+#[derive(Args, Clone)]
+struct SyncArgs {
+    #[arg(long, default_value_t = 1000)]
+    max_facts: usize,
+}
+
+#[derive(Args)]
+struct CacheCommand {
+    #[command(subcommand)]
+    command: CacheSubcommand,
+}
+
+#[derive(Subcommand)]
+enum CacheSubcommand {
+    Status,
+    Clear {
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 #[derive(Args, Clone)]
@@ -576,6 +637,53 @@ struct MatrixContext {
     tag: Option<String>,
     sha: Option<String>,
     reference: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct FactLoadOptions {
+    offline: bool,
+    refresh_cache: bool,
+}
+
+#[derive(Clone, Debug)]
+struct CachedFacts {
+    facts: Vec<Value>,
+    cache: FactCacheSummary,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FactCacheFile {
+    version: u32,
+    metadata: FactCacheMetadata,
+    facts: Vec<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FactCacheMetadata {
+    construct: Option<String>,
+    api_prefix: String,
+    profile: Option<ConfigProfile>,
+    fetched_at_unix: u64,
+    fact_count: usize,
+    max_facts: usize,
+}
+
+#[derive(Clone, Debug)]
+struct FactCacheSummary {
+    source: FactCacheSource,
+    path: PathBuf,
+    metadata: Option<FactCacheMetadata>,
+    age_seconds: Option<u64>,
+    stale: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FactCacheSource {
+    Live,
+    Cache,
+    Missing,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -704,6 +812,8 @@ pub async fn run_cli() -> Result<()> {
                 ))
                 .await?
         }
+        Commands::Sync(args) => sync_cache(&matrix, args).await?,
+        Commands::Cache(command) => cache_command(&matrix, command).await?,
         Commands::Query(args) => query(&matrix, args).await?,
         Commands::Enter(context) => dispatch_enter(&matrix, context)?,
         Commands::Update(command) => update_command(&matrix, command).await?,
@@ -1819,6 +1929,32 @@ async fn blockers(matrix: &Matrix, args: BlockersArgs) -> Result<Value> {
         .await
 }
 
+async fn sync_cache(matrix: &Matrix, args: SyncArgs) -> Result<Value> {
+    let cached = load_facts(
+        matrix,
+        args.max_facts,
+        FactLoadOptions {
+            offline: false,
+            refresh_cache: true,
+        },
+    )
+    .await?;
+    Ok(json!({
+        "kind": "fact-cache-sync",
+        "cache": cached.cache.to_value(),
+    }))
+}
+
+async fn cache_command(matrix: &Matrix, command: CacheCommand) -> Result<Value> {
+    match command.command {
+        CacheSubcommand::Status => Ok(json!({
+            "kind": "fact-cache-status",
+            "cache": fact_cache_status(matrix)?,
+        })),
+        CacheSubcommand::Clear { all } => clear_fact_cache(matrix, all),
+    }
+}
+
 async fn ingest(matrix: &Matrix, args: IngestArgs) -> Result<Value> {
     let input = read_text_input(args.file.clone(), args.stdin)?;
     let adapter = ingest::normalize_adapter(&args.adapter)?;
@@ -1861,11 +1997,12 @@ async fn ingest(matrix: &Matrix, args: IngestArgs) -> Result<Value> {
 }
 
 async fn query(matrix: &Matrix, args: QueryArgs) -> Result<Value> {
-    let facts = fetch_facts(matrix, args.max_facts).await?;
+    let cached = load_facts(matrix, args.max_facts, (&args.cache).into()).await?;
     let context = MatrixContext::detect(args.context);
     let sql_init = matrix.sql_init()?;
-    let db = build_facts_db_with_init(&facts, &context, sql_init.as_deref())?;
-    execute_readonly_sql(&db, &query_text(args.sql, args.file, "SQL query")?)
+    let db = build_facts_db_with_init(&cached.facts, &context, sql_init.as_deref())?;
+    let result = execute_readonly_sql(&db, &query_text(args.sql, args.file, "SQL query")?)?;
+    Ok(with_cache_summary(result, &cached.cache))
 }
 
 #[derive(Clone, Copy)]
@@ -1875,12 +2012,13 @@ enum FactView {
 }
 
 async fn fact_view_query(matrix: &Matrix, args: FactQueryArgs, view: FactView) -> Result<Value> {
-    let facts = fetch_facts(matrix, args.max_facts).await?;
+    let cached = load_facts(matrix, args.max_facts, (&args.cache).into()).await?;
     let context = MatrixContext::detect(args.context);
     let sql_init = matrix.sql_init()?;
-    let db = build_facts_db_with_init(&facts, &context, sql_init.as_deref())?;
+    let db = build_facts_db_with_init(&cached.facts, &context, sql_init.as_deref())?;
     let sql = fact_view_sql(&args.fact_id, view);
-    execute_readonly_sql(&db, &sql)
+    let result = execute_readonly_sql(&db, &sql)?;
+    Ok(with_cache_summary(result, &cached.cache))
 }
 
 fn fact_view_sql(fact_id: &str, view: FactView) -> String {
@@ -1912,9 +2050,10 @@ enum ContextView {
 async fn list_components_query(matrix: &Matrix, args: ListQueryArgs) -> Result<Value> {
     let options = args.component_options();
     let context = MatrixContext::detect_browsing(args.context);
-    let db = query_db(matrix, args.max_facts, &context).await?;
+    let (db, cache) = query_db(matrix, args.max_facts, &context, (&args.cache).into()).await?;
     let sql = components_query_sql(&db, &context, options, args.limit);
-    execute_readonly_sql(&db, &sql)
+    let result = execute_readonly_sql(&db, &sql)?;
+    Ok(with_cache_summary(result, &cache))
 }
 
 async fn list_versions_query(matrix: &Matrix, args: VersionQueryArgs) -> Result<Value> {
@@ -1930,13 +2069,14 @@ async fn list_versions_query(matrix: &Matrix, args: VersionQueryArgs) -> Result<
                 right: component,
                 max_facts: args.max_facts,
                 limit: args.limit,
+                cache: args.cache.clone(),
             },
         )
         .await;
     }
     let options = args.component_options();
     let context = MatrixContext::detect_browsing(args.context);
-    let db = query_db(matrix, args.max_facts, &context).await?;
+    let (db, cache) = query_db(matrix, args.max_facts, &context, (&args.cache).into()).await?;
     let sql = versions_query_sql(
         &db,
         &context,
@@ -1944,14 +2084,16 @@ async fn list_versions_query(matrix: &Matrix, args: VersionQueryArgs) -> Result<
         options,
         args.limit,
     );
-    execute_readonly_sql(&db, &sql)
+    let result = execute_readonly_sql(&db, &sql)?;
+    Ok(with_cache_summary(result, &cache))
 }
 
 async fn list_tags_query(matrix: &Matrix, args: ListQueryArgs) -> Result<Value> {
     let context = MatrixContext::detect_browsing(args.context);
-    let db = query_db(matrix, args.max_facts, &context).await?;
+    let (db, cache) = query_db(matrix, args.max_facts, &context, (&args.cache).into()).await?;
     let sql = tags_query_sql(&db, &context, args.limit);
-    execute_readonly_sql(&db, &sql)
+    let result = execute_readonly_sql(&db, &sql)?;
+    Ok(with_cache_summary(result, &cache))
 }
 
 async fn context_view_query(
@@ -1960,16 +2102,18 @@ async fn context_view_query(
     view: ContextView,
 ) -> Result<Value> {
     let context = MatrixContext::detect_browsing(args.context);
-    let db = query_db(matrix, args.max_facts, &context).await?;
+    let (db, cache) = query_db(matrix, args.max_facts, &context, (&args.cache).into()).await?;
     let sql = context_view_sql(view, args.limit);
-    execute_readonly_sql(&db, &sql)
+    let result = execute_readonly_sql(&db, &sql)?;
+    Ok(with_cache_summary(result, &cache))
 }
 
 async fn compare_query(matrix: &Matrix, args: CompareArgs) -> Result<Value> {
     let context = MatrixContext::detect(args.context);
-    let db = query_db(matrix, args.max_facts, &context).await?;
+    let (db, cache) = query_db(matrix, args.max_facts, &context, (&args.cache).into()).await?;
     let sql = compare_query_sql(&args.target, args.target_version.as_deref(), args.limit);
-    execute_readonly_sql(&db, &sql)
+    let result = execute_readonly_sql(&db, &sql)?;
+    Ok(with_cache_summary(result, &cache))
 }
 
 async fn compatible_command(matrix: &Matrix, args: CompatibleArgs) -> Result<Value> {
@@ -1982,6 +2126,7 @@ async fn compatible_command(matrix: &Matrix, args: CompatibleArgs) -> Result<Val
                     right,
                     max_facts: args.max_facts,
                     limit: args.limit.clamp(1, 25),
+                    cache: args.cache.clone(),
                 },
             )
             .await
@@ -1994,17 +2139,21 @@ async fn compatible_command(matrix: &Matrix, args: CompatibleArgs) -> Result<Val
 }
 
 async fn graph_path_command(matrix: &Matrix, args: GraphPathArgs) -> Result<Value> {
-    let graph = load_graph(matrix, args.max_facts).await?;
-    graph.path_answer(&args.source, &args.target, args.limit.max(1))
+    let (graph, cache) = load_graph(matrix, args.max_facts, (&args.cache).into()).await?;
+    graph
+        .path_answer(&args.source, &args.target, args.limit.max(1))
+        .map(|value| with_cache_summary(value, &cache))
 }
 
 async fn works_with_command(matrix: &Matrix, args: GraphPairArgs) -> Result<Value> {
-    let graph = load_graph(matrix, args.max_facts).await?;
-    graph.works_with_answer(&args.left, &args.right, args.limit.max(1))
+    let (graph, cache) = load_graph(matrix, args.max_facts, (&args.cache).into()).await?;
+    graph
+        .works_with_answer(&args.left, &args.right, args.limit.max(1))
+        .map(|value| with_cache_summary(value, &cache))
 }
 
 async fn graph_why_command(matrix: &Matrix, args: GraphPairArgs) -> Result<Value> {
-    let graph = load_graph(matrix, args.max_facts).await?;
+    let (graph, cache) = load_graph(matrix, args.max_facts, (&args.cache).into()).await?;
     let mut answer = graph.works_with_answer(&args.left, &args.right, args.limit.max(1))?;
     if let Some(object) = answer.as_object_mut() {
         object.insert("kind".to_string(), json!("graph-why"));
@@ -2013,27 +2162,40 @@ async fn graph_why_command(matrix: &Matrix, args: GraphPairArgs) -> Result<Value
             json!("Evidence is carried on each path edge; missing paths mean Matrix lacks a connecting fact chain, not necessarily real-world incompatibility."),
         );
     }
-    Ok(answer)
+    Ok(with_cache_summary(answer, &cache))
 }
 
 async fn graph_status_command(matrix: &Matrix, args: GraphStatusArgs) -> Result<Value> {
-    let graph = load_graph(matrix, args.max_facts).await?;
-    graph.status_answer(&args.component, args.limit.max(1))
+    let (graph, cache) = load_graph(matrix, args.max_facts, (&args.cache).into()).await?;
+    graph
+        .status_answer(&args.component, args.limit.max(1))
+        .map(|value| with_cache_summary(value, &cache))
 }
 
 async fn graph_resolve_command(matrix: &Matrix, args: GraphResolveArgs) -> Result<Value> {
-    let graph = load_graph(matrix, args.max_facts).await?;
-    graph.resolve_answer(&args.component)
+    let (graph, cache) = load_graph(matrix, args.max_facts, (&args.cache).into()).await?;
+    graph
+        .resolve_answer(&args.component)
+        .map(|value| with_cache_summary(value, &cache))
 }
 
 async fn graph_versions_for_command(matrix: &Matrix, args: GraphPairArgs) -> Result<Value> {
-    let graph = load_graph(matrix, args.max_facts).await?;
-    graph.versions_for_answer(&args.right, &args.left, args.limit.max(1))
+    let (graph, cache) = load_graph(matrix, args.max_facts, (&args.cache).into()).await?;
+    graph
+        .versions_for_answer(&args.right, &args.left, args.limit.max(1))
+        .map(|value| with_cache_summary(value, &cache))
 }
 
 async fn graph_query_command(matrix: &Matrix, args: GraphQueryArgs) -> Result<Value> {
     let query = query_text(args.query, args.file, "graph query")?;
-    graph_query_value(matrix, &query, args.max_facts, args.limit).await
+    graph_query_value(
+        matrix,
+        &query,
+        args.max_facts,
+        args.limit,
+        (&args.cache).into(),
+    )
+    .await
 }
 
 async fn graph_query_value(
@@ -2041,9 +2203,12 @@ async fn graph_query_value(
     query: &str,
     max_facts: usize,
     limit: usize,
+    options: FactLoadOptions,
 ) -> Result<Value> {
-    let graph = load_graph(matrix, max_facts).await?;
-    graph.execute_request(parse_graph_query(query)?, limit.max(1))
+    let (graph, cache) = load_graph(matrix, max_facts, options).await?;
+    graph
+        .execute_request(parse_graph_query(query)?, limit.max(1))
+        .map(|value| with_cache_summary(value, &cache))
 }
 
 fn query_text(inline: Option<String>, file: Option<PathBuf>, label: &str) -> Result<String> {
@@ -2068,15 +2233,21 @@ async fn query_db(
     matrix: &Matrix,
     max_facts: usize,
     context: &MatrixContext,
-) -> Result<Connection> {
-    let facts = fetch_facts(matrix, max_facts).await?;
+    options: FactLoadOptions,
+) -> Result<(Connection, FactCacheSummary)> {
+    let cached = load_facts(matrix, max_facts, options).await?;
     let sql_init = matrix.sql_init()?;
-    build_facts_db_with_init(&facts, context, sql_init.as_deref())
+    let db = build_facts_db_with_init(&cached.facts, context, sql_init.as_deref())?;
+    Ok((db, cached.cache))
 }
 
-async fn load_graph(matrix: &Matrix, max_facts: usize) -> Result<GraphIndex> {
-    let db = query_db(matrix, max_facts, &MatrixContext::default()).await?;
-    GraphIndex::from_db(&db)
+async fn load_graph(
+    matrix: &Matrix,
+    max_facts: usize,
+    options: FactLoadOptions,
+) -> Result<(GraphIndex, FactCacheSummary)> {
+    let (db, cache) = query_db(matrix, max_facts, &MatrixContext::default(), options).await?;
+    Ok((GraphIndex::from_db(&db)?, cache))
 }
 
 #[derive(Clone, Debug)]
@@ -2841,7 +3012,17 @@ impl CompatibleArgs {
             type_filter: self.type_filter.clone(),
             include_applications: self.include_applications,
             include_dependencies: self.include_dependencies,
+            cache: self.cache.clone(),
             context: self.context.clone(),
+        }
+    }
+}
+
+impl From<&FactCacheArgs> for FactLoadOptions {
+    fn from(args: &FactCacheArgs) -> Self {
+        Self {
+            offline: args.offline,
+            refresh_cache: args.refresh_cache,
         }
     }
 }
@@ -3165,6 +3346,7 @@ struct ReplSession<'a> {
     facts: Vec<Value>,
     choices: Vec<ContextChoice>,
     db: Connection,
+    cache: FactCacheSummary,
     max_facts: usize,
     fact_count: usize,
     output_mode: OutputMode,
@@ -3177,16 +3359,17 @@ struct ReplSession<'a> {
 impl<'a> ReplSession<'a> {
     async fn new(matrix: &'a Matrix, context: MatrixContext) -> Result<Self> {
         let max_facts = 1000;
-        let facts = fetch_facts(matrix, max_facts).await?;
-        let fact_count = facts.len();
+        let cached = load_facts(matrix, max_facts, FactLoadOptions::default()).await?;
+        let fact_count = cached.facts.len();
         let sql_init = matrix.sql_init()?;
         Ok(Self {
             matrix,
-            db: build_facts_db_with_init(&facts, &context, sql_init.as_deref())?,
+            db: build_facts_db_with_init(&cached.facts, &context, sql_init.as_deref())?,
             context,
             sql_init,
-            facts,
+            facts: cached.facts,
             choices: Vec::new(),
+            cache: cached.cache,
             max_facts,
             fact_count,
             output_mode: match matrix.output {
@@ -3203,9 +3386,14 @@ impl<'a> ReplSession<'a> {
     }
 
     async fn refresh(&mut self) -> Result<()> {
-        let facts = fetch_facts(self.matrix, self.max_facts).await?;
-        self.fact_count = facts.len();
-        self.facts = facts;
+        self.reload(FactLoadOptions::default()).await
+    }
+
+    async fn reload(&mut self, options: FactLoadOptions) -> Result<()> {
+        let cached = load_facts(self.matrix, self.max_facts, options).await?;
+        self.fact_count = cached.facts.len();
+        self.facts = cached.facts;
+        self.cache = cached.cache;
         self.db = build_facts_db_with_init(&self.facts, &self.context, self.sql_init.as_deref())?;
         self.last_refresh = SystemTime::now();
         Ok(())
@@ -3579,6 +3767,14 @@ impl<'a> ReplSession<'a> {
                 self.refresh().await?;
                 eprintln!("Refreshed {} facts.", self.fact_count);
             }
+            "offline" => {
+                self.reload(FactLoadOptions {
+                    offline: true,
+                    refresh_cache: false,
+                })
+                .await?;
+                eprintln!("Loaded {} cached facts.", self.fact_count);
+            }
             "zones" => self.run_sql("select * from zones order by zone")?,
             "subjects" => self.run_sql("select * from subjects order by subject_name")?,
             "trace" => {
@@ -3638,6 +3834,7 @@ impl<'a> ReplSession<'a> {
             "expanded": self.expanded,
             "timing": self.timing,
             "refreshed": refreshed,
+            "cache": self.cache.to_value(),
         });
         print_value(&value, self.matrix.output)
     }
@@ -4819,6 +5016,7 @@ Matrix shell commands
   .timing                   Toggle query timing
   .limit <n>                Set fact fetch limit and refresh cache
   .refresh                  Reload facts from the construct
+  .offline                  Reload facts from the local persistent cache
   .context                  Show active context
   .context <field> <value>  Set zone, repo, component, version, tag, sha, or ref
   .context set <field> ...  Same as `.context <field> <value>`
@@ -4956,6 +5154,7 @@ impl MatrixCompleter {
             ".limit",
             ".members",
             ".mode",
+            ".offline",
             ".path",
             ".read",
             ".refresh",
@@ -5258,6 +5457,212 @@ async fn fetch_facts(matrix: &Matrix, max_facts: usize) -> Result<Vec<Value>> {
     Ok(facts)
 }
 
+async fn load_facts(
+    matrix: &Matrix,
+    max_facts: usize,
+    options: FactLoadOptions,
+) -> Result<CachedFacts> {
+    if options.offline && options.refresh_cache {
+        bail!("--offline cannot be combined with --refresh-cache");
+    }
+    if options.offline {
+        return read_cached_facts(matrix, max_facts);
+    }
+
+    let facts = fetch_facts(matrix, max_facts).await?;
+    let cache = write_fact_cache(matrix, facts.clone(), max_facts)?;
+    Ok(CachedFacts { facts, cache })
+}
+
+fn read_cached_facts(matrix: &Matrix, max_facts: usize) -> Result<CachedFacts> {
+    let path = fact_cache_path(matrix)?;
+    let cache = read_fact_cache_file(&path).with_context(|| {
+        format!(
+            "no usable Matrix fact cache for this construct/profile; run `matrix sync --max-facts {max_facts}`"
+        )
+    })?;
+    let mut facts = cache.facts;
+    if facts.len() > max_facts {
+        facts.truncate(max_facts);
+    }
+    let summary = FactCacheSummary::from_metadata(FactCacheSource::Cache, path, cache.metadata);
+    Ok(CachedFacts {
+        facts,
+        cache: summary,
+    })
+}
+
+fn write_fact_cache(
+    matrix: &Matrix,
+    facts: Vec<Value>,
+    max_facts: usize,
+) -> Result<FactCacheSummary> {
+    let path = fact_cache_path(matrix)?;
+    let metadata = FactCacheMetadata {
+        construct: matrix.construct.clone(),
+        api_prefix: matrix.api_prefix.clone(),
+        profile: matrix.profile,
+        fetched_at_unix: unix_now()?,
+        fact_count: facts.len(),
+        max_facts,
+    };
+    let cache = FactCacheFile {
+        version: 1,
+        metadata: metadata.clone(),
+        facts,
+    };
+    write_fact_cache_file(&path, &cache)?;
+    Ok(FactCacheSummary::from_metadata(
+        FactCacheSource::Live,
+        path,
+        metadata,
+    ))
+}
+
+fn read_fact_cache_file(path: &Path) -> Result<FactCacheFile> {
+    let cache: FactCacheFile = serde_json::from_slice(&fs::read(path)?)
+        .with_context(|| format!("failed to parse Matrix fact cache {}", path.display()))?;
+    if cache.version != 1 {
+        bail!(
+            "unsupported Matrix fact cache version {} in {}",
+            cache.version,
+            path.display()
+        );
+    }
+    Ok(cache)
+}
+
+fn write_fact_cache_file(path: &Path, cache: &FactCacheFile) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_vec_pretty(cache)?)?;
+    Ok(())
+}
+
+fn fact_cache_status(matrix: &Matrix) -> Result<Value> {
+    let path = fact_cache_path(matrix)?;
+    let summary = match read_fact_cache_file(&path) {
+        Ok(cache) => FactCacheSummary::from_metadata(FactCacheSource::Cache, path, cache.metadata),
+        Err(_) => FactCacheSummary {
+            source: FactCacheSource::Missing,
+            path,
+            metadata: None,
+            age_seconds: None,
+            stale: false,
+        },
+    };
+    Ok(summary.to_value())
+}
+
+fn clear_fact_cache(matrix: &Matrix, all: bool) -> Result<Value> {
+    let root = fact_cache_dir()?;
+    let mut removed = 0usize;
+    if all {
+        if root.exists() {
+            for entry in fs::read_dir(&root)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.extension().and_then(|value| value.to_str()) == Some("json") {
+                    fs::remove_file(&path)?;
+                    removed += 1;
+                }
+            }
+        }
+    } else {
+        let path = fact_cache_path(matrix)?;
+        if path.exists() {
+            fs::remove_file(&path)?;
+            removed = 1;
+        }
+    }
+    Ok(json!({
+        "kind": "fact-cache-clear",
+        "removed": removed,
+        "path": if all { Value::Null } else { json!(fact_cache_path(matrix)?.display().to_string()) },
+        "all": all,
+    }))
+}
+
+fn fact_cache_dir() -> Result<PathBuf> {
+    Ok(cache_root()?.join("facts"))
+}
+
+fn fact_cache_path(matrix: &Matrix) -> Result<PathBuf> {
+    Ok(fact_cache_dir()?.join(format!("{}.json", fact_cache_key(matrix))))
+}
+
+fn fact_cache_key(matrix: &Matrix) -> String {
+    let mut hasher = DefaultHasher::new();
+    matrix.profile.map(ConfigProfile::as_str).hash(&mut hasher);
+    matrix.construct.hash(&mut hasher);
+    matrix.api_prefix.hash(&mut hasher);
+    let prefix = matrix
+        .profile
+        .map(|profile| format!("profile-{}", profile.as_str()))
+        .unwrap_or_else(|| "custom".to_string());
+    format!("{prefix}-{:016x}", hasher.finish())
+}
+
+fn unix_now() -> Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before UNIX epoch")?
+        .as_secs())
+}
+
+fn unix_age_seconds(fetched_at_unix: u64) -> Option<u64> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    Some(now.saturating_sub(fetched_at_unix))
+}
+
+fn with_cache_summary(mut value: Value, cache: &FactCacheSummary) -> Value {
+    if let Some(object) = value.as_object_mut() {
+        object.insert("cache".to_string(), cache.to_value());
+    }
+    value
+}
+
+impl FactCacheSummary {
+    fn from_metadata(source: FactCacheSource, path: PathBuf, metadata: FactCacheMetadata) -> Self {
+        let age_seconds = unix_age_seconds(metadata.fetched_at_unix);
+        Self {
+            source,
+            path,
+            metadata: Some(metadata),
+            age_seconds,
+            stale: age_seconds.is_some_and(|age| age > FACT_CACHE_STALE_AFTER.as_secs()),
+        }
+    }
+
+    fn to_value(&self) -> Value {
+        let metadata = self.metadata.as_ref();
+        json!({
+            "source": self.source.as_str(),
+            "path": self.path.display().to_string(),
+            "exists": self.source != FactCacheSource::Missing,
+            "construct": metadata.and_then(|value| value.construct.clone()),
+            "apiPrefix": metadata.map(|value| value.api_prefix.clone()),
+            "profile": metadata.and_then(|value| value.profile.map(ConfigProfile::as_str)),
+            "fetchedAtUnix": metadata.map(|value| value.fetched_at_unix),
+            "ageSeconds": self.age_seconds,
+            "stale": self.stale,
+            "factCount": metadata.map(|value| value.fact_count),
+            "maxFacts": metadata.map(|value| value.max_facts),
+        })
+    }
+}
+
+impl FactCacheSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Cache => "cache",
+            Self::Missing => "missing",
+        }
+    }
+}
+
 fn page_values(body: &Value, primary_key: &str) -> Vec<Value> {
     body.get(primary_key)
         .or_else(|| body.get("items"))
@@ -5382,20 +5787,20 @@ fn print_value(value: &Value, output: OutputFormat) -> Result<()> {
 }
 
 fn print_json(value: &Value) -> Result<()> {
-    let output = if is_query_result(value) {
+    let output = if is_query_result(value) && value.get("cache").is_none() {
         query_rows(value)
     } else {
-        value.clone()
+        normalize_query_result_value(value)
     };
     println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())
 }
 
 fn print_yaml(value: &Value) -> Result<()> {
-    let output = if is_query_result(value) {
+    let output = if is_query_result(value) && value.get("cache").is_none() {
         query_rows(value)
     } else {
-        value.clone()
+        normalize_query_result_value(value)
     };
     print!("{}", serde_yaml::to_string(&output)?);
     Ok(())
@@ -5416,6 +5821,15 @@ fn query_rows(value: &Value) -> Value {
             .map(normalize_structured_value)
             .collect(),
     )
+}
+
+fn normalize_query_result_value(value: &Value) -> Value {
+    if !is_query_result(value) {
+        return value.clone();
+    }
+    let mut object = value.as_object().cloned().unwrap_or_default();
+    object.insert("rows".to_string(), query_rows(value));
+    Value::Object(object)
 }
 
 fn normalize_structured_value(value: Value) -> Value {
@@ -5469,7 +5883,11 @@ fn human_query_result_text(value: &Value) -> String {
     let rows = query_rows(value).as_array().cloned().unwrap_or_default();
 
     if rows.is_empty() {
-        return "No rows.\nTry `matrix components`, `matrix versions`, or `matrix query 'select * from context'` to inspect the active context.\n".to_string();
+        let mut text = "No rows.\nTry `matrix components`, `matrix versions`, or `matrix query 'select * from context'` to inspect the active context.\n".to_string();
+        if let Some(cache) = value.get("cache").and_then(Value::as_object) {
+            text.push_str(&cache_human_line(cache));
+        }
+        return text;
     }
 
     let mut text = format!(
@@ -5497,6 +5915,9 @@ fn human_query_result_text(value: &Value) -> String {
                 human_inline_value(value)
             ));
         }
+    }
+    if let Some(cache) = value.get("cache").and_then(Value::as_object) {
+        text.push_str(&cache_human_line(cache));
     }
     text
 }
@@ -5570,6 +5991,14 @@ fn print_human_object(object: &serde_json::Map<String, Value>) {
         print!("{}", graph_answer_human_text(object));
         return;
     }
+    if object
+        .get("kind")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.starts_with("fact-cache-"))
+    {
+        print_cache_command_human(object);
+        return;
+    }
     if let Some(saved) = object.get("saved").and_then(Value::as_str) {
         println!("Saved {saved}");
         return;
@@ -5633,8 +6062,46 @@ fn print_fact_get_human(object: &serde_json::Map<String, Value>) {
     print!("{}", fact_get_human_text(object));
 }
 
-fn graph_answer_human_text(object: &serde_json::Map<String, Value>) -> String {
+fn print_cache_command_human(object: &serde_json::Map<String, Value>) {
     match object.get("kind").and_then(Value::as_str) {
+        Some("fact-cache-clear") => {
+            let removed = object.get("removed").and_then(Value::as_u64).unwrap_or(0);
+            println!(
+                "Removed {removed} cache file{}.",
+                if removed == 1 { "" } else { "s" }
+            );
+        }
+        Some("fact-cache-sync") | Some("fact-cache-status") => {
+            println!("Matrix fact cache");
+            if let Some(cache) = object.get("cache").and_then(Value::as_object) {
+                for key in [
+                    "source",
+                    "exists",
+                    "profile",
+                    "construct",
+                    "apiPrefix",
+                    "factCount",
+                    "maxFacts",
+                    "ageSeconds",
+                    "stale",
+                    "path",
+                ] {
+                    if let Some(value) = cache.get(key) {
+                        println!("{}: {}", human_label(key), human_inline_value(value));
+                    }
+                }
+            }
+        }
+        _ => {
+            for (key, value) in object {
+                println!("{}: {}", human_label(key), human_inline_value(value));
+            }
+        }
+    }
+}
+
+fn graph_answer_human_text(object: &serde_json::Map<String, Value>) -> String {
+    let mut text = match object.get("kind").and_then(Value::as_str) {
         Some("graph-path") => graph_path_human_text(object, "Path"),
         Some("graph-works-with") => graph_path_human_text(object, "Works with"),
         Some("graph-why") => graph_path_human_text(object, "Why"),
@@ -5652,7 +6119,33 @@ fn graph_answer_human_text(object: &serde_json::Map<String, Value>) -> String {
             }
             text
         }
+    };
+    if let Some(cache) = object.get("cache").and_then(Value::as_object) {
+        text.push_str(&cache_human_line(cache));
     }
+    text
+}
+
+fn cache_human_line(cache: &serde_json::Map<String, Value>) -> String {
+    let source = cache
+        .get("source")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let facts = cache
+        .get("factCount")
+        .and_then(Value::as_u64)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let age = cache
+        .get("ageSeconds")
+        .and_then(Value::as_u64)
+        .map(|value| format!("{value}s old"))
+        .unwrap_or_else(|| "age unknown".to_string());
+    let stale = cache.get("stale").and_then(Value::as_bool).unwrap_or(false);
+    format!(
+        "Cache: {source}, {facts} facts, {age}{}\n",
+        if stale { ", stale" } else { "" }
+    )
 }
 
 fn graph_path_human_text(object: &serde_json::Map<String, Value>, title: &str) -> String {
@@ -6254,6 +6747,68 @@ mod tests {
     }
 
     #[test]
+    fn accepts_fact_cache_commands_and_offline_flags() {
+        let sync = Cli::try_parse_from(["matrix", "sync", "--max-facts", "250"]).unwrap();
+        match sync.command {
+            Commands::Sync(args) => assert_eq!(args.max_facts, 250),
+            _ => panic!("expected sync command"),
+        }
+
+        let status = Cli::try_parse_from(["matrix", "cache", "status"]).unwrap();
+        match status.command {
+            Commands::Cache(CacheCommand {
+                command: CacheSubcommand::Status,
+            }) => {}
+            _ => panic!("expected cache status command"),
+        }
+
+        let clear = Cli::try_parse_from(["matrix", "cache", "clear", "--all"]).unwrap();
+        match clear.command {
+            Commands::Cache(CacheCommand {
+                command: CacheSubcommand::Clear { all },
+            }) => assert!(all),
+            _ => panic!("expected cache clear command"),
+        }
+
+        let query = Cli::try_parse_from([
+            "matrix",
+            "query",
+            "select * from facts",
+            "--offline",
+            "--refresh-cache",
+        ])
+        .unwrap();
+        match query.command {
+            Commands::Query(args) => {
+                assert!(args.cache.offline);
+                assert!(args.cache.refresh_cache);
+            }
+            _ => panic!("expected query command"),
+        }
+
+        let path =
+            Cli::try_parse_from(["matrix", "path", "aphrodite", "eunomia", "--offline"]).unwrap();
+        match path.command {
+            Commands::Path(args) => assert!(args.cache.offline),
+            _ => panic!("expected path command"),
+        }
+
+        let versions = Cli::try_parse_from([
+            "matrix",
+            "versions",
+            "eunomia",
+            "--for",
+            "aphrodite",
+            "--offline",
+        ])
+        .unwrap();
+        match versions.command {
+            Commands::Versions(args) => assert!(args.cache.offline),
+            _ => panic!("expected versions command"),
+        }
+    }
+
+    #[test]
     fn accepts_fact_view_commands() {
         let members = Cli::try_parse_from([
             "matrix",
@@ -6801,6 +7356,41 @@ mod tests {
             page_values(&json!({"items": [{"id": "item-1"}]}), "facts")[0]["id"],
             "item-1"
         );
+    }
+
+    #[test]
+    fn fact_cache_round_trips_metadata_and_facts() {
+        let path = env::temp_dir().join(format!("matrix-cache-test-{}.json", process::id()));
+        let cache = FactCacheFile {
+            version: 1,
+            metadata: FactCacheMetadata {
+                construct: Some("https://matrix.example.test".to_string()),
+                api_prefix: "/v1/compatibility".to_string(),
+                profile: Some(ConfigProfile::RedWiz),
+                fetched_at_unix: unix_now().unwrap(),
+                fact_count: 1,
+                max_facts: 1000,
+            },
+            facts: vec![json!({"id": "fact-1", "zone": "runtime"})],
+        };
+        write_fact_cache_file(&path, &cache).unwrap();
+        let read = read_fact_cache_file(&path).unwrap();
+        let _ = fs::remove_file(&path);
+        assert_eq!(read.version, 1);
+        assert_eq!(read.metadata.profile, Some(ConfigProfile::RedWiz));
+        assert_eq!(read.facts[0]["id"], "fact-1");
+    }
+
+    #[test]
+    fn query_json_keeps_cache_metadata_when_present() {
+        let value = json!({
+            "columns": ["id"],
+            "rows": [{"id": "fact-1"}],
+            "cache": {"source": "cache", "factCount": 1}
+        });
+        let normalized = normalize_query_result_value(&value);
+        assert_eq!(normalized["rows"][0]["id"], "fact-1");
+        assert_eq!(normalized["cache"]["source"], "cache");
     }
 
     #[test]
