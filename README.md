@@ -142,9 +142,13 @@ matrix query 'select id, zone, status from facts limit 20' --offline
 matrix path aphrodite eunomia --offline
 ```
 
-Online local SQL and graph commands refresh the cache after fetching facts.
-`--offline` opens the cached SQLite database directly, and `matrix cache clear`
-removes the active construct/profile cache file.
+By default, local SQL and graph commands use `cache-policy=auto`: a fresh cache
+hit opens the SQLite database immediately, while a miss, stale cache, or
+too-small cache refreshes from the construct. `--offline` opens the cached
+SQLite database directly, `--refresh-cache` forces a refresh, and
+`matrix cache clear` removes the active construct/profile cache file. Configure
+defaults once with `matrix config set cache-policy auto` and
+`matrix config set cache-max-facts 10000`.
 
 Run a local construct:
 

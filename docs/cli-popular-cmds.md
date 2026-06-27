@@ -58,7 +58,10 @@ matrix graphql -f queries/aphrodite-path.graphql --offline -o json
 
 Use this when you are iterating on saved SQL/GraphQL files, demoing without a
 network dependency, or giving an agent a stable SQLite fact cache. Run
-`matrix sync` again when you want fresh facts.
+`matrix sync` again when you want fresh facts. Normal SQL and graph commands use
+fresh local cache hits automatically and refresh on miss or stale cache; force a
+network refresh with `--refresh-cache` or configure the default with
+`matrix config set cache-policy auto`.
 
 ## Work In A Repository
 

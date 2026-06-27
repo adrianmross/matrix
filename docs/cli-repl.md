@@ -23,9 +23,9 @@ version check.
 ## Session Basics
 
 SQL statements can span multiple lines and execute when they end with `;`. The
-REPL opens the local SQLite fact cache for the session, persists command
-history, offers tab completion, and uses light SQL highlighting when the
-terminal supports it.
+REPL follows the configured cache policy on startup, opens the SQLite fact cache
+for the session, persists command history, offers tab completion, and uses light
+SQL highlighting when the terminal supports it.
 
 ```text
 matrix> select id, zone, status from facts limit 10;
