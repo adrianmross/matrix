@@ -81,7 +81,10 @@ matrix trace --zone runtime --subject payments-api
 matrix path aphrodite eunomia
 matrix works-with putto aphrodite
 matrix versions eunomia --for aphrodite
+matrix resolve aphrodite
+matrix query -f queries/current-runtime.sql -o json
 matrix graphql '{ path(from:"aphrodite", to:"eunomia") { status paths { nodes { component version } } } }' -o json
+matrix graphql -f queries/aphrodite-path.graphql -o json
 matrix upload facts.json
 matrix query 'select id, zone, status, subject_name from facts limit 20'
 matrix history release-bundle.api.1.0.0
@@ -108,7 +111,9 @@ matrix works-with putto aphrodite
 matrix compatible aphrodite putto
 matrix versions eunomia --for aphrodite
 matrix why aphrodite eunomia
+matrix resolve aphrodite
 matrix graphql '{ path(from:"aphrodite", to:"eunomia") { status paths { nodes { component version } } } }' -o json
+matrix graphql -f queries/aphrodite-path.graphql -o json
 ```
 
 The `red-wiz` profile stores the hosted construct URL, the `/v1/compatibility`

@@ -82,6 +82,7 @@ matrix compatible aphrodite putto
 matrix versions eunomia --for aphrodite
 matrix why aphrodite eunomia
 matrix status aphrodite
+matrix resolve aphrodite
 ```
 
 Examples of the questions these answer:
@@ -98,6 +99,9 @@ matrix why aphrodite eunomia
 
 # What is connected to Aphrodite right now?
 matrix status aphrodite
+
+# What did Matrix actually match when I typed Aphrodite?
+matrix resolve aphrodite
 ```
 
 For agents and scripts, every command supports structured output:
@@ -116,6 +120,7 @@ like GraphQL, while Matrix still returns the standard JSON answer shape.
 matrix graphql '{ path(from:"aphrodite", to:"eunomia") { status paths { nodes { component version } } } }' -o json
 matrix graphql '{ worksWith(left:"putto", right:"aphrodite") { status paths { edges { capability } } } }' -o json
 matrix graphql '{ versions(component:"eunomia", for:"aphrodite") { versions } }' -o json
+matrix graphql -f queries/aphrodite-path.graphql -o json
 matrix graph 'aphrodite -> eunomia' -o json
 ```
 
@@ -150,6 +155,8 @@ tag, and SHA. Override that context when needed:
 ```bash
 matrix query --zone runtime --repo example/payments-api \
   'select * from zone where type==service and status!=failed'
+
+matrix query -f queries/current-runtime.sql -o json
 
 matrix enter --zone runtime --repo example/ledger-service
 ```
