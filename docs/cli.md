@@ -39,8 +39,11 @@ matrix doctor -o json
 That stores `https://platform-api.red-wiz.stream` with the `/v1/compatibility`
 API prefix, so the CLI talks to platform-api as the public construct while the
 internal compatibility-service and MySQL ledger stay behind it.
-It also configures a Wiz token command and clears saved Matrix token/token-file
-values so old bearer tokens do not override the profile handoff.
+It also configures `wiz auth token --audience platform-api --format json` as
+the credential command and clears saved Matrix token/token-file values so old
+bearer tokens do not override the profile handoff. `wiz tool setup matrix` is
+the beginner wrapper for setup and smoke guidance; Matrix stores the narrower
+credential command for per-request auth.
 
 For non-profile deployments, provide a bearer token with one of these sources:
 

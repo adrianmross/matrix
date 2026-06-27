@@ -188,12 +188,14 @@ Environment overrides:
 - `MATRIX_SQL_PACKS`, comma-separated SQL pack paths
 
 `matrix config use red-wiz` configures Matrix to call
-`wiz tool setup matrix --json --include-token` when it needs a bearer token.
+`wiz auth token --audience platform-api --format json` when it needs a bearer
+token.
 It also clears any saved Matrix `token` or `token-file` value so stale bearer
 tokens do not override the profile handoff.
 For other platforms, use `MATRIX_TOKEN`, `MATRIX_TOKEN_FILE`, or
 `MATRIX_TOKEN_COMMAND`. Token commands can print a raw token, JSON with an
-`access_token` field, or JSON containing a `MATRIX_TOKEN` environment entry.
+`access_token` field, or JSON with a `token`, `bearerToken`, or `bearer_token`
+field.
 
 Use `matrix doctor -o json` to inspect the active profile, construct URL, API
 prefix, redacted auth source, token-command health, and construct reachability.
