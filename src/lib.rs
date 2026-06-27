@@ -22,7 +22,7 @@ const MATRIX_HOMEBREW_FORMULA: &str = "adrianmross/tap/matrix";
 const MATRIX_LINUX_TARGET: &str = "x86_64-unknown-linux-gnu";
 const RED_WIZ_CONSTRUCT_URL: &str = "https://platform-api.red-wiz.stream";
 const RED_WIZ_API_PREFIX: &str = "/v1/compatibility";
-const RED_WIZ_TOKEN_COMMAND: &str = "wiz tool setup matrix --json --include-token";
+const RED_WIZ_TOKEN_COMMAND: &str = "wiz auth token --audience platform-api --format json";
 const UPDATE_CHECK_TTL: Duration = Duration::from_secs(60 * 60 * 24);
 
 #[cfg(feature = "interactive")]
@@ -938,7 +938,7 @@ fn token_from_command_stdout(command: &str, stdout: Vec<u8>) -> Result<Option<St
     if let Ok(value) = serde_json::from_str::<Value>(text) {
         return token_from_json_value(&value).map(Some).ok_or_else(|| {
             anyhow!(
-                "Matrix token command {command:?} emitted JSON without a token; expected access_token, token, bearerToken, or a MATRIX_TOKEN environment entry"
+                "Matrix token command {command:?} emitted JSON without a token; expected access_token, token, bearerToken, or bearer_token"
             )
         });
     }
@@ -955,21 +955,7 @@ fn token_from_json_value(value: &Value) -> Option<String> {
             return Some(token);
         }
     }
-    value
-        .get("environment")
-        .and_then(Value::as_array)
-        .and_then(|entries| {
-            entries.iter().find_map(|entry| {
-                let name = entry.get("name").and_then(Value::as_str)?;
-                if name != "MATRIX_TOKEN" {
-                    return None;
-                }
-                entry
-                    .get("value")
-                    .and_then(Value::as_str)
-                    .and_then(usable_token)
-            })
-        })
+    None
 }
 
 fn usable_token(value: &str) -> Option<String> {
@@ -5293,26 +5279,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(credential_process.as_deref(), Some("json-token"));
-
-        let wiz_setup = token_from_command_stdout(
-            RED_WIZ_TOKEN_COMMAND,
-            br#"{
-              "environment": [
-                {"name":"MATRIX_CONSTRUCT_URL","value":"https://platform-api.red-wiz.stream"},
-                {"name":"MATRIX_TOKEN","secret":true,"value":"wiz-token"}
-              ]
-            }"#
-            .to_vec(),
-        )
-        .unwrap();
-        assert_eq!(wiz_setup.as_deref(), Some("wiz-token"));
     }
 
     #[test]
     fn rejects_json_token_command_without_a_real_token() {
         let err = token_from_command_stdout(
             RED_WIZ_TOKEN_COMMAND,
-            br#"{"environment":[{"name":"MATRIX_TOKEN","placeholder":true,"value":"<token>"}]}"#
+            br#"{"environment":[{"name":"MATRIX_TOKEN","secret":true,"value":"wiz-token"}]}"#
                 .to_vec(),
         )
         .unwrap_err();
