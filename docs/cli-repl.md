@@ -23,8 +23,9 @@ version check.
 ## Session Basics
 
 SQL statements can span multiple lines and execute when they end with `;`. The
-REPL keeps a local fact cache for the session, persists command history, offers
-tab completion, and uses light SQL highlighting when the terminal supports it.
+REPL opens the local SQLite fact cache for the session, persists command
+history, offers tab completion, and uses light SQL highlighting when the
+terminal supports it.
 
 ```text
 matrix> select id, zone, status from facts limit 10;
@@ -85,8 +86,8 @@ clears the current local session context.
 - `.timing`: toggle query timings.
 - `.limit <n>`: change the fact fetch limit and refresh the cache.
 - `.refresh`: reload facts from the construct.
-- `.offline`: reload facts from the local persistent cache without contacting
-  the construct.
+- `.offline`: reopen the local persistent SQLite cache without contacting the
+  construct.
 - `.context`: show the active zone, repo, component, version, tag, ref, and SHA.
 - `.context <field> <value>`: set `zone`, `repo`, `component`, `version`,
   `tag`, `sha`, or `ref` without leaving the REPL.
