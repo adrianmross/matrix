@@ -175,7 +175,6 @@ enum Commands {
     Status(GraphStatusArgs),
     Resolve(GraphResolveArgs),
     Why(GraphPairArgs),
-    Ask(GraphAskArgs),
     #[command(alias = "coverage")]
     Producers(ProducerInventoryArgs),
     #[command(alias = "graphql")]
@@ -478,18 +477,6 @@ struct GraphPathArgs {
 struct GraphPairArgs {
     left: String,
     right: String,
-    #[arg(long)]
-    max_facts: Option<usize>,
-    #[arg(long, default_value_t = 5)]
-    limit: usize,
-    #[command(flatten)]
-    cache: FactCacheArgs,
-}
-
-#[derive(Args, Clone)]
-struct GraphAskArgs {
-    #[arg(value_name = "QUESTION", required = true, num_args = 1..)]
-    question: Vec<String>,
     #[arg(long)]
     max_facts: Option<usize>,
     #[arg(long, default_value_t = 5)]
@@ -862,7 +849,6 @@ pub async fn run_cli() -> Result<()> {
         Commands::Status(args) => graph_status_command(&matrix, args).await?,
         Commands::Resolve(args) => graph_resolve_command(&matrix, args).await?,
         Commands::Why(args) => graph_why_command(&matrix, args).await?,
-        Commands::Ask(args) => graph_ask_command(&matrix, args).await?,
         Commands::Producers(args) => producer_inventory_command(&matrix, args).await?,
         Commands::Graph(args) => graph_query_command(&matrix, args).await?,
         Commands::Artifacts(args) => list_artifacts(&matrix, args).await?,
@@ -2337,13 +2323,6 @@ async fn graph_why_command(matrix: &Matrix, args: GraphPairArgs) -> Result<Value
     Ok(with_cache_summary(answer, &cache))
 }
 
-async fn graph_ask_command(matrix: &Matrix, args: GraphAskArgs) -> Result<Value> {
-    let (graph, cache) = load_graph(matrix, args.max_facts, &args.cache).await?;
-    graph
-        .ask_answer(&args.question.join(" "), args.limit.max(1))
-        .map(|value| with_cache_summary(value, &cache))
-}
-
 async fn producer_inventory_command(matrix: &Matrix, args: ProducerInventoryArgs) -> Result<Value> {
     let context = MatrixContext::detect_browsing(args.context);
     let (db, cache) = query_db(matrix, args.max_facts, &context, &args.cache).await?;
@@ -3071,103 +3050,6 @@ impl GraphIndex {
             "versions": versions,
             "versionCandidates": candidates.into_iter().take(limit).collect::<Vec<_>>(),
         }))
-    }
-
-    fn ask_answer(&self, question: &str, limit: usize) -> Result<Value> {
-        let mentions = self.mentioned_components(question);
-        let lower = question.to_ascii_lowercase();
-        let (interpreted_as, answer) = if mentions.len() >= 2
-            && (lower.contains("version")
-                || lower.contains("which ")
-                || lower.contains("what ")
-                || lower.contains("using"))
-        {
-            (
-                json!({
-                    "request": "versions",
-                    "component": mentions[0].1.component,
-                    "for": mentions[1].1.component,
-                }),
-                self.versions_for_answer(
-                    &mentions[0].1.component,
-                    &mentions[1].1.component,
-                    limit,
-                )?,
-            )
-        } else if mentions.len() >= 2
-            && (lower.contains("work") || lower.contains("compatible") || lower.contains("why"))
-        {
-            (
-                json!({
-                    "request": "worksWith",
-                    "left": mentions[0].1.component,
-                    "right": mentions[1].1.component,
-                }),
-                self.works_with_answer(&mentions[0].1.component, &mentions[1].1.component, limit)?,
-            )
-        } else if mentions.len() >= 2 {
-            (
-                json!({
-                    "request": "path",
-                    "source": mentions[0].1.component,
-                    "target": mentions[1].1.component,
-                }),
-                self.path_answer(&mentions[0].1.component, &mentions[1].1.component, limit)?,
-            )
-        } else if let Some((_, node)) = mentions.first() {
-            (
-                json!({
-                    "request": "status",
-                    "component": node.component,
-                }),
-                self.status_answer(&node.component, limit)?,
-            )
-        } else {
-            bail!(
-                "could not find Matrix components in that question; try `matrix ask 'which putto works with aphrodite'` or `matrix resolve <name>`"
-            );
-        };
-        Ok(json!({
-            "kind": "graph-ask",
-            "question": question,
-            "interpretedAs": interpreted_as,
-            "mentions": mentions.into_iter().map(|(alias, node)| json!({
-                "alias": alias,
-                "node": self.node_value(&node.key, &alias),
-            })).collect::<Vec<_>>(),
-            "answer": answer,
-        }))
-    }
-
-    fn mentioned_components(&self, question: &str) -> Vec<(String, GraphNode)> {
-        let haystack = format!(" {} ", question.to_ascii_lowercase());
-        let mut matches: Vec<(usize, String, GraphNode)> = Vec::new();
-        let mut seen = BTreeSet::new();
-        for (alias, key) in &self.aliases {
-            let trimmed = alias.trim();
-            if trimmed.len() < 3 {
-                continue;
-            }
-            let needle = format!(" {} ", trimmed.to_ascii_lowercase());
-            let dashed = format!("{}-", trimmed.to_ascii_lowercase());
-            let position = haystack.find(&needle).or_else(|| haystack.find(&dashed));
-            if let Some(position) = position
-                && seen.insert(key.clone())
-                && let Some(node) = self.nodes.get(key)
-            {
-                matches.push((position, trimmed.to_string(), node.clone()));
-            }
-        }
-        matches.sort_by(|left, right| {
-            left.0
-                .cmp(&right.0)
-                .then_with(|| right.1.len().cmp(&left.1.len()))
-                .then_with(|| left.2.component.cmp(&right.2.component))
-        });
-        matches
-            .into_iter()
-            .map(|(_, alias, node)| (alias, node))
-            .collect()
     }
 
     fn best_directional_path(
@@ -4113,12 +3995,6 @@ impl<'a> ReplSession<'a> {
         self.print_value(&value)
     }
 
-    fn run_graph_ask(&self, question: &str, limit: usize) -> Result<()> {
-        let graph = self.graph()?;
-        let value = graph.ask_answer(question, limit.max(1))?;
-        self.print_value(&value)
-    }
-
     async fn handle_command(&mut self, raw: &str) -> Result<bool> {
         let command = raw.trim();
         let command = command
@@ -4262,14 +4138,6 @@ impl<'a> ReplSession<'a> {
                         self.print_value(&value)?;
                     }
                     _ => eprintln!("Usage: .why <component-a> <component-b>"),
-                }
-            }
-            "ask" => {
-                let question = parts.collect::<Vec<_>>().join(" ");
-                if question.is_empty() {
-                    eprintln!("Usage: .ask which putto works with aphrodite");
-                } else {
-                    self.run_graph_ask(&question, 5)?;
                 }
             }
             "resolve" => {
@@ -5686,7 +5554,6 @@ Matrix shell commands
   .path <from> <to>         Find an inferred compatibility path
   .works-with <a> <b>       Check whether two components connect
   .why <a> <b>              Explain pair compatibility
-  .ask <question>           Ask a beginner-friendly compatibility question
   .resolve <name>           Explain component/repo/package alias resolution
   .graph <query>            Run a GraphQL-style graph query
   .graph -f <file>          Run a saved graph query file
@@ -7082,7 +6949,6 @@ fn graph_answer_human_text(object: &serde_json::Map<String, Value>) -> String {
         Some("graph-status") => graph_status_human_text(object),
         Some("graph-versions-for") => graph_versions_human_text(object),
         Some("graph-resolve") => graph_resolve_human_text(object),
-        Some("graph-ask") => graph_ask_human_text(object),
         _ => {
             let mut text = String::new();
             for (key, value) in object {
@@ -7276,24 +7142,6 @@ fn graph_versions_human_text(object: &serde_json::Map<String, Value>) -> String 
                 text.push_str(&format!("- {}\n", human_inline_value(&version)));
             }
         }
-    }
-    text
-}
-
-fn graph_ask_human_text(object: &serde_json::Map<String, Value>) -> String {
-    let question = object
-        .get("question")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let mut text = format!("Ask: {question}\n");
-    if let Some(interpreted) = object.get("interpretedAs") {
-        text.push_str(&format!(
-            "Interpreted as: {}\n",
-            human_inline_value(interpreted)
-        ));
-    }
-    if let Some(answer) = object.get("answer").and_then(Value::as_object) {
-        text.push_str(&graph_answer_human_text(answer));
     }
     text
 }
@@ -9511,24 +9359,6 @@ mod tests {
                 .iter()
                 .any(|reason| reason == "inferred multi-hop path")
         );
-    }
-
-    #[test]
-    fn graph_ask_interprets_beginner_questions() {
-        let graph = graph_fixture();
-
-        let answer = graph
-            .ask_answer("which putto can work for aphrodite 1.2.0", 5)
-            .unwrap();
-        assert_eq!(answer["kind"], "graph-ask");
-        assert_eq!(answer["interpretedAs"]["request"], "versions");
-        assert_eq!(answer["answer"]["versions"], json!(["0.8.1"]));
-
-        let works = graph
-            .ask_answer("does aphrodite work with putto", 5)
-            .unwrap();
-        assert_eq!(works["interpretedAs"]["request"], "worksWith");
-        assert_eq!(works["answer"]["compatible"], true);
     }
 
     #[test]

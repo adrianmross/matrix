@@ -84,8 +84,6 @@ matrix why payments-api ledger-service
 Use these before writing SQL:
 
 ```bash
-matrix ask 'which putto can work for aphrodite'
-matrix ask 'what version of eunomia is aphrodite using'
 matrix path aphrodite eunomia
 matrix works-with putto aphrodite
 matrix versions eunomia --for aphrodite
