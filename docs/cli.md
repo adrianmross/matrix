@@ -174,10 +174,12 @@ json` reports the cache path, file size, age, and whether the database is older
 than Matrix's freshness hint.
 
 Local SQL and graph commands use `cache-policy=auto` by default: a fresh cache
-hit opens the SQLite database immediately, while a miss, stale cache, or
-too-small cache refreshes from the construct. Add `--offline` to open only the
-persisted SQLite database. Add `--refresh-cache` when you want the command
-invocation to make the refresh intent explicit.
+hit opens the SQLite database immediately, while a stale cache first asks the
+construct for a tiny facts digest. If the digest still matches, Matrix reuses
+the persisted SQLite database and updates the cache check time; a miss, changed
+digest, or too-small cache refreshes from the construct. Add `--offline` to
+open only the persisted SQLite database. Add `--refresh-cache` when you want the
+command invocation to make the refresh intent explicit.
 
 Cache defaults can be configured once per Matrix config:
 
@@ -188,14 +190,17 @@ matrix config set cache-max-facts 10000
 
 Supported cache policies are:
 
-- `auto`: use a fresh local cache hit, refresh on miss/stale/too-small cache.
+- `auto`: use a fresh local cache hit, validate stale caches with the remote
+  facts digest, and refresh on miss/change/too-small cache.
 - `prefer-cache`: use any sufficiently large local cache, even when stale.
 - `refresh`: always fetch fresh facts before answering.
 - `offline`: never contact the construct for SQL and graph commands.
 
 Human output warns when it uses a stale local cache and shows how long ago the
-cache was refreshed. JSON/YAML output includes `cache.fetchedAtUnix`,
-`cache.ageSeconds`, `cache.ageHuman`, and `cache.stale`.
+cache was refreshed and checked. JSON/YAML output includes
+`cache.fetchedAtUnix`, `cache.ageSeconds`, `cache.ageHuman`,
+`cache.checkedAtUnix`, `cache.checkedAgeSeconds`, `cache.checkedAgeHuman`,
+`cache.headDigest`, and `cache.stale`.
 
 ## Context Queries
 
