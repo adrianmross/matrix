@@ -175,6 +175,9 @@ enum Commands {
     Status(GraphStatusArgs),
     Resolve(GraphResolveArgs),
     Why(GraphPairArgs),
+    Ask(GraphAskArgs),
+    #[command(alias = "coverage")]
+    Producers(ProducerInventoryArgs),
     #[command(alias = "graphql")]
     Graph(GraphQueryArgs),
     Artifacts(ArtifactListArgs),
@@ -484,6 +487,32 @@ struct GraphPairArgs {
 }
 
 #[derive(Args, Clone)]
+struct GraphAskArgs {
+    #[arg(value_name = "QUESTION", required = true, num_args = 1..)]
+    question: Vec<String>,
+    #[arg(long)]
+    max_facts: Option<usize>,
+    #[arg(long, default_value_t = 5)]
+    limit: usize,
+    #[command(flatten)]
+    cache: FactCacheArgs,
+}
+
+#[derive(Args, Clone)]
+struct ProducerInventoryArgs {
+    #[arg(long)]
+    max_facts: Option<usize>,
+    #[arg(long, default_value_t = 50)]
+    limit: usize,
+    #[arg(long, default_value_t = 14)]
+    stale_days: i64,
+    #[command(flatten)]
+    cache: FactCacheArgs,
+    #[command(flatten)]
+    context: ContextArgs,
+}
+
+#[derive(Args, Clone)]
 struct GraphStatusArgs {
     component: String,
     #[arg(long)]
@@ -509,6 +538,8 @@ struct GraphQueryArgs {
     max_facts: Option<usize>,
     #[arg(long, default_value_t = 10)]
     limit: usize,
+    #[arg(long = "var", value_name = "NAME=VALUE")]
+    vars: Vec<String>,
     #[command(flatten)]
     cache: FactCacheArgs,
 }
@@ -831,6 +862,8 @@ pub async fn run_cli() -> Result<()> {
         Commands::Status(args) => graph_status_command(&matrix, args).await?,
         Commands::Resolve(args) => graph_resolve_command(&matrix, args).await?,
         Commands::Why(args) => graph_why_command(&matrix, args).await?,
+        Commands::Ask(args) => graph_ask_command(&matrix, args).await?,
+        Commands::Producers(args) => producer_inventory_command(&matrix, args).await?,
         Commands::Graph(args) => graph_query_command(&matrix, args).await?,
         Commands::Artifacts(args) => list_artifacts(&matrix, args).await?,
         Commands::Validations(args) => list_validations(&matrix, args).await?,
@@ -2304,6 +2337,20 @@ async fn graph_why_command(matrix: &Matrix, args: GraphPairArgs) -> Result<Value
     Ok(with_cache_summary(answer, &cache))
 }
 
+async fn graph_ask_command(matrix: &Matrix, args: GraphAskArgs) -> Result<Value> {
+    let (graph, cache) = load_graph(matrix, args.max_facts, &args.cache).await?;
+    graph
+        .ask_answer(&args.question.join(" "), args.limit.max(1))
+        .map(|value| with_cache_summary(value, &cache))
+}
+
+async fn producer_inventory_command(matrix: &Matrix, args: ProducerInventoryArgs) -> Result<Value> {
+    let context = MatrixContext::detect_browsing(args.context);
+    let (db, cache) = query_db(matrix, args.max_facts, &context, &args.cache).await?;
+    producer_inventory_value(&db, args.limit.max(1), args.stale_days.max(1))
+        .map(|value| with_cache_summary(value, &cache))
+}
+
 async fn graph_status_command(matrix: &Matrix, args: GraphStatusArgs) -> Result<Value> {
     let (graph, cache) = load_graph(matrix, args.max_facts, &args.cache).await?;
     graph
@@ -2327,6 +2374,7 @@ async fn graph_versions_for_command(matrix: &Matrix, args: GraphPairArgs) -> Res
 
 async fn graph_query_command(matrix: &Matrix, args: GraphQueryArgs) -> Result<Value> {
     let query = query_text(args.query, args.file, "graph query")?;
+    let query = apply_graph_query_vars(&query, &args.vars)?;
     graph_query_value(matrix, &query, args.max_facts, args.limit, &args.cache).await
 }
 
@@ -2431,6 +2479,13 @@ struct GraphPath {
     edges: Vec<GraphEdge>,
 }
 
+#[derive(Clone, Debug)]
+struct GraphPathScore {
+    score: i64,
+    confidence: &'static str,
+    reasons: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default)]
 struct GraphIndex {
     nodes: BTreeMap<String, GraphNode>,
@@ -2464,6 +2519,84 @@ enum GraphRequest {
         component: String,
         for_component: String,
     },
+}
+
+fn producer_inventory_value(db: &Connection, limit: usize, stale_days: i64) -> Result<Value> {
+    let rows = execute_readonly_sql(db, &producer_inventory_sql(limit, stale_days))?;
+    let producers = query_rows(&rows).as_array().cloned().unwrap_or_default();
+    let total_producers = producers.len();
+    let stale_producers = producers
+        .iter()
+        .filter(|row| {
+            row.get("freshness")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value == "stale")
+        })
+        .count();
+    let total_facts = producers
+        .iter()
+        .filter_map(|row| row.get("facts").and_then(Value::as_i64))
+        .sum::<i64>();
+    let invalid_facts = producers
+        .iter()
+        .filter_map(|row| row.get("invalid_facts").and_then(Value::as_i64))
+        .sum::<i64>();
+    Ok(json!({
+        "kind": "producer-inventory",
+        "summary": {
+            "producers": total_producers,
+            "staleProducers": stale_producers,
+            "facts": total_facts,
+            "invalidFacts": invalid_facts,
+            "staleAfterDays": stale_days,
+        },
+        "columns": rows["columns"].clone(),
+        "rows": producers,
+    }))
+}
+
+fn producer_inventory_sql(limit: usize, stale_days: i64) -> String {
+    format!(
+        "select row_number() over (order by max(coalesce(accepted_at, observed_at)) desc, producer asc) as pick,
+            producer,
+            count(*) as facts,
+            count(distinct component) as components,
+            count(distinct zone) as zones,
+            sum(case when status in ('incompatible', 'failed', 'invalid', 'blocked') then 1 else 0 end) as invalid_facts,
+            max(coalesce(accepted_at, observed_at)) as last_observed_at,
+            case
+              when max(coalesce(accepted_at, observed_at)) is null then 'unknown'
+              when julianday('now') - julianday(max(coalesce(accepted_at, observed_at))) > {} then 'stale'
+              else 'fresh'
+            end as freshness
+         from (
+            select coalesce(nullif(source_repository, ''), nullif(source_repo, ''), nullif(repo, ''), 'unknown') as producer,
+                   component, zone, status, observed_at, accepted_at
+            from facts
+         )
+         group by producer
+         order by last_observed_at desc, producer asc
+         limit {}",
+        stale_days.max(1),
+        limit.max(1)
+    )
+}
+
+fn apply_graph_query_vars(query: &str, vars: &[String]) -> Result<String> {
+    let mut rendered = query.to_string();
+    for var in vars {
+        let Some((name, value)) = var.split_once('=') else {
+            bail!("graph --var expects NAME=VALUE, got {var:?}");
+        };
+        let name = name.trim();
+        if name.is_empty() || !is_sql_identifier(name) {
+            bail!("invalid graph variable name {name:?}");
+        }
+        let encoded = serde_json::to_string(value.trim())?;
+        rendered = rendered.replace(&format!("${name}"), &encoded);
+        rendered = rendered.replace(&format!("${{{name}}}"), &encoded);
+    }
+    Ok(rendered)
 }
 
 impl GraphIndex {
@@ -2775,12 +2908,20 @@ impl GraphIndex {
         let source_ref = self.resolve(source);
         let target_ref = self.resolve(target);
         let paths = self.find_paths(&source_ref.name, &target_ref.name, limit);
+        let recommended = paths.first().map(|path| self.path_value(path));
+        let confidence = recommended
+            .as_ref()
+            .and_then(|path| path.get("confidence"))
+            .cloned()
+            .unwrap_or_else(|| json!("unknown"));
         Ok(json!({
             "kind": "graph-path",
             "source": self.node_value(&source_ref.name, source),
             "target": self.node_value(&target_ref.name, target),
             "status": if paths.is_empty() { "unknown" } else { "connected" },
             "found": !paths.is_empty(),
+            "confidence": confidence,
+            "recommended": recommended,
             "pathCount": paths.len(),
             "paths": paths.iter().map(|path| self.path_value(path)).collect::<Vec<_>>(),
             "missing": if paths.is_empty() { json!(["no known fact path connects these components"]) } else { json!([]) },
@@ -2790,19 +2931,22 @@ impl GraphIndex {
     fn works_with_answer(&self, left: &str, right: &str, limit: usize) -> Result<Value> {
         let left_ref = self.resolve(left);
         let right_ref = self.resolve(right);
-        let forward = self.find_paths(&left_ref.name, &right_ref.name, limit);
-        let reverse = self.find_paths(&right_ref.name, &left_ref.name, limit);
-        let (direction, paths) = if !forward.is_empty() {
-            ("left_to_right", forward)
-        } else if !reverse.is_empty() {
-            ("right_to_left", reverse)
-        } else {
-            ("none", Vec::new())
-        };
+        let (direction, paths) = self.best_directional_path(&left_ref.name, &right_ref.name, limit);
         let compatible = paths
             .iter()
             .flat_map(|path| path.edges.iter())
             .all(|edge| !is_invalid_status(edge.status.as_deref()));
+        let recommended = paths.first().map(|path| self.path_value(path));
+        let confidence = recommended
+            .as_ref()
+            .and_then(|path| path.get("confidence"))
+            .cloned()
+            .unwrap_or_else(|| json!("unknown"));
+        let reasons = recommended
+            .as_ref()
+            .and_then(|path| path.get("reasons"))
+            .cloned()
+            .unwrap_or_else(|| json!([]));
         Ok(json!({
             "kind": "graph-works-with",
             "left": self.node_value(&left_ref.name, left),
@@ -2815,6 +2959,9 @@ impl GraphIndex {
                 "blocked"
             },
             "compatible": !paths.is_empty() && compatible,
+            "confidence": confidence,
+            "reasons": reasons,
+            "recommended": recommended,
             "direction": direction,
             "pathCount": paths.len(),
             "paths": paths.iter().map(|path| self.path_value(path)).collect::<Vec<_>>(),
@@ -2860,22 +3007,23 @@ impl GraphIndex {
     ) -> Result<Value> {
         let component_ref = self.resolve(component);
         let for_ref = self.resolve(for_component);
-        let mut versions = BTreeSet::new();
+        let mut versions: BTreeMap<String, (i64, String, usize)> = BTreeMap::new();
         for path in self
             .find_paths(&for_ref.name, &component_ref.name, limit)
             .into_iter()
             .chain(self.find_paths(&component_ref.name, &for_ref.name, limit))
         {
+            let score = self.score_path(&path);
             for edge in path.edges {
                 if edge.source == component_ref.name
                     && let Some(version) = edge.source_version
                 {
-                    versions.insert(version);
+                    record_version_candidate(&mut versions, version, &score);
                 }
                 if edge.target == component_ref.name
                     && let Some(version) = edge.target_version
                 {
-                    versions.insert(version);
+                    record_version_candidate(&mut versions, version, &score);
                 }
             }
         }
@@ -2883,14 +3031,167 @@ impl GraphIndex {
             && let Some(node) = self.nodes.get(&component_ref.name)
             && let Some(version) = node.version.clone()
         {
-            versions.insert(version);
+            versions.insert(version, (25, "low".to_string(), 1));
         }
+        let mut candidates = versions
+            .into_iter()
+            .map(|(version, (score, confidence, path_count))| {
+                json!({
+                    "version": version,
+                    "score": score,
+                    "confidence": confidence,
+                    "pathCount": path_count,
+                })
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            let right_score = right.get("score").and_then(Value::as_i64).unwrap_or(0);
+            let left_score = left.get("score").and_then(Value::as_i64).unwrap_or(0);
+            right_score.cmp(&left_score).then_with(|| {
+                right
+                    .get("version")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .cmp(
+                        left.get("version")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                    )
+            })
+        });
+        let versions = candidates
+            .iter()
+            .take(limit)
+            .filter_map(|candidate| candidate.get("version").cloned())
+            .collect::<Vec<_>>();
         Ok(json!({
             "kind": "graph-versions-for",
             "component": self.node_value(&component_ref.name, component),
             "for": self.node_value(&for_ref.name, for_component),
-            "versions": versions.into_iter().take(limit).collect::<Vec<_>>(),
+            "versions": versions,
+            "versionCandidates": candidates.into_iter().take(limit).collect::<Vec<_>>(),
         }))
+    }
+
+    fn ask_answer(&self, question: &str, limit: usize) -> Result<Value> {
+        let mentions = self.mentioned_components(question);
+        let lower = question.to_ascii_lowercase();
+        let (interpreted_as, answer) = if mentions.len() >= 2
+            && (lower.contains("version")
+                || lower.contains("which ")
+                || lower.contains("what ")
+                || lower.contains("using"))
+        {
+            (
+                json!({
+                    "request": "versions",
+                    "component": mentions[0].1.component,
+                    "for": mentions[1].1.component,
+                }),
+                self.versions_for_answer(
+                    &mentions[0].1.component,
+                    &mentions[1].1.component,
+                    limit,
+                )?,
+            )
+        } else if mentions.len() >= 2
+            && (lower.contains("work") || lower.contains("compatible") || lower.contains("why"))
+        {
+            (
+                json!({
+                    "request": "worksWith",
+                    "left": mentions[0].1.component,
+                    "right": mentions[1].1.component,
+                }),
+                self.works_with_answer(&mentions[0].1.component, &mentions[1].1.component, limit)?,
+            )
+        } else if mentions.len() >= 2 {
+            (
+                json!({
+                    "request": "path",
+                    "source": mentions[0].1.component,
+                    "target": mentions[1].1.component,
+                }),
+                self.path_answer(&mentions[0].1.component, &mentions[1].1.component, limit)?,
+            )
+        } else if let Some((_, node)) = mentions.first() {
+            (
+                json!({
+                    "request": "status",
+                    "component": node.component,
+                }),
+                self.status_answer(&node.component, limit)?,
+            )
+        } else {
+            bail!(
+                "could not find Matrix components in that question; try `matrix ask 'which putto works with aphrodite'` or `matrix resolve <name>`"
+            );
+        };
+        Ok(json!({
+            "kind": "graph-ask",
+            "question": question,
+            "interpretedAs": interpreted_as,
+            "mentions": mentions.into_iter().map(|(alias, node)| json!({
+                "alias": alias,
+                "node": self.node_value(&node.key, &alias),
+            })).collect::<Vec<_>>(),
+            "answer": answer,
+        }))
+    }
+
+    fn mentioned_components(&self, question: &str) -> Vec<(String, GraphNode)> {
+        let haystack = format!(" {} ", question.to_ascii_lowercase());
+        let mut matches: Vec<(usize, String, GraphNode)> = Vec::new();
+        let mut seen = BTreeSet::new();
+        for (alias, key) in &self.aliases {
+            let trimmed = alias.trim();
+            if trimmed.len() < 3 {
+                continue;
+            }
+            let needle = format!(" {} ", trimmed.to_ascii_lowercase());
+            let dashed = format!("{}-", trimmed.to_ascii_lowercase());
+            let position = haystack.find(&needle).or_else(|| haystack.find(&dashed));
+            if let Some(position) = position
+                && seen.insert(key.clone())
+                && let Some(node) = self.nodes.get(key)
+            {
+                matches.push((position, trimmed.to_string(), node.clone()));
+            }
+        }
+        matches.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| right.1.len().cmp(&left.1.len()))
+                .then_with(|| left.2.component.cmp(&right.2.component))
+        });
+        matches
+            .into_iter()
+            .map(|(_, alias, node)| (alias, node))
+            .collect()
+    }
+
+    fn best_directional_path(
+        &self,
+        left: &str,
+        right: &str,
+        limit: usize,
+    ) -> (&'static str, Vec<GraphPath>) {
+        let forward = self.find_paths(left, right, limit);
+        let reverse = self.find_paths(right, left, limit);
+        match (forward.first(), reverse.first()) {
+            (Some(left_path), Some(right_path)) => {
+                let left_score = self.score_path(left_path).score;
+                let right_score = self.score_path(right_path).score;
+                if left_score >= right_score {
+                    ("left_to_right", forward)
+                } else {
+                    ("right_to_left", reverse)
+                }
+            }
+            (Some(_), None) => ("left_to_right", forward),
+            (None, Some(_)) => ("right_to_left", reverse),
+            (None, None) => ("none", Vec::new()),
+        }
     }
 
     fn find_paths(&self, source: &str, target: &str, limit: usize) -> Vec<GraphPath> {
@@ -2898,6 +3199,7 @@ impl GraphIndex {
             return vec![GraphPath { edges: Vec::new() }];
         }
         const MAX_DEPTH: usize = 6;
+        let search_limit = limit.saturating_mul(8).clamp(limit.max(1), 80);
         let mut paths = Vec::new();
         let mut queue = VecDeque::from([(source.to_string(), Vec::<GraphEdge>::new())]);
         while let Some((current, path)) = queue.pop_front() {
@@ -2912,18 +3214,97 @@ impl GraphIndex {
                 next_path.push(edge.clone());
                 if edge.target == target {
                     paths.push(GraphPath { edges: next_path });
-                    if paths.len() >= limit {
-                        return paths;
+                    if paths.len() >= search_limit {
+                        return self.rank_paths(paths, limit);
                     }
                 } else {
                     queue.push_back((edge.target.clone(), next_path));
                 }
             }
         }
-        paths
+        self.rank_paths(paths, limit)
+    }
+
+    fn rank_paths(&self, mut paths: Vec<GraphPath>, limit: usize) -> Vec<GraphPath> {
+        paths.sort_by(|left, right| {
+            let left_score = self.score_path(left).score;
+            let right_score = self.score_path(right).score;
+            right_score
+                .cmp(&left_score)
+                .then_with(|| left.edges.len().cmp(&right.edges.len()))
+                .then_with(|| {
+                    left.node_keys()
+                        .join("\0")
+                        .cmp(&right.node_keys().join("\0"))
+                })
+        });
+        paths.into_iter().take(limit.max(1)).collect()
+    }
+
+    fn score_path(&self, path: &GraphPath) -> GraphPathScore {
+        if path.edges.is_empty() {
+            return GraphPathScore {
+                score: 100,
+                confidence: "high",
+                reasons: vec!["same component".to_string()],
+            };
+        }
+        let mut score = 100 - (path.edges.len() as i64 * 8);
+        let mut reasons = Vec::new();
+        if path.edges.len() == 1 {
+            score += 10;
+            reasons.push("direct evidence".to_string());
+        } else {
+            reasons.push("inferred multi-hop path".to_string());
+        }
+        if path
+            .edges
+            .iter()
+            .any(|edge| is_invalid_status(edge.status.as_deref()))
+        {
+            score -= 70;
+            reasons.push("contains blocked or failed evidence".to_string());
+        } else if path
+            .edges
+            .iter()
+            .all(|edge| is_positive_status(edge.status.as_deref()))
+        {
+            score += 20;
+            reasons.push("all edge statuses are passing".to_string());
+        }
+        if path.edges.iter().all(|edge| {
+            edge.source_fact_id.is_some()
+                && edge.target_fact_id.is_some()
+                && (edge.source_version.is_some() || edge.target_version.is_some())
+        }) {
+            score += 15;
+            reasons.push("versioned fact evidence".to_string());
+        } else {
+            score -= 10;
+            reasons.push("some version or fact details are missing".to_string());
+        }
+        let confidence = if path
+            .edges
+            .iter()
+            .any(|edge| is_invalid_status(edge.status.as_deref()))
+        {
+            "blocked"
+        } else if score >= 120 {
+            "high"
+        } else if score >= 75 {
+            "medium"
+        } else {
+            "low"
+        };
+        GraphPathScore {
+            score,
+            confidence,
+            reasons,
+        }
     }
 
     fn path_value(&self, path: &GraphPath) -> Value {
+        let score = self.score_path(path);
         let nodes = path
             .node_keys()
             .into_iter()
@@ -2931,6 +3312,9 @@ impl GraphIndex {
             .collect::<Vec<_>>();
         json!({
             "length": path.edges.len(),
+            "score": score.score,
+            "confidence": score.confidence,
+            "reasons": score.reasons,
             "nodes": nodes,
             "edges": path.edges.iter().map(|edge| self.edge_value(edge)).collect::<Vec<_>>(),
         })
@@ -3032,6 +3416,54 @@ fn is_invalid_status(status: Option<&str>) -> bool {
         status.map(|value| value.to_ascii_lowercase()),
         Some(value) if matches!(value.as_str(), "incompatible" | "failed" | "invalid" | "blocked")
     )
+}
+
+fn is_positive_status(status: Option<&str>) -> bool {
+    matches!(
+        status.map(|value| value.to_ascii_lowercase()),
+        Some(value)
+            if matches!(
+                value.as_str(),
+                "compatible" | "passed" | "observed" | "candidate" | "valid" | "ready" | "success" | "succeeded"
+            )
+    )
+}
+
+fn record_version_candidate(
+    versions: &mut BTreeMap<String, (i64, String, usize)>,
+    version: String,
+    score: &GraphPathScore,
+) {
+    versions
+        .entry(version)
+        .and_modify(|existing| {
+            existing.0 = existing.0.max(score.score);
+            existing.1 = strongest_confidence(&existing.1, score.confidence).to_string();
+            existing.2 += 1;
+        })
+        .or_insert((score.score, score.confidence.to_string(), 1));
+}
+
+fn strongest_confidence(left: &str, right: &str) -> &'static str {
+    let rank = |value: &str| match value {
+        "high" => 4,
+        "medium" => 3,
+        "low" => 2,
+        "blocked" => 1,
+        _ => 0,
+    };
+    let stronger = if rank(left) >= rank(right) {
+        left
+    } else {
+        right
+    };
+    match stronger {
+        "high" => "high",
+        "medium" => "medium",
+        "low" => "low",
+        "blocked" => "blocked",
+        _ => "unknown",
+    }
 }
 
 fn parse_graph_query(query: &str) -> Result<GraphRequest> {
@@ -3681,6 +4113,12 @@ impl<'a> ReplSession<'a> {
         self.print_value(&value)
     }
 
+    fn run_graph_ask(&self, question: &str, limit: usize) -> Result<()> {
+        let graph = self.graph()?;
+        let value = graph.ask_answer(question, limit.max(1))?;
+        self.print_value(&value)
+    }
+
     async fn handle_command(&mut self, raw: &str) -> Result<bool> {
         let command = raw.trim();
         let command = command
@@ -3826,6 +4264,14 @@ impl<'a> ReplSession<'a> {
                     _ => eprintln!("Usage: .why <component-a> <component-b>"),
                 }
             }
+            "ask" => {
+                let question = parts.collect::<Vec<_>>().join(" ");
+                if question.is_empty() {
+                    eprintln!("Usage: .ask which putto works with aphrodite");
+                } else {
+                    self.run_graph_ask(&question, 5)?;
+                }
+            }
             "resolve" => {
                 let component = parts.collect::<Vec<_>>().join(" ");
                 if component.is_empty() {
@@ -3846,6 +4292,10 @@ impl<'a> ReplSession<'a> {
                 } else {
                     self.run_graph_query(&query, 10)?;
                 }
+            }
+            "producers" | "coverage" => {
+                let value = producer_inventory_value(&self.db, 50, 14)?;
+                self.print_value(&value)?;
             }
             "examples" => print_repl_examples(),
             "describe" | "desc" | "d" => {
@@ -5236,9 +5686,12 @@ Matrix shell commands
   .path <from> <to>         Find an inferred compatibility path
   .works-with <a> <b>       Check whether two components connect
   .why <a> <b>              Explain pair compatibility
+  .ask <question>           Ask a beginner-friendly compatibility question
   .resolve <name>           Explain component/repo/package alias resolution
   .graph <query>            Run a GraphQL-style graph query
   .graph -f <file>          Run a saved graph query file
+  .producers                Show fact producer coverage and freshness
+  .coverage                 Alias for .producers
   .read <file>              Run a saved SQL query file
   .examples                 Show copyable query examples
   .explain <sql>            Run EXPLAIN QUERY PLAN
@@ -6495,6 +6948,14 @@ fn print_human_object(object: &serde_json::Map<String, Value>) {
     if object
         .get("kind")
         .and_then(Value::as_str)
+        .is_some_and(|kind| kind == "producer-inventory")
+    {
+        print!("{}", producer_inventory_human_text(object));
+        return;
+    }
+    if object
+        .get("kind")
+        .and_then(Value::as_str)
         .is_some_and(|kind| kind.starts_with("fact-cache-"))
     {
         print_cache_command_human(object);
@@ -6621,6 +7082,7 @@ fn graph_answer_human_text(object: &serde_json::Map<String, Value>) -> String {
         Some("graph-status") => graph_status_human_text(object),
         Some("graph-versions-for") => graph_versions_human_text(object),
         Some("graph-resolve") => graph_resolve_human_text(object),
+        Some("graph-ask") => graph_ask_human_text(object),
         _ => {
             let mut text = String::new();
             for (key, value) in object {
@@ -6694,7 +7156,11 @@ fn graph_path_human_text(object: &serde_json::Map<String, Value>, title: &str) -
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let mut text = format!("{title}: {status}\n");
+    let confidence = object
+        .get("confidence")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let mut text = format!("{title}: {status} ({confidence} confidence)\n");
     if paths.is_empty() {
         text.push_str("No known compatibility path.\n");
         if let Some(missing) = object.get("missing").and_then(Value::as_array) {
@@ -6713,7 +7179,7 @@ fn graph_path_human_text(object: &serde_json::Map<String, Value>, title: &str) -
             .unwrap_or_default();
         let node_labels = nodes.iter().map(graph_node_label).collect::<Vec<_>>();
         text.push_str(&format!(
-            "{}. {}\n",
+            "{}. {}",
             index + 1,
             if node_labels.is_empty() {
                 "same component".to_string()
@@ -6721,6 +7187,13 @@ fn graph_path_human_text(object: &serde_json::Map<String, Value>, title: &str) -
                 node_labels.join(" -> ")
             }
         ));
+        if let Some(confidence) = path.get("confidence").and_then(Value::as_str) {
+            text.push_str(&format!(" [{confidence}]"));
+        }
+        if let Some(score) = path.get("score").and_then(Value::as_i64) {
+            text.push_str(&format!(" score {score}"));
+        }
+        text.push('\n');
         if let Some(edges) = path.get("edges").and_then(Value::as_array) {
             for edge in edges {
                 text.push_str(&format!("   {}\n", graph_edge_label(edge)));
@@ -6780,9 +7253,89 @@ fn graph_versions_human_text(object: &serde_json::Map<String, Value>) -> String 
     if versions.is_empty() {
         text.push_str("No known matching versions.\n");
     } else {
+        let candidates = object
+            .get("versionCandidates")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
         for version in versions {
-            text.push_str(&format!("- {}\n", human_inline_value(&version)));
+            let details = candidates
+                .iter()
+                .find(|candidate| candidate.get("version") == Some(&version));
+            if let Some(details) = details {
+                let confidence = details
+                    .get("confidence")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let score = details.get("score").and_then(Value::as_i64).unwrap_or(0);
+                text.push_str(&format!(
+                    "- {} ({confidence}, score {score})\n",
+                    human_inline_value(&version)
+                ));
+            } else {
+                text.push_str(&format!("- {}\n", human_inline_value(&version)));
+            }
         }
+    }
+    text
+}
+
+fn graph_ask_human_text(object: &serde_json::Map<String, Value>) -> String {
+    let question = object
+        .get("question")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mut text = format!("Ask: {question}\n");
+    if let Some(interpreted) = object.get("interpretedAs") {
+        text.push_str(&format!(
+            "Interpreted as: {}\n",
+            human_inline_value(interpreted)
+        ));
+    }
+    if let Some(answer) = object.get("answer").and_then(Value::as_object) {
+        text.push_str(&graph_answer_human_text(answer));
+    }
+    text
+}
+
+fn producer_inventory_human_text(object: &serde_json::Map<String, Value>) -> String {
+    let summary = object.get("summary").and_then(Value::as_object);
+    let producers = summary
+        .and_then(|value| value.get("producers"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let stale = summary
+        .and_then(|value| value.get("staleProducers"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let facts = summary
+        .and_then(|value| value.get("facts"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let mut text =
+        format!("Producer inventory: {producers} producers, {facts} facts, {stale} stale\n");
+    for row in object
+        .get("rows")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+    {
+        let producer = row
+            .get("producer")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let facts = row.get("facts").and_then(Value::as_i64).unwrap_or(0);
+        let components = row.get("components").and_then(Value::as_i64).unwrap_or(0);
+        let freshness = row
+            .get("freshness")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        text.push_str(&format!(
+            "- {producer}: {facts} facts, {components} components, {freshness}\n"
+        ));
+    }
+    if let Some(cache) = object.get("cache").and_then(Value::as_object) {
+        text.push_str(&cache_human_line(cache));
     }
     text
 }
@@ -8940,6 +9493,100 @@ mod tests {
             .versions_for_answer("eunomia", "aphrodite", 5)
             .unwrap();
         assert_eq!(versions["versions"], json!(["3.1.0"]));
+        assert_eq!(versions["versionCandidates"][0]["confidence"], "medium");
+    }
+
+    #[test]
+    fn graph_paths_include_ranked_confidence() {
+        let graph = graph_fixture();
+
+        let path = graph.path_answer("aphrodite", "eunomia", 5).unwrap();
+        assert_eq!(path["confidence"], "medium");
+        assert_eq!(path["recommended"]["confidence"], "medium");
+        assert!(path["paths"][0]["score"].as_i64().unwrap() > 0);
+        assert!(
+            path["paths"][0]["reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|reason| reason == "inferred multi-hop path")
+        );
+    }
+
+    #[test]
+    fn graph_ask_interprets_beginner_questions() {
+        let graph = graph_fixture();
+
+        let answer = graph
+            .ask_answer("which putto can work for aphrodite 1.2.0", 5)
+            .unwrap();
+        assert_eq!(answer["kind"], "graph-ask");
+        assert_eq!(answer["interpretedAs"]["request"], "versions");
+        assert_eq!(answer["answer"]["versions"], json!(["0.8.1"]));
+
+        let works = graph
+            .ask_answer("does aphrodite work with putto", 5)
+            .unwrap();
+        assert_eq!(works["interpretedAs"]["request"], "worksWith");
+        assert_eq!(works["answer"]["compatible"], true);
+    }
+
+    #[test]
+    fn graph_query_variables_render_for_saved_queries() {
+        let query = apply_graph_query_vars(
+            "query Matrix($component:String,$for:String) { versions(component:$component, for:$for) { versions } }",
+            &["component=putto".to_string(), "for=aphrodite".to_string()],
+        )
+        .unwrap();
+
+        match parse_graph_query(&query).unwrap() {
+            GraphRequest::VersionsFor {
+                component,
+                for_component,
+            } => {
+                assert_eq!(component, "putto");
+                assert_eq!(for_component, "aphrodite");
+            }
+            _ => panic!("expected versions request"),
+        }
+    }
+
+    #[test]
+    fn producer_inventory_summarizes_fact_sources() {
+        let facts = vec![
+            json!({
+                "id": "producer-a-1",
+                "track": "odin",
+                "status": "passed",
+                "sourceRepository": "red-wiz/aphrodite",
+                "observedAt": "2026-06-28T00:00:00Z",
+                "subject": {"type": "service", "name": "aphrodite", "version": "1.2.0", "repo": "red-wiz/aphrodite"}
+            }),
+            json!({
+                "id": "producer-a-2",
+                "track": "odin",
+                "status": "failed",
+                "sourceRepository": "red-wiz/aphrodite",
+                "observedAt": "2026-06-28T00:01:00Z",
+                "subject": {"type": "service", "name": "eos", "version": "24.6.0", "repo": "red-wiz/eos"}
+            }),
+            json!({
+                "id": "producer-b-1",
+                "track": "odin",
+                "status": "passed",
+                "source": {"repo": "red-wiz/putto"},
+                "observedAt": "2026-06-28T00:02:00Z",
+                "subject": {"type": "service", "name": "putto", "version": "0.8.1", "repo": "red-wiz/putto"}
+            }),
+        ];
+        let db = build_facts_db(&facts, &MatrixContext::default()).unwrap();
+        let value = producer_inventory_value(&db, 10, 14).unwrap();
+
+        assert_eq!(value["kind"], "producer-inventory");
+        assert_eq!(value["summary"]["producers"], 2);
+        assert_eq!(value["summary"]["facts"], 3);
+        assert_eq!(value["rows"][0]["producer"], "red-wiz/putto");
+        assert_eq!(value["rows"][1]["invalid_facts"], 1);
     }
 
     #[test]

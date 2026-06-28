@@ -79,6 +79,23 @@ matrix compare example/ledger-service --repo example/payments-api --version v1.6
 matrix why payments-api ledger-service
 ```
 
+## Answer Compatibility Questions
+
+Use these before writing SQL:
+
+```bash
+matrix ask 'which putto can work for aphrodite'
+matrix ask 'what version of eunomia is aphrodite using'
+matrix path aphrodite eunomia
+matrix works-with putto aphrodite
+matrix versions eunomia --for aphrodite
+matrix why aphrodite eunomia
+matrix producers --zone odin
+```
+
+Graph answers rank paths and show confidence. Add `-o json` for agents and
+scripts.
+
 ## Publish Producer Evidence
 
 ```bash

@@ -78,10 +78,12 @@ matrix view runtime
 matrix current --zone runtime --level preview
 matrix gate --zone runtime --level stage
 matrix trace --zone runtime --subject payments-api
+matrix ask 'which putto can work for aphrodite'
 matrix path aphrodite eunomia
 matrix works-with putto aphrodite
 matrix versions eunomia --for aphrodite
 matrix resolve aphrodite
+matrix producers
 matrix sync --max-facts 5000
 matrix cache status
 matrix query -f queries/current-runtime.sql -o json
@@ -110,12 +112,14 @@ matrix requirements smart-contract-tuple.vdr.0.1.1
 matrix consumers smart-contract-tuple.vdr.0.1.1
 matrix blockers odin --environment stage
 matrix eligibility odin stage
+matrix ask 'what version of eunomia is aphrodite using'
 matrix path aphrodite eunomia
 matrix works-with putto aphrodite
 matrix compatible aphrodite putto
 matrix versions eunomia --for aphrodite
 matrix why aphrodite eunomia
 matrix resolve aphrodite
+matrix producers --zone odin
 matrix sync --max-facts 10000
 matrix cache status
 matrix path aphrodite eunomia --offline
