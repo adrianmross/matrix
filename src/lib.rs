@@ -695,8 +695,14 @@ struct FactCacheMetadata {
     profile: Option<ConfigProfile>,
     schema_version: u32,
     fetched_at_unix: u64,
+    checked_at_unix: Option<u64>,
     fact_count: usize,
     max_facts: usize,
+    head_digest: Option<String>,
+    head_fact_count: Option<usize>,
+    head_latest_accepted_at: Option<String>,
+    head_latest_fact_id: Option<String>,
+    head_latest_content_hash: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -706,7 +712,21 @@ struct FactCacheSummary {
     path: PathBuf,
     metadata: Option<FactCacheMetadata>,
     age_seconds: Option<u64>,
+    checked_age_seconds: Option<u64>,
     stale: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FactsHead {
+    kind: String,
+    schema_version: u32,
+    fact_count: usize,
+    digest: String,
+    generated_at: Option<String>,
+    latest_accepted_at: Option<String>,
+    latest_fact_id: Option<String>,
+    latest_content_hash: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1074,6 +1094,10 @@ impl Matrix {
         self.request(Method::GET, path, None).await
     }
 
+    async fn get_optional(&self, path: &str) -> Result<Option<Value>> {
+        self.request_optional(Method::GET, path, None).await
+    }
+
     async fn get_fallback(&self, primary: &str, fallback: &str) -> Result<Value> {
         match self.request(Method::GET, primary, None).await {
             Ok(value) => Ok(value),
@@ -1115,6 +1139,47 @@ impl Matrix {
             bail!("construct {status}: {}", error_detail(&value, &text));
         }
         Ok(value)
+    }
+
+    async fn request_optional(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<Option<Value>> {
+        let url = format!("{}{}{}", self.construct()?, self.api_prefix, path);
+        let mut request = self.client.request(method, &url);
+        if let Some(token) = self.auth_token()? {
+            request = request.bearer_auth(token);
+        }
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request
+            .send()
+            .await
+            .with_context(|| format!("request failed: {url}"))?;
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let text = response.text().await?;
+        if status == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if status.is_success() && looks_like_html(&content_type, &text) {
+            bail!(
+                "received HTML from the construct; authenticate or use a machine/API construct URL"
+            );
+        }
+        let value = parse_response_text(&text);
+        if !status.is_success() {
+            bail!("construct {status}: {}", error_detail(&value, &text));
+        }
+        Ok(Some(value))
     }
 
     fn auth_candidate(&self) -> Option<AuthCandidate> {
@@ -5584,9 +5649,22 @@ async fn fetch_facts(matrix: &Matrix, max_facts: usize) -> Result<Vec<Value>> {
     Ok(facts)
 }
 
+async fn fetch_facts_head(matrix: &Matrix) -> Result<Option<FactsHead>> {
+    let Some(body) = matrix.get_optional("/facts/head").await? else {
+        return Ok(None);
+    };
+    let head: FactsHead =
+        serde_json::from_value(body).context("construct returned an invalid facts head")?;
+    if head.kind != "compatibility-facts-head" || head.digest.trim().is_empty() {
+        bail!("construct returned an invalid facts head");
+    }
+    Ok(Some(head))
+}
+
 async fn sync_facts_to_cache(matrix: &Matrix, max_facts: usize) -> Result<FactCacheSummary> {
+    let head = fetch_facts_head(matrix).await.ok().flatten();
     let facts = fetch_facts(matrix, max_facts).await?;
-    write_fact_cache_db(matrix, &facts, max_facts)
+    write_fact_cache_db(matrix, &facts, max_facts, head.as_ref())
 }
 
 async fn cache_source_for_policy(
@@ -5604,9 +5682,13 @@ async fn cache_source_for_policy(
         CachePolicy::Auto | CachePolicy::PreferCache => {
             if let Ok(summary) = fact_cache_summary_from_db(path, FactCacheSource::Cache)
                 && summary.satisfies_max_facts(max_facts)
-                && (policy == CachePolicy::PreferCache || !summary.stale)
             {
-                return Ok(FactCacheSource::Cache);
+                if policy == CachePolicy::PreferCache || !summary.stale {
+                    return Ok(FactCacheSource::Cache);
+                }
+                if cache_head_matches(matrix, path, &summary).await? {
+                    return Ok(FactCacheSource::Cache);
+                }
             }
             sync_facts_to_cache(matrix, max_facts).await?;
             Ok(FactCacheSource::Live)
@@ -5614,10 +5696,38 @@ async fn cache_source_for_policy(
     }
 }
 
+async fn cache_head_matches(
+    matrix: &Matrix,
+    path: &Path,
+    summary: &FactCacheSummary,
+) -> Result<bool> {
+    let Some(metadata) = summary.metadata.as_ref() else {
+        return Ok(false);
+    };
+    let Some(cached_digest) = metadata.head_digest.as_deref() else {
+        return Ok(false);
+    };
+    let Some(head) = fetch_facts_head(matrix).await? else {
+        return Ok(false);
+    };
+    if cached_digest != head.digest {
+        return Ok(false);
+    }
+    if metadata
+        .head_fact_count
+        .is_some_and(|fact_count| fact_count != head.fact_count)
+    {
+        return Ok(false);
+    }
+    update_fact_cache_head_metadata(path, &head)?;
+    Ok(true)
+}
+
 fn write_fact_cache_db(
     matrix: &Matrix,
     facts: &[Value],
     max_facts: usize,
+    head: Option<&FactsHead>,
 ) -> Result<FactCacheSummary> {
     let final_path = fact_cache_path(matrix)?;
     if let Some(parent) = final_path.parent() {
@@ -5637,8 +5747,14 @@ fn write_fact_cache_db(
         profile: matrix.profile,
         schema_version: 2,
         fetched_at_unix: unix_now()?,
+        checked_at_unix: None,
         fact_count: facts.len(),
         max_facts,
+        head_digest: head.map(|value| value.digest.clone()),
+        head_fact_count: head.map(|value| value.fact_count),
+        head_latest_accepted_at: head.and_then(|value| value.latest_accepted_at.clone()),
+        head_latest_fact_id: head.and_then(|value| value.latest_fact_id.clone()),
+        head_latest_content_hash: head.and_then(|value| value.latest_content_hash.clone()),
     };
     write_fact_cache_metadata(&db, &metadata)?;
     db.execute_batch("pragma optimize;")?;
@@ -5695,8 +5811,41 @@ fn write_fact_cache_metadata(db: &Connection, metadata: &FactCacheMetadata) -> R
         ),
         ("schemaVersion", metadata.schema_version.to_string()),
         ("fetchedAtUnix", metadata.fetched_at_unix.to_string()),
+        (
+            "checkedAtUnix",
+            metadata
+                .checked_at_unix
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        ),
         ("factCount", metadata.fact_count.to_string()),
         ("maxFacts", metadata.max_facts.to_string()),
+        (
+            "headDigest",
+            metadata.head_digest.clone().unwrap_or_default(),
+        ),
+        (
+            "headFactCount",
+            metadata
+                .head_fact_count
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        ),
+        (
+            "headLatestAcceptedAt",
+            metadata.head_latest_accepted_at.clone().unwrap_or_default(),
+        ),
+        (
+            "headLatestFactId",
+            metadata.head_latest_fact_id.clone().unwrap_or_default(),
+        ),
+        (
+            "headLatestContentHash",
+            metadata
+                .head_latest_content_hash
+                .clone()
+                .unwrap_or_default(),
+        ),
     ];
     for (key, value) in fields {
         db.execute(
@@ -5736,6 +5885,10 @@ fn read_fact_cache_metadata(db: &Connection) -> Result<FactCacheMetadata> {
             .get("fetchedAtUnix")
             .and_then(|value| value.parse().ok())
             .unwrap_or(0),
+        checked_at_unix: entries
+            .get("checkedAtUnix")
+            .filter(|value| !value.is_empty())
+            .and_then(|value| value.parse().ok()),
         fact_count: entries
             .get("factCount")
             .and_then(|value| value.parse().ok())
@@ -5744,7 +5897,55 @@ fn read_fact_cache_metadata(db: &Connection) -> Result<FactCacheMetadata> {
             .get("maxFacts")
             .and_then(|value| value.parse().ok())
             .unwrap_or(0),
+        head_digest: entries
+            .get("headDigest")
+            .filter(|value| !value.is_empty())
+            .cloned(),
+        head_fact_count: entries
+            .get("headFactCount")
+            .filter(|value| !value.is_empty())
+            .and_then(|value| value.parse().ok()),
+        head_latest_accepted_at: entries
+            .get("headLatestAcceptedAt")
+            .filter(|value| !value.is_empty())
+            .cloned(),
+        head_latest_fact_id: entries
+            .get("headLatestFactId")
+            .filter(|value| !value.is_empty())
+            .cloned(),
+        head_latest_content_hash: entries
+            .get("headLatestContentHash")
+            .filter(|value| !value.is_empty())
+            .cloned(),
     })
+}
+
+fn update_fact_cache_head_metadata(path: &Path, head: &FactsHead) -> Result<()> {
+    let db = Connection::open(path)?;
+    let fields = [
+        ("checkedAtUnix", unix_now()?.to_string()),
+        ("headDigest", head.digest.clone()),
+        ("headFactCount", head.fact_count.to_string()),
+        (
+            "headLatestAcceptedAt",
+            head.latest_accepted_at.clone().unwrap_or_default(),
+        ),
+        (
+            "headLatestFactId",
+            head.latest_fact_id.clone().unwrap_or_default(),
+        ),
+        (
+            "headLatestContentHash",
+            head.latest_content_hash.clone().unwrap_or_default(),
+        ),
+    ];
+    for (key, value) in fields {
+        db.execute(
+            "insert or replace into matrix_cache_metadata (key, value) values (?1, ?2)",
+            params![key, value],
+        )?;
+    }
+    Ok(())
 }
 
 fn fact_cache_summary_from_db(path: &Path, source: FactCacheSource) -> Result<FactCacheSummary> {
@@ -5768,6 +5969,7 @@ fn fact_cache_status(matrix: &Matrix) -> Result<Value> {
             path,
             metadata: None,
             age_seconds: None,
+            checked_age_seconds: None,
             stale: false,
         },
     };
@@ -5848,13 +6050,16 @@ fn with_cache_summary(mut value: Value, cache: &FactCacheSummary) -> Value {
 impl FactCacheSummary {
     fn from_metadata(source: FactCacheSource, path: PathBuf, metadata: FactCacheMetadata) -> Self {
         let age_seconds = unix_age_seconds(metadata.fetched_at_unix);
+        let checked_at_unix = metadata.checked_at_unix.unwrap_or(metadata.fetched_at_unix);
+        let checked_age_seconds = unix_age_seconds(checked_at_unix);
         Self {
             source,
             policy: CachePolicy::Auto,
             path,
             metadata: Some(metadata),
             age_seconds,
-            stale: age_seconds.is_some_and(|age| age > FACT_CACHE_STALE_AFTER.as_secs()),
+            checked_age_seconds,
+            stale: checked_age_seconds.is_some_and(|age| age > FACT_CACHE_STALE_AFTER.as_secs()),
         }
     }
 
@@ -5880,12 +6085,21 @@ impl FactCacheSummary {
             "schemaVersion": metadata.map(|value| value.schema_version),
             "fetchedAtUnix": metadata.map(|value| value.fetched_at_unix),
             "fetchedAt": metadata.map(|value| unix_timestamp_human(value.fetched_at_unix)),
+            "checkedAtUnix": metadata.map(|value| value.checked_at_unix.unwrap_or(value.fetched_at_unix)),
+            "checkedAt": metadata.map(|value| unix_timestamp_human(value.checked_at_unix.unwrap_or(value.fetched_at_unix))),
             "ageSeconds": self.age_seconds,
             "ageHuman": self.age_seconds.map(human_duration),
+            "checkedAgeSeconds": self.checked_age_seconds,
+            "checkedAgeHuman": self.checked_age_seconds.map(human_duration),
             "staleAfterSeconds": FACT_CACHE_STALE_AFTER.as_secs(),
             "stale": self.stale,
             "factCount": metadata.map(|value| value.fact_count),
             "maxFacts": metadata.map(|value| value.max_facts),
+            "headDigest": metadata.and_then(|value| value.head_digest.clone()),
+            "headFactCount": metadata.and_then(|value| value.head_fact_count),
+            "headLatestAcceptedAt": metadata.and_then(|value| value.head_latest_accepted_at.clone()),
+            "headLatestFactId": metadata.and_then(|value| value.head_latest_fact_id.clone()),
+            "headLatestContentHash": metadata.and_then(|value| value.head_latest_content_hash.clone()),
         })
     }
 
@@ -6373,10 +6587,16 @@ fn print_cache_command_human(object: &serde_json::Map<String, Value>) {
                     "schemaVersion",
                     "factCount",
                     "maxFacts",
+                    "checkedAgeHuman",
+                    "checkedAgeSeconds",
                     "ageHuman",
                     "ageSeconds",
                     "staleAfterSeconds",
                     "stale",
+                    "headDigest",
+                    "headFactCount",
+                    "headLatestFactId",
+                    "headLatestAcceptedAt",
                     "path",
                 ] {
                     if let Some(value) = cache.get(key) {
@@ -6441,7 +6661,21 @@ fn cache_human_line(cache: &serde_json::Map<String, Value>) -> String {
         })
         .unwrap_or_else(|| "unknown".to_string());
     let stale = cache.get("stale").and_then(Value::as_bool).unwrap_or(false);
-    let mut line = format!("Cache: {source}, {facts} facts, last refreshed {age} ago\n");
+    let checked = cache
+        .get("checkedAgeHuman")
+        .and_then(Value::as_str)
+        .map(|value| value.to_string())
+        .or_else(|| {
+            cache
+                .get("checkedAgeSeconds")
+                .and_then(Value::as_u64)
+                .map(human_duration)
+        });
+    let mut line = format!("Cache: {source}, {facts} facts, last refreshed {age} ago");
+    if let Some(checked) = checked.filter(|value| value != &age) {
+        line.push_str(&format!(", checked {checked} ago"));
+    }
+    line.push('\n');
     if stale && source == "cache" {
         line.push_str(
             "Warning: using stale local Matrix cache; run `matrix sync` or add `--refresh-cache` for fresh facts.\n",
@@ -7680,8 +7914,14 @@ mod tests {
                 profile: Some(ConfigProfile::RedWiz),
                 schema_version: 2,
                 fetched_at_unix: unix_now().unwrap(),
+                checked_at_unix: Some(unix_now().unwrap()),
                 fact_count: 1,
                 max_facts: 1000,
+                head_digest: Some("sha256:test-head".to_string()),
+                head_fact_count: Some(1),
+                head_latest_accepted_at: Some("2026-05-22T00:00:00.000Z".to_string()),
+                head_latest_fact_id: Some("fact-1".to_string()),
+                head_latest_content_hash: Some("sha256:test-fact".to_string()),
             },
         )
         .unwrap();
@@ -7705,6 +7945,7 @@ mod tests {
         assert_eq!(metadata.schema_version, 2);
         assert_eq!(metadata.profile, Some(ConfigProfile::RedWiz));
         assert_eq!(metadata.fact_count, 1);
+        assert_eq!(metadata.head_digest.as_deref(), Some("sha256:test-head"));
         assert_eq!(count, 1);
         assert_eq!(zones, 1);
         assert_eq!(persisted_views, 0);

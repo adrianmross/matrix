@@ -1,6 +1,6 @@
 [package]
 name = "matrix"
-version = "0.3.23"
+version = "0.3.24"
 edition = "2024"
 description = "A compatibility matrix CLI for software zones, levels, facts, gates, and traces."
 license = "Apache-2.0"

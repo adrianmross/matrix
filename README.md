@@ -143,8 +143,10 @@ matrix path aphrodite eunomia --offline
 ```
 
 By default, local SQL and graph commands use `cache-policy=auto`: a fresh cache
-hit opens the SQLite database immediately, while a miss, stale cache, or
-too-small cache refreshes from the construct. `--offline` opens the cached
+hit opens the SQLite database immediately, while a stale cache first asks the
+construct for a tiny facts digest. If the digest still matches, Matrix reuses
+the local SQLite database and records the check time; misses, changed digests,
+or too-small caches refresh from the construct. `--offline` opens the cached
 SQLite database directly, `--refresh-cache` forces a refresh, and
 `matrix cache clear` removes the active construct/profile cache file. Configure
 defaults once with `matrix config set cache-policy auto` and
