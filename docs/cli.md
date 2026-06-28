@@ -76,6 +76,8 @@ first. Matrix infers known paths from `requires`, `provides`, and tuple
 the facts already describe that path.
 
 ```bash
+matrix ask 'which putto can work for aphrodite'
+matrix ask 'what version of eunomia is aphrodite using'
 matrix path aphrodite eunomia
 matrix works-with putto aphrodite
 matrix compatible aphrodite putto
@@ -90,9 +92,11 @@ Examples of the questions these answer:
 ```bash
 # What version of Eunomia is Aphrodite using?
 matrix versions eunomia --for aphrodite
+matrix ask 'what version of eunomia is aphrodite using'
 
 # Which Putto facts connect to Aphrodite?
 matrix works-with putto aphrodite
+matrix ask 'which putto can work for aphrodite'
 
 # Why does Matrix think Aphrodite and Eunomia are connected?
 matrix why aphrodite eunomia
@@ -121,6 +125,7 @@ matrix graphql '{ path(from:"aphrodite", to:"eunomia") { status paths { nodes { 
 matrix graphql '{ worksWith(left:"putto", right:"aphrodite") { status paths { edges { capability } } } }' -o json
 matrix graphql '{ versions(component:"eunomia", for:"aphrodite") { versions } }' -o json
 matrix graphql -f queries/aphrodite-path.graphql -o json
+matrix graphql -f queries/version-for.graphql --var component=eunomia --var for=aphrodite -o json
 matrix graph 'aphrodite -> eunomia' -o json
 ```
 
@@ -451,6 +456,24 @@ Use `--target-version` to pin the target side.
 components directly. They infer intermediate bundles from Matrix facts, so a
 query such as `matrix why aphrodite eunomia` can show the Aphrodite to EOS to
 Eunomia evidence path without a `--through eos` flag.
+
+Graph answers include a ranked `recommended` path plus per-path `score`,
+`confidence`, and `reasons`. Use human output for quick inspection and `-o json`
+when an agent or script needs to branch on confidence.
+
+## Producer Coverage
+
+Use producer coverage to see which repositories are emitting facts and whether
+their evidence looks fresh:
+
+```bash
+matrix producers
+matrix producers --zone odin --stale-days 7
+matrix coverage -o json
+```
+
+The summary groups by `sourceRepository`/`source.repo` first and falls back to
+the subject repo when older facts do not carry an explicit producer field.
 
 ## SQL Packs
 

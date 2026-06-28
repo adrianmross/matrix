@@ -44,7 +44,9 @@ matrix> .compare ledger-service
 matrix> .path aphrodite eunomia
 matrix> .works-with putto aphrodite
 matrix> .why aphrodite eunomia
+matrix> .ask which putto can work for aphrodite
 matrix> .resolve aphrodite
+matrix> .producers
 matrix> .read queries/current-runtime.sql
 matrix> .graphql -f queries/aphrodite-path.graphql
 matrix> .mode json
@@ -74,11 +76,15 @@ clears the current local session context.
   subject, or repo.
 - `.path <from> <to>`, `.works-with <a> <b>`, `.why <a> <b>`: answer graph
   compatibility questions from the session fact cache.
+- `.ask <question>`: interpret a beginner-friendly compatibility question and
+  run the matching graph answer.
 - `.resolve <name>`: show how a repo, package, identity, or short component name
   resolves into graph nodes.
 - `.graph <query>` or `.graphql <query>`: run GraphQL-style graph queries from
   the session fact cache.
 - `.graph -f <file>` or `.graphql -f <file>`: run a saved graph query file.
+- `.producers` or `.coverage`: summarize fact producers, coverage, invalid
+  facts, and freshness.
 - `.read <file>`, `.load <file>`, or `.source <file>`: run a saved SQL query
   file against the session cache.
 - `.mode human|table|json|yaml|csv`: change result rendering.
