@@ -76,8 +76,6 @@ first. Matrix infers known paths from `requires`, `provides`, and tuple
 the facts already describe that path.
 
 ```bash
-matrix ask 'which putto can work for aphrodite'
-matrix ask 'what version of eunomia is aphrodite using'
 matrix path aphrodite eunomia
 matrix works-with putto aphrodite
 matrix compatible aphrodite putto
@@ -92,11 +90,9 @@ Examples of the questions these answer:
 ```bash
 # What version of Eunomia is Aphrodite using?
 matrix versions eunomia --for aphrodite
-matrix ask 'what version of eunomia is aphrodite using'
 
 # Which Putto facts connect to Aphrodite?
 matrix works-with putto aphrodite
-matrix ask 'which putto can work for aphrodite'
 
 # Why does Matrix think Aphrodite and Eunomia are connected?
 matrix why aphrodite eunomia
