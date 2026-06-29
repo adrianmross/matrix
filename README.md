@@ -85,12 +85,12 @@ matrix resolve aphrodite
 matrix producers
 matrix sync --max-facts 5000
 matrix cache status
-matrix query -f queries/current-runtime.sql -o json
-matrix query -f queries/current-runtime.sql --offline -o json
+matrix query -f examples/queries/current-runtime.sql -o json
+matrix query -f examples/queries/current-runtime.sql --offline -o json
 matrix graphql --schema
 matrix graphql '{ path(from:"aphrodite", to:"eunomia") { status paths { nodes { component version } } } }' -o json
-matrix graphql -f queries/aphrodite-path.graphql -o json
-matrix graphql -f queries/aphrodite-path.graphql --offline -o json
+matrix graphql -f examples/queries/aphrodite-eunomia-path.graphql --var from=aphrodite --var to=eunomia -o json
+matrix graphql -f examples/queries/aphrodite-eunomia-path.graphql --var from=aphrodite --var to=eunomia --offline -o json
 matrix upload facts.json
 matrix query 'select id, zone, status, subject_name from facts limit 20'
 matrix history release-bundle.api.1.0.0
@@ -125,7 +125,7 @@ matrix path aphrodite eunomia --offline
 matrix query 'select id, zone, status from facts limit 20' --offline
 matrix graphql --schema
 matrix graphql '{ path(from:"aphrodite", to:"eunomia") { status paths { nodes { component version } } } }' -o json
-matrix graphql -f queries/aphrodite-path.graphql -o json
+matrix graphql -f examples/queries/aphrodite-eunomia-path.graphql --var from=aphrodite --var to=eunomia -o json
 ```
 
 The `red-wiz` profile stores the hosted construct URL, the `/v1/compatibility`
@@ -167,6 +167,7 @@ matrix --construct http://127.0.0.1:8080 list
 
 - [CLI guide](docs/cli.md)
 - [Popular commands](docs/cli-popular-cmds.md)
+- [Query examples](docs/query-examples.md)
 - [Producer onboarding](docs/producer-onboarding.md)
 - [Producer coverage boundary](docs/producer-coverage.md)
 - [Interactive REPL](docs/cli-repl.md)

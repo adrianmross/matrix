@@ -1,0 +1,33 @@
+# What is connected to a component right now?
+query ComponentStatus($component: String!) {
+  status(component: $component, limit: 20) {
+    component {
+      component
+      version
+      repo
+      status
+    }
+    outgoingCount
+    incomingCount
+    outgoing {
+      relationship
+      capability
+      to {
+        component
+        version
+        repo
+      }
+      status
+    }
+    incoming {
+      relationship
+      capability
+      from {
+        component
+        version
+        repo
+      }
+      status
+    }
+  }
+}

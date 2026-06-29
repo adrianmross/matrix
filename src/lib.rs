@@ -10604,6 +10604,28 @@ mod tests {
     }
 
     #[test]
+    fn query_examples_are_parseable() {
+        for query in [
+            include_str!("../examples/queries/aphrodite-eunomia-path.graphql"),
+            include_str!("../examples/queries/putto-aphrodite-works-with.graphql"),
+            include_str!("../examples/queries/version-for.graphql"),
+            include_str!("../examples/queries/component-status.graphql"),
+            include_str!("../examples/queries/producer-coverage.graphql"),
+        ] {
+            GraphQlParser::parse(query).unwrap();
+        }
+
+        let db = graph_fixture_db();
+        for sql in [
+            include_str!("../examples/queries/current-runtime.sql"),
+            include_str!("../examples/queries/eos-chaincode-members.sql"),
+            include_str!("../examples/queries/chaincode-athena-compatibility.sql"),
+        ] {
+            execute_readonly_sql(&db, sql).unwrap();
+        }
+    }
+
+    #[test]
     fn producer_inventory_summarizes_fact_sources() {
         let facts = vec![
             json!({
