@@ -476,6 +476,7 @@ their evidence looks fresh:
 ```bash
 matrix producers
 matrix producers --zone odin --stale-days 7
+matrix producers --zone odin --stale-days 7 --audit -o json
 matrix coverage -o json
 ```
 
