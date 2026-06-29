@@ -83,6 +83,8 @@ matrix works-with putto aphrodite
 matrix versions eunomia --for aphrodite
 matrix resolve aphrodite
 matrix producers
+matrix examples list
+matrix examples run version-for -o json
 matrix sync --max-facts 5000
 matrix cache status
 matrix query -f examples/queries/current-runtime.sql -o json
@@ -119,6 +121,7 @@ matrix versions eunomia --for aphrodite
 matrix why aphrodite eunomia
 matrix resolve aphrodite
 matrix producers --zone odin
+matrix examples run aphrodite-eunomia-path -o json
 matrix sync --max-facts 10000
 matrix cache status
 matrix path aphrodite eunomia --offline

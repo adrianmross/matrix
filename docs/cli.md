@@ -112,6 +112,25 @@ matrix works-with putto aphrodite -o json
 matrix versions eunomia --for aphrodite -o json
 ```
 
+## Built-In Examples
+
+Use built-in examples when you are starting out or when an agent needs stable
+query names instead of ad hoc copied commands:
+
+```bash
+matrix examples list
+matrix examples show version-for
+matrix examples run version-for -o json
+matrix examples run aphrodite-eunomia-path -o json
+matrix examples run producer-coverage -o json
+matrix examples run eos-chaincode-members --offline -o table
+```
+
+`matrix examples run` uses the same embedded GraphQL and SQL examples as the
+repository files under `examples/queries`, so it works even when Matrix is
+installed outside the source checkout. Each example also reports the equivalent
+file-based shell command and REPL command in structured output.
+
 Matrix also exposes a deterministic native GraphQL query surface for agents and
 scripts. It supports typed root fields, aliases, selection projection, saved
 documents, and native `--var NAME=VALUE` variable binding. Matrix does not do

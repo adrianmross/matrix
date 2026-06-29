@@ -11,6 +11,16 @@ matrix config set api-prefix /v1/matrix
 matrix completion zsh
 ```
 
+## Start With Examples
+
+```bash
+matrix examples list
+matrix examples show version-for
+matrix examples run version-for -o json
+matrix examples run aphrodite-eunomia-path -o json
+matrix examples run producer-coverage -o json
+```
+
 ## Query The Construct
 
 ```bash

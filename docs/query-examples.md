@@ -4,6 +4,16 @@ These examples are deterministic starting points for humans, agents, and
 scripts. They avoid natural-language handling inside Matrix: translate the
 question into one of these explicit commands, GraphQL documents, or SQL files.
 
+List and run the embedded examples from any install:
+
+```bash
+matrix examples list
+matrix examples show version-for
+matrix examples run version-for -o json
+matrix examples run aphrodite-eunomia-path -o json
+matrix examples run eos-chaincode-members --offline -o table
+```
+
 Run GraphQL examples with `matrix graphql -f`:
 
 ```bash
@@ -68,6 +78,9 @@ For REPL workflows, save any of these into the Matrix snippet directory with
 `.save`, or open the repository copy directly:
 
 ```text
+matrix> .tutorial
+matrix> .examples
+matrix> .example version-for
 matrix> .graphql -f examples/queries/version-for.graphql --var component=eunomia --var for=aphrodite
 matrix> .read examples/queries/eos-chaincode-members.sql
 ```

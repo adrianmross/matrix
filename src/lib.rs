@@ -28,6 +28,20 @@ const RED_WIZ_TOKEN_COMMAND: &str = "wiz auth token --audience platform-api --fo
 const UPDATE_CHECK_TTL: Duration = Duration::from_secs(60 * 60 * 24);
 const FACT_CACHE_STALE_AFTER: Duration = Duration::from_secs(60 * 60 * 24);
 const DEFAULT_FACT_CACHE_MAX_FACTS: usize = 1000;
+const QUERY_EXAMPLE_APHRODITE_EUNOMIA_PATH: &str =
+    include_str!("../examples/queries/aphrodite-eunomia-path.graphql");
+const QUERY_EXAMPLE_PUTTO_APHRODITE_WORKS_WITH: &str =
+    include_str!("../examples/queries/putto-aphrodite-works-with.graphql");
+const QUERY_EXAMPLE_VERSION_FOR: &str = include_str!("../examples/queries/version-for.graphql");
+const QUERY_EXAMPLE_COMPONENT_STATUS: &str =
+    include_str!("../examples/queries/component-status.graphql");
+const QUERY_EXAMPLE_PRODUCER_COVERAGE: &str =
+    include_str!("../examples/queries/producer-coverage.graphql");
+const QUERY_EXAMPLE_CURRENT_RUNTIME: &str = include_str!("../examples/queries/current-runtime.sql");
+const QUERY_EXAMPLE_EOS_CHAINCODE_MEMBERS: &str =
+    include_str!("../examples/queries/eos-chaincode-members.sql");
+const QUERY_EXAMPLE_CHAINCODE_ATHENA_COMPATIBILITY: &str =
+    include_str!("../examples/queries/chaincode-athena-compatibility.sql");
 const MATRIX_GRAPHQL_SCHEMA: &str = r#"schema {
   query: Query
 }
@@ -331,6 +345,7 @@ enum Commands {
     Producers(ProducerInventoryArgs),
     #[command(alias = "graphql")]
     Graph(GraphQueryArgs),
+    Examples(ExamplesCommand),
     Artifacts(ArtifactListArgs),
     Validations(ValidationListArgs),
     Capabilities,
@@ -370,6 +385,34 @@ struct UpdateCommand {
     force: bool,
     #[arg(long)]
     install_path: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct ExamplesCommand {
+    #[command(subcommand)]
+    command: Option<ExamplesSubcommand>,
+}
+
+#[derive(Subcommand)]
+enum ExamplesSubcommand {
+    List,
+    Show { name: String },
+    Run(Box<ExampleRunArgs>),
+}
+
+#[derive(Args)]
+struct ExampleRunArgs {
+    name: String,
+    #[arg(long = "var", value_name = "NAME=VALUE")]
+    vars: Vec<String>,
+    #[arg(long)]
+    max_facts: Option<usize>,
+    #[arg(long, default_value_t = 25)]
+    limit: usize,
+    #[command(flatten)]
+    cache: FactCacheArgs,
+    #[command(flatten)]
+    context: ContextArgs,
 }
 
 #[derive(Args)]
@@ -1007,6 +1050,7 @@ pub async fn run_cli() -> Result<()> {
         Commands::Why(args) => graph_why_command(&matrix, args).await?,
         Commands::Producers(args) => producer_inventory_command(&matrix, args).await?,
         Commands::Graph(args) => graph_query_command(&matrix, args).await?,
+        Commands::Examples(command) => examples_command(&matrix, command).await?,
         Commands::Artifacts(args) => list_artifacts(&matrix, args).await?,
         Commands::Validations(args) => list_validations(&matrix, args).await?,
         Commands::Capabilities => matrix.get("/capabilities").await?,
@@ -2562,6 +2606,283 @@ async fn graph_query_value(
         .map(|value| with_cache_summary(value, &cache))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QueryExampleKind {
+    Graphql,
+    Sql,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct QueryExample {
+    name: &'static str,
+    title: &'static str,
+    question: &'static str,
+    kind: QueryExampleKind,
+    path: &'static str,
+    text: &'static str,
+    vars: &'static [(&'static str, &'static str)],
+    offline_recommended: bool,
+}
+
+const QUERY_EXAMPLES: &[QueryExample] = &[
+    QueryExample {
+        name: "aphrodite-eunomia-path",
+        title: "Aphrodite to Eunomia path",
+        question: "Why are Aphrodite and Eunomia connected?",
+        kind: QueryExampleKind::Graphql,
+        path: "examples/queries/aphrodite-eunomia-path.graphql",
+        text: QUERY_EXAMPLE_APHRODITE_EUNOMIA_PATH,
+        vars: &[("from", "aphrodite"), ("to", "eunomia")],
+        offline_recommended: false,
+    },
+    QueryExample {
+        name: "putto-aphrodite-works-with",
+        title: "Putto works with Aphrodite",
+        question: "Which Putto can work with an Aphrodite version?",
+        kind: QueryExampleKind::Graphql,
+        path: "examples/queries/putto-aphrodite-works-with.graphql",
+        text: QUERY_EXAMPLE_PUTTO_APHRODITE_WORKS_WITH,
+        vars: &[("left", "putto"), ("right", "aphrodite")],
+        offline_recommended: false,
+    },
+    QueryExample {
+        name: "version-for",
+        title: "Version used by a component",
+        question: "What version of Eunomia is Aphrodite using?",
+        kind: QueryExampleKind::Graphql,
+        path: "examples/queries/version-for.graphql",
+        text: QUERY_EXAMPLE_VERSION_FOR,
+        vars: &[("component", "eunomia"), ("for", "aphrodite")],
+        offline_recommended: false,
+    },
+    QueryExample {
+        name: "component-status",
+        title: "Component status",
+        question: "What is connected to Aphrodite right now?",
+        kind: QueryExampleKind::Graphql,
+        path: "examples/queries/component-status.graphql",
+        text: QUERY_EXAMPLE_COMPONENT_STATUS,
+        vars: &[("component", "aphrodite")],
+        offline_recommended: false,
+    },
+    QueryExample {
+        name: "producer-coverage",
+        title: "Producer coverage",
+        question: "Which producers are stale or missing metadata?",
+        kind: QueryExampleKind::Graphql,
+        path: "examples/queries/producer-coverage.graphql",
+        text: QUERY_EXAMPLE_PRODUCER_COVERAGE,
+        vars: &[("limit", "25"), ("staleDays", "7")],
+        offline_recommended: false,
+    },
+    QueryExample {
+        name: "current-runtime",
+        title: "Current runtime context",
+        question: "What does my current repo context see?",
+        kind: QueryExampleKind::Sql,
+        path: "examples/queries/current-runtime.sql",
+        text: QUERY_EXAMPLE_CURRENT_RUNTIME,
+        vars: &[],
+        offline_recommended: false,
+    },
+    QueryExample {
+        name: "eos-chaincode-members",
+        title: "EOS chaincode members",
+        question: "Which chaincode members are in an EOS bundle?",
+        kind: QueryExampleKind::Sql,
+        path: "examples/queries/eos-chaincode-members.sql",
+        text: QUERY_EXAMPLE_EOS_CHAINCODE_MEMBERS,
+        vars: &[],
+        offline_recommended: true,
+    },
+    QueryExample {
+        name: "chaincode-athena-compatibility",
+        title: "Chaincode Athena compatibility",
+        question: "Which chaincode facts connect to Athena?",
+        kind: QueryExampleKind::Sql,
+        path: "examples/queries/chaincode-athena-compatibility.sql",
+        text: QUERY_EXAMPLE_CHAINCODE_ATHENA_COMPATIBILITY,
+        vars: &[],
+        offline_recommended: true,
+    },
+];
+
+async fn examples_command(matrix: &Matrix, command: ExamplesCommand) -> Result<Value> {
+    match command.command.unwrap_or(ExamplesSubcommand::List) {
+        ExamplesSubcommand::List => Ok(query_examples_value()),
+        ExamplesSubcommand::Show { name } => Ok(query_example_show_value(query_example(&name)?)?),
+        ExamplesSubcommand::Run(args) => run_query_example(matrix, *args).await,
+    }
+}
+
+async fn run_query_example(matrix: &Matrix, args: ExampleRunArgs) -> Result<Value> {
+    let example = query_example(&args.name)?;
+    match example.kind {
+        QueryExampleKind::Graphql => {
+            let mut vars = example_var_args(example);
+            vars.extend(args.vars);
+            let mut value = graph_query_value(
+                matrix,
+                example.text,
+                &vars,
+                args.max_facts,
+                args.limit,
+                &args.cache,
+            )
+            .await?;
+            add_example_metadata(&mut value, example);
+            Ok(value)
+        }
+        QueryExampleKind::Sql => {
+            if !args.vars.is_empty() {
+                bail!(
+                    "SQL example {:?} does not accept --var values",
+                    example.name
+                );
+            }
+            let context = MatrixContext::detect_browsing(args.context);
+            let (db, cache) = query_db(matrix, args.max_facts, &context, &args.cache).await?;
+            let mut value = execute_readonly_sql(&db, example.text)
+                .map(|value| with_cache_summary(value, &cache))?;
+            add_example_metadata(&mut value, example);
+            Ok(value)
+        }
+    }
+}
+
+fn query_examples_value() -> Value {
+    json!({
+        "kind": "query-examples",
+        "examples": QUERY_EXAMPLES.iter().map(query_example_summary_value).collect::<Vec<_>>(),
+    })
+}
+
+fn query_example_show_value(example: &QueryExample) -> Result<Value> {
+    Ok(json!({
+        "kind": "query-example",
+        "example": query_example_summary_value(example),
+        "text": example.text.trim(),
+        "command": query_example_command(example, false),
+        "offlineCommand": query_example_command(example, true),
+        "replCommand": query_example_repl_command(example),
+    }))
+}
+
+fn query_example_summary_value(example: &QueryExample) -> Value {
+    json!({
+        "name": example.name,
+        "title": example.title,
+        "question": example.question,
+        "kind": example.kind.as_str(),
+        "path": example.path,
+        "variables": example.vars.iter().map(|(name, value)| {
+            json!({"name": name, "default": value})
+        }).collect::<Vec<_>>(),
+        "command": query_example_command(example, false),
+        "replCommand": query_example_repl_command(example),
+    })
+}
+
+fn add_example_metadata(value: &mut Value, example: &QueryExample) {
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "example".to_string(),
+            json!({
+                "name": example.name,
+                "title": example.title,
+                "question": example.question,
+                "kind": example.kind.as_str(),
+                "equivalentCommand": query_example_command(example, false),
+                "replCommand": query_example_repl_command(example),
+            }),
+        );
+    }
+}
+
+fn query_example(name: &str) -> Result<&'static QueryExample> {
+    let normalized = name.trim();
+    QUERY_EXAMPLES
+        .iter()
+        .find(|example| example.name == normalized)
+        .ok_or_else(|| {
+            anyhow!(
+                "unknown Matrix example {normalized:?}; run `matrix examples list` to see available examples"
+            )
+        })
+}
+
+fn example_var_args(example: &QueryExample) -> Vec<String> {
+    example
+        .vars
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect()
+}
+
+fn query_example_command(example: &QueryExample, force_offline: bool) -> String {
+    let offline = force_offline || example.offline_recommended;
+    match example.kind {
+        QueryExampleKind::Graphql => {
+            let vars = example
+                .vars
+                .iter()
+                .map(|(name, value)| format!(" --var {name}={value}"))
+                .collect::<String>();
+            format!(
+                "matrix graphql -f {}{}{} -o json",
+                shell_word(example.path),
+                vars,
+                if offline { " --offline" } else { "" },
+            )
+        }
+        QueryExampleKind::Sql => {
+            format!(
+                "matrix query -f {}{} -o {}",
+                shell_word(example.path),
+                if offline { " --offline" } else { "" },
+                if example.offline_recommended {
+                    "table"
+                } else {
+                    "json"
+                },
+            )
+        }
+    }
+}
+
+fn query_example_repl_command(example: &QueryExample) -> String {
+    match example.kind {
+        QueryExampleKind::Graphql => {
+            let vars = example
+                .vars
+                .iter()
+                .map(|(name, value)| format!(" --var {name}={value}"))
+                .collect::<String>();
+            format!(".example {}{vars}", example.name)
+        }
+        QueryExampleKind::Sql => format!(".example {}", example.name),
+    }
+}
+
+fn shell_word(value: &str) -> String {
+    if value.chars().all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '/' | '.' | '-' | '_')
+    }) {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+impl QueryExampleKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Graphql => "graphql",
+            Self::Sql => "sql",
+        }
+    }
+}
+
 fn query_text(inline: Option<String>, file: Option<PathBuf>, label: &str) -> Result<String> {
     match (inline, file) {
         (Some(value), None) if !value.trim().is_empty() => Ok(value),
@@ -3042,9 +3363,21 @@ fn execute_graphql_field(
             )
         }
         other => bail!(
-            "unsupported GraphQL root field {other:?}; expected path, worksWith, status, versions, resolve, or producers"
+            "unsupported GraphQL root field {other:?}; expected one of {}. Run `matrix graphql --schema` for the schema or `matrix examples list` for copyable examples.",
+            supported_graphql_root_fields().join(", ")
         ),
     }
+}
+
+fn supported_graphql_root_fields() -> Vec<&'static str> {
+    vec![
+        "path",
+        "worksWith",
+        "status",
+        "versions",
+        "resolve",
+        "producers",
+    ]
 }
 
 fn graphql_string_arg(
@@ -5033,6 +5366,26 @@ impl<'a> ReplSession<'a> {
         self.print_value(&value)
     }
 
+    fn run_query_example(&self, name: &str, vars: &[String], limit: usize) -> Result<()> {
+        let example = query_example(name)?;
+        match example.kind {
+            QueryExampleKind::Graphql => {
+                let mut merged_vars = example_var_args(example);
+                merged_vars.extend(vars.iter().cloned());
+                self.run_graph_query(example.text, &merged_vars, limit)
+            }
+            QueryExampleKind::Sql => {
+                if !vars.is_empty() {
+                    bail!(
+                        "SQL example {:?} does not accept --var values",
+                        example.name
+                    );
+                }
+                self.run_sql(example.text.trim().trim_end_matches(';').trim())
+            }
+        }
+    }
+
     fn explain_graph_query(&self, query: &str, vars: &[String], limit: usize) -> Result<()> {
         let graph = self.graph()?;
         let variables = parse_graphql_variables(vars)?;
@@ -5084,6 +5437,7 @@ impl<'a> ReplSession<'a> {
                 eprintln!("Session context reset to auto-detected values.");
             }
             "help" | "?" => print_repl_help(),
+            "tutorial" => print_repl_tutorial(),
             "context" | "ctx" => self.handle_context_command(parts.collect::<Vec<_>>())?,
             "zone" | "repo" | "component" | "version" | "tag" | "sha" | "ref" => {
                 self.set_context_field(name, &parts.collect::<Vec<_>>().join(" "))?;
@@ -5278,6 +5632,16 @@ impl<'a> ReplSession<'a> {
                 self.print_value(&value)?;
             }
             "examples" => print_repl_examples(),
+            "example" => {
+                let mut args = parts.collect::<Vec<_>>();
+                if args.is_empty() {
+                    eprintln!("Usage: .example <name> [--var name=value] [--limit N]");
+                } else {
+                    let name = args.remove(0);
+                    let graph_args = parse_repl_graph_args(args)?;
+                    self.run_query_example(name, &graph_args.vars, graph_args.limit)?;
+                }
+            }
             "describe" | "desc" | "d" => {
                 let table = parts.next().unwrap_or("facts");
                 self.run_sql(&format!(
@@ -6687,6 +7051,8 @@ Matrix shell commands
   .coverage                 Alias for .producers
   .read <file>              Run a saved SQL query file
   .examples                 Show copyable query examples
+  .example <name>           Run a built-in query example
+  .tutorial                 Show a short guided workflow with shell equivalents
   .explain <sql>            Run EXPLAIN QUERY PLAN
   .explain graph <query>    Explain a graph or GraphQL query
   red, red-pill, .exit      Exit
@@ -6707,37 +7073,55 @@ SQL
 
 #[cfg(feature = "interactive")]
 fn print_repl_examples() {
-    let examples = r#"Matrix SQL examples
+    println!("Matrix query examples\n");
+    for example in QUERY_EXAMPLES {
+        println!(
+            "{}\n  {}\n  repl:  {}\n  shell: {}\n",
+            example.name,
+            example.question,
+            query_example_repl_command(example),
+            query_example_command(example, false),
+        );
+    }
+    println!(
+        "Use `.example <name>` to run one here, or `matrix examples run <name>` outside the REPL."
+    );
+}
 
-select * from current;
+#[cfg(feature = "interactive")]
+fn print_repl_tutorial() {
+    let tutorial = r#"Matrix tutorial
 
-select current_version, capability, component, version, status
-from upstream;
+1. Check session state and cache freshness.
+   REPL:  .status
+   Shell: matrix cache status
 
-select current_version, capability, component, version, status
-from downstream;
+2. See the built-in examples.
+   REPL:  .examples
+   Shell: matrix examples list
 
-select component, version, runtime, platform
-from members
-where fact_id==release-bundle.api.1.0.0;
+3. Ask which Eunomia version Aphrodite uses.
+   REPL:  .example version-for
+   Shell: matrix examples run version-for -o json
 
-select edge, target, target_version, runtime, platform
-from deref
-where fact_id==release-bundle.api.1.0.0;
+4. Inspect why Aphrodite and Eunomia connect.
+   REPL:  .example aphrodite-eunomia-path
+   Shell: matrix examples run aphrodite-eunomia-path -o json
 
-.members release-bundle.api.1.0.0
-.deref release-bundle.api.1.0.0
-.history release-bundle.api.1.0.0 --relative -1
-.history release-bundle.api.1.0.0 --as-of 2026-06-19
-.compare ledger-service
-.why example/ledger-service --target-version v2.4.0
-.graphql --schema
-.graphql --var component=eunomia --var for=aphrodite query Matrix($component:String!,$for:String!) { versions(component:$component, for:$for) { versions } }
-.explain graph aphrodite -> eunomia
-.save aphrodite-path { path(from:"aphrodite", to:"eunomia") { status paths { confidence nodes { component version } } } }
-.open aphrodite-path
+5. Check producer freshness and metadata.
+   REPL:  .producers
+   Shell: matrix producers --audit -o json
+
+6. Switch to a repo or component context.
+   REPL:  .repo red-wiz/aphrodite
+   Shell: matrix query -f examples/queries/current-runtime.sql --repo red-wiz/aphrodite -o json
+
+7. Work offline after warming the cache.
+   REPL:  .offline
+   Shell: matrix sync --max-facts 10000
+          matrix examples run version-for --offline -o json
 "#;
-    println!("{examples}");
+    println!("{tutorial}");
 }
 
 #[cfg(feature = "interactive")]
@@ -6786,6 +7170,7 @@ impl MatrixCompleter {
             ".describe",
             ".deref",
             ".examples",
+            ".example",
             ".explain",
             ".gate",
             ".graph",
@@ -6820,6 +7205,7 @@ impl MatrixCompleter {
             ".tags",
             ".timing",
             ".trace",
+            ".tutorial",
             ".use",
             ".version",
             ".versions",
@@ -8845,6 +9231,39 @@ mod tests {
     }
 
     #[test]
+    fn accepts_query_example_commands() {
+        let list = Cli::try_parse_from(["matrix", "examples"]).unwrap();
+        match list.command {
+            Commands::Examples(ExamplesCommand { command: None }) => {}
+            _ => panic!("expected default examples command"),
+        }
+
+        let run = Cli::try_parse_from([
+            "matrix",
+            "examples",
+            "run",
+            "version-for",
+            "--var",
+            "component=eunomia",
+            "--offline",
+            "-o",
+            "json",
+        ])
+        .unwrap();
+        assert_eq!(run.output, OutputFormat::Json);
+        match run.command {
+            Commands::Examples(ExamplesCommand {
+                command: Some(ExamplesSubcommand::Run(args)),
+            }) => {
+                assert_eq!(args.name, "version-for");
+                assert_eq!(args.vars, vec!["component=eunomia"]);
+                assert!(args.cache.offline);
+            }
+            _ => panic!("expected examples run command"),
+        }
+    }
+
+    #[test]
     fn accepts_fact_cache_commands_and_offline_flags() {
         let sync = Cli::try_parse_from(["matrix", "sync", "--max-facts", "250"]).unwrap();
         match sync.command {
@@ -10690,24 +11109,44 @@ mod tests {
 
     #[test]
     fn query_examples_are_parseable() {
-        for query in [
-            include_str!("../examples/queries/aphrodite-eunomia-path.graphql"),
-            include_str!("../examples/queries/putto-aphrodite-works-with.graphql"),
-            include_str!("../examples/queries/version-for.graphql"),
-            include_str!("../examples/queries/component-status.graphql"),
-            include_str!("../examples/queries/producer-coverage.graphql"),
-        ] {
-            GraphQlParser::parse(query).unwrap();
-        }
-
         let db = graph_fixture_db();
-        for sql in [
-            include_str!("../examples/queries/current-runtime.sql"),
-            include_str!("../examples/queries/eos-chaincode-members.sql"),
-            include_str!("../examples/queries/chaincode-athena-compatibility.sql"),
-        ] {
-            execute_readonly_sql(&db, sql).unwrap();
+        let graph = GraphIndex::from_db(&db).unwrap();
+        for example in QUERY_EXAMPLES {
+            match example.kind {
+                QueryExampleKind::Graphql => {
+                    GraphQlParser::parse(example.text).unwrap();
+                    let vars = parse_graphql_variables(&example_var_args(example)).unwrap();
+                    execute_graphql_document(&db, &graph, example.text, &vars, 5).unwrap();
+                }
+                QueryExampleKind::Sql => {
+                    execute_readonly_sql(&db, example.text).unwrap();
+                }
+            }
         }
+    }
+
+    #[test]
+    fn query_example_catalog_exposes_equivalent_commands() {
+        let value = query_examples_value();
+        let examples = value["examples"].as_array().unwrap();
+        assert!(
+            examples
+                .iter()
+                .any(|example| example["name"] == "version-for")
+        );
+
+        let version_for = query_example("version-for").unwrap();
+        assert!(query_example_command(version_for, false).contains("matrix graphql -f"));
+        assert_eq!(
+            query_example_repl_command(version_for),
+            ".example version-for --var component=eunomia --var for=aphrodite"
+        );
+        assert!(
+            query_example_show_value(version_for).unwrap()["text"]
+                .as_str()
+                .unwrap()
+                .contains("query VersionFor")
+        );
     }
 
     #[test]
