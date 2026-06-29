@@ -43,7 +43,7 @@ matrix works-with putto aphrodite -o json
 matrix versions eunomia --for aphrodite -o json
 matrix graphql --schema
 matrix graphql '{ path(from:"aphrodite", to:"eunomia") { status paths { nodes { component version } } } }' -o json
-matrix graphql -f queries/aphrodite-path.graphql -o json
+matrix graphql -f examples/queries/aphrodite-eunomia-path.graphql --var from=aphrodite --var to=eunomia -o json
 matrix graphql 'query VersionFor($component:String!,$for:String!) { versions(component:$component, for:$for) { versions } }' --var component=eunomia --var for=aphrodite -o json
 ```
 
@@ -54,7 +54,7 @@ matrix sync --max-facts 10000
 matrix cache status
 matrix query 'select id, zone, status from facts limit 20' --offline
 matrix path aphrodite eunomia --offline
-matrix graphql -f queries/aphrodite-path.graphql --offline -o json
+matrix graphql -f examples/queries/aphrodite-eunomia-path.graphql --var from=aphrodite --var to=eunomia --offline -o json
 ```
 
 Use this when you are iterating on saved SQL/GraphQL files, demoing without a
@@ -120,7 +120,7 @@ matrix query --zone runtime 'select * from zone where type==service and status==
 matrix query --repo example/payments-api 'select * from upstream'
 matrix query --repo example/auth-service 'select * from downstream'
 matrix query 'select alias, identity from identity_aliases order by alias limit 25'
-matrix query -f queries/current-runtime.sql -o json
+matrix query -f examples/queries/current-runtime.sql -o json
 ```
 
 ## Fact Bundles

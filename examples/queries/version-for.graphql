@@ -1,0 +1,22 @@
+# What version of one component is another component using?
+query VersionFor($component: String!, $for: String!) {
+  versions(component: $component, for: $for, limit: 10) {
+    component {
+      component
+      version
+      repo
+    }
+    for {
+      component
+      version
+      repo
+    }
+    versions
+    versionCandidates {
+      version
+      confidence
+      score
+      pathCount
+    }
+  }
+}

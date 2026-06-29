@@ -1,0 +1,29 @@
+# Which producers are emitting facts, and are any stale or missing metadata?
+query ProducerCoverage($limit: Int!, $staleDays: Int!) {
+  producers(limit: $limit, staleDays: $staleDays) {
+    summary {
+      producers
+      staleProducers
+      facts
+      invalidFacts
+      sourceRepoFacts
+      inferredSubjectRepoFacts
+      unknownProducerFacts
+      missingProducerMetadataFacts
+      staleAfterDays
+    }
+    rows {
+      producer
+      facts
+      components
+      zones
+      invalid_facts
+      source_repo_facts
+      inferred_subject_repo_facts
+      unknown_producer_facts
+      producer_metadata
+      freshness
+      last_observed_at
+    }
+  }
+}

@@ -124,8 +124,8 @@ matrix graphql '{ path(from:"aphrodite", to:"eunomia") { status paths { nodes { 
 matrix graphql '{ worksWith(left:"putto", right:"aphrodite") { status paths { edges { capability } } } }' -o json
 matrix graphql '{ versions(component:"eunomia", for:"aphrodite") { versions } }' -o json
 matrix graphql '{ producers(limit:10) { summary { producers facts } rows { producer freshness } } }' -o json
-matrix graphql -f queries/aphrodite-path.graphql -o json
-matrix graphql -f queries/version-for.graphql --var component=eunomia --var for=aphrodite -o json
+matrix graphql -f examples/queries/aphrodite-eunomia-path.graphql --var from=aphrodite --var to=eunomia -o json
+matrix graphql -f examples/queries/version-for.graphql --var component=eunomia --var for=aphrodite -o json
 matrix graph 'aphrodite -> eunomia' -o json
 ```
 
@@ -167,12 +167,12 @@ queries:
 matrix sync --max-facts 10000
 matrix cache status
 matrix query 'select id, zone, status from facts limit 20' --offline
-matrix query -f queries/current-runtime.sql --offline -o json
+matrix query -f examples/queries/current-runtime.sql --offline -o json
 matrix path aphrodite eunomia --offline
 matrix works-with putto aphrodite --offline
 matrix why aphrodite eunomia --offline
 matrix resolve aphrodite --offline
-matrix graphql -f queries/aphrodite-path.graphql --offline -o json
+matrix graphql -f examples/queries/aphrodite-eunomia-path.graphql --var from=aphrodite --var to=eunomia --offline -o json
 matrix cache clear
 ```
 
@@ -212,6 +212,8 @@ cache was refreshed and checked. JSON/YAML output includes
 `cache.checkedAtUnix`, `cache.checkedAgeSeconds`, `cache.checkedAgeHuman`,
 `cache.headDigest`, and `cache.stale`.
 
+For copyable GraphQL and SQL files, see [Query examples](query-examples.md).
+
 ## Context Queries
 
 `matrix query` and `matrix enter` detect the current git repository, branch,
@@ -221,8 +223,8 @@ tag, and SHA. Override that context when needed:
 matrix query --zone runtime --repo example/payments-api \
   'select * from zone where type==service and status!=failed'
 
-matrix query -f queries/current-runtime.sql -o json
-matrix query -f queries/current-runtime.sql --offline -o json
+matrix query -f examples/queries/current-runtime.sql -o json
+matrix query -f examples/queries/current-runtime.sql --offline -o json
 
 matrix enter --zone runtime --repo example/ledger-service
 ```

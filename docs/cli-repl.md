@@ -46,10 +46,10 @@ matrix> .works-with putto aphrodite
 matrix> .why aphrodite eunomia
 matrix> .resolve aphrodite
 matrix> .producers
-matrix> .read queries/current-runtime.sql
+matrix> .read examples/queries/current-runtime.sql
 matrix> .graphql --schema
 matrix> .graphql --var component=eunomia --var for=aphrodite query Matrix($component:String!,$for:String!) { versions(component:$component, for:$for) { versions } }
-matrix> .graphql -f queries/aphrodite-path.graphql
+matrix> .graphql -f examples/queries/aphrodite-eunomia-path.graphql --var from=aphrodite --var to=eunomia
 matrix> .explain graph aphrodite -> eunomia
 matrix> .save aphrodite-path { path(from:"aphrodite", to:"eunomia") { status paths { confidence nodes { component version } } } }
 matrix> .open aphrodite-path
@@ -124,6 +124,8 @@ clears the current local session context.
 - `.zones`, `.subjects`, `.trace <subject>`: Matrix-native inspection helpers.
 - `.gate <zone> [level]`: fetch a gate decision from the construct.
 - `.explain <sql>`: run `EXPLAIN QUERY PLAN`.
+
+For copyable GraphQL and SQL files, see [Query examples](query-examples.md).
 
 ## Useful GraphQL
 

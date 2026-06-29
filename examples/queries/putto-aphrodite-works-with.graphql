@@ -1,0 +1,31 @@
+# Which Putto facts connect to Aphrodite?
+query PuttoAphroditeWorksWith($left: String!, $right: String!) {
+  worksWith(left: $left, right: $right, limit: 5) {
+    status
+    compatible
+    confidence
+    direction
+    reasons
+    recommended {
+      confidence
+      score
+      reasons
+      edges {
+        relationship
+        capability
+        capabilityVersion
+        sourceVersion
+        targetVersion
+        status
+      }
+    }
+    paths {
+      confidence
+      nodes {
+        component
+        version
+        repo
+      }
+    }
+  }
+}
