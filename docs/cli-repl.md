@@ -150,10 +150,16 @@ quit
 ```
 
 `.tutorial` enters tutorial mode and shows one step at a time. Press Enter or
-type `next` to advance, `back` to review, `run` to execute the step's safe REPL
-commands, `shell` to print the equivalent non-REPL commands, `steps` to list the
-whole path, and `quit` to leave tutorial mode. While tutorial mode is active,
-plain input is interpreted as tutorial controls instead of SQL.
+type `next` to advance, `back` to review, `show` or `help` to redraw the
+current step, `run` to execute the step's safe REPL commands, `shell` to print
+the equivalent non-REPL commands, `steps` to list the whole path, and `quit` to
+leave tutorial mode. Tutorial mode keeps a compact hint visible near the prompt
+and uses highlighted command blocks when the terminal supports ANSI color.
+
+While tutorial mode is active, dotted input such as `.status`, `.examples`, or
+`.graphql ...` runs as a normal REPL command and then returns to the tutorial.
+Plain input is reserved for tutorial controls, and complete SQL ending in `;`
+still runs against the session cache.
 
 The guided path covers session/cache status, examples, GraphQL queries, producer
 coverage, Wiz-to-Matrix producer readback, repo context, and offline cache use.
