@@ -79,6 +79,10 @@ See [examples/producers/fact-batch.json](../examples/producers/fact-batch.json)
 for a complete custom batch with validation, capability provider,
 requirement/consumer, and SBOM/provenance-style facts.
 
+If the repository still dispatches or checks out
+`red-wiz/compatibility-matrix`, migrate through
+[Legacy compatibility-matrix migration](legacy-compatibility-migration.md).
+
 ## Common Producer Commands
 
 Normalize and inspect facts without publishing:
