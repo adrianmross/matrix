@@ -76,8 +76,9 @@ clears the current local session context.
 - `.examples`: print copyable SQL and helper-command examples.
 - `.example <name>`: run a built-in GraphQL or SQL query example from the
   current session cache.
-- `.tutorial`: print a short guided workflow with equivalent shell commands for
-  each REPL step.
+- `.tutorial`: start an interactive guided workflow with equivalent shell
+  commands for each REPL step.
+- `.tutorial print`: print the static tutorial without entering tutorial mode.
 - `.get <fact-id>`: show the current or selected revision of a fact.
 - `.members <fact-id>`: show tuple members for a fact.
 - `.deref <fact-id>`: show member, requirement, and provide edges for a fact.
@@ -140,14 +141,23 @@ normal command:
 
 ```text
 .tutorial
-.examples
-.example version-for
-.example aphrodite-eunomia-path
-.producers
+run
+next
+shell
+back
+steps
+quit
 ```
 
-The tutorial output includes the equivalent `matrix ...` shell command beside
-each REPL command, so the same flow can be copied into scripts or agent plans.
+`.tutorial` enters tutorial mode and shows one step at a time. Press Enter or
+type `next` to advance, `back` to review, `run` to execute the step's safe REPL
+commands, `shell` to print the equivalent non-REPL commands, `steps` to list the
+whole path, and `quit` to leave tutorial mode. While tutorial mode is active,
+plain input is interpreted as tutorial controls instead of SQL.
+
+The guided path covers session/cache status, examples, GraphQL queries, producer
+coverage, Wiz-to-Matrix producer readback, repo context, and offline cache use.
+Run `.tutorial print` when you only want the copyable static version.
 
 ## Useful GraphQL
 
