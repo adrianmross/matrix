@@ -645,6 +645,8 @@ struct ProducerInventoryArgs {
     limit: usize,
     #[arg(long, default_value_t = 14)]
     stale_days: i64,
+    #[arg(long, help = "Include fact-side producer audit findings")]
+    audit: bool,
     #[command(flatten)]
     cache: FactCacheArgs,
     #[command(flatten)]
@@ -2491,6 +2493,7 @@ async fn producer_inventory_command(matrix: &Matrix, args: ProducerInventoryArgs
         &filter_context,
         args.limit.max(1),
         args.stale_days.max(1),
+        args.audit,
     )
     .map(|value| with_cache_summary(value, &cache))
 }
@@ -2694,6 +2697,7 @@ fn producer_inventory_value(
     context: &MatrixContext,
     limit: usize,
     stale_days: i64,
+    audit: bool,
 ) -> Result<Value> {
     let rows = execute_readonly_sql(db, &producer_inventory_sql(context, limit, stale_days))?;
     let producers = query_rows(&rows).as_array().cloned().unwrap_or_default();
@@ -2729,7 +2733,7 @@ fn producer_inventory_value(
         .iter()
         .filter_map(|row| row.get("unknown_producer_facts").and_then(Value::as_i64))
         .sum::<i64>();
-    Ok(json!({
+    let mut value = json!({
         "kind": "producer-inventory",
         "summary": {
             "producers": total_producers,
@@ -2744,7 +2748,82 @@ fn producer_inventory_value(
         },
         "columns": rows["columns"].clone(),
         "rows": producers,
-    }))
+    });
+    if audit {
+        let findings = value["rows"]
+            .as_array()
+            .map(|rows| producer_audit_findings(rows))
+            .unwrap_or_else(|| producer_audit_findings(&[]));
+        if let Some(object) = value.as_object_mut() {
+            object.insert("audit".to_string(), Value::Array(findings));
+        }
+    }
+    Ok(value)
+}
+
+fn producer_audit_findings(producers: &[Value]) -> Vec<Value> {
+    let mut findings = Vec::new();
+    if producers.is_empty() {
+        findings.push(json!({
+            "severity": "warn",
+            "code": "no-producers",
+            "detail": "no compatibility fact producers matched the current Matrix filters",
+            "fix": "publish facts with matrix upload, matrix ingest --upload, or the shared producer action",
+        }));
+        return findings;
+    }
+    for row in producers {
+        let producer = row
+            .get("producer")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let freshness = row
+            .get("freshness")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        if freshness == "stale" {
+            findings.push(json!({
+                "severity": "warn",
+                "code": "stale-producer",
+                "producer": producer,
+                "detail": "producer has not emitted fresh compatibility facts within the configured stale window",
+                "fix": format!("inspect producer runtime and confirm repo workflow posture with `wiz repo health --repo {producer} -v`"),
+            }));
+        }
+        let invalid_facts = row
+            .get("invalid_facts")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        if invalid_facts > 0 {
+            findings.push(json!({
+                "severity": "warn",
+                "code": "invalid-facts",
+                "producer": producer,
+                "facts": invalid_facts,
+                "detail": "producer emitted incompatible, failed, invalid, or blocked facts",
+                "fix": "query invalid_facts for the producer and inspect linked evidence",
+            }));
+        }
+        let missing_metadata = row
+            .get("inferred_subject_repo_facts")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            + row
+                .get("unknown_producer_facts")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+        if missing_metadata > 0 {
+            findings.push(json!({
+                "severity": "info",
+                "code": "missing-producer-metadata",
+                "producer": producer,
+                "facts": missing_metadata,
+                "detail": "some facts were grouped by subject repo fallback or unknown producer metadata",
+                "fix": "emit explicit source.repo, source.sha, and source.ref metadata",
+            }));
+        }
+    }
+    findings
 }
 
 fn producer_inventory_sql(context: &MatrixContext, limit: usize, stale_days: i64) -> String {
@@ -2954,7 +3033,13 @@ fn execute_graphql_field(
             let stale_days = graphql_i64_arg(field, vars, &["staleDays", "stale_days"])?
                 .unwrap_or(14)
                 .max(1);
-            producer_inventory_value(db, &MatrixContext::default(), limit.max(1), stale_days)
+            producer_inventory_value(
+                db,
+                &MatrixContext::default(),
+                limit.max(1),
+                stale_days,
+                false,
+            )
         }
         other => bail!(
             "unsupported GraphQL root field {other:?}; expected path, worksWith, status, versions, resolve, or producers"
@@ -5189,7 +5274,7 @@ impl<'a> ReplSession<'a> {
                 self.print_value(&value)?;
             }
             "producers" | "coverage" => {
-                let value = producer_inventory_value(&self.db, &self.context, 50, 14)?;
+                let value = producer_inventory_value(&self.db, &self.context, 50, 14, false)?;
                 self.print_value(&value)?;
             }
             "examples" => print_repl_examples(),
@@ -10661,7 +10746,7 @@ mod tests {
             }),
         ];
         let db = build_facts_db(&facts, &MatrixContext::default()).unwrap();
-        let value = producer_inventory_value(&db, &MatrixContext::default(), 10, 14).unwrap();
+        let value = producer_inventory_value(&db, &MatrixContext::default(), 10, 14, true).unwrap();
 
         assert_eq!(value["kind"], "producer-inventory");
         assert_eq!(value["summary"]["producers"], 3);
@@ -10669,6 +10754,20 @@ mod tests {
         assert_eq!(value["summary"]["sourceRepoFacts"], 3);
         assert_eq!(value["summary"]["inferredSubjectRepoFacts"], 1);
         assert_eq!(value["summary"]["missingProducerMetadataFacts"], 1);
+        assert!(
+            value["audit"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|finding| finding["code"] == "invalid-facts")
+        );
+        assert!(
+            value["audit"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|finding| finding["code"] == "missing-producer-metadata")
+        );
         assert_eq!(value["rows"][0]["producer"], "red-wiz/athena");
         assert_eq!(
             value["rows"][0]["producer_metadata"],
@@ -10684,11 +10783,25 @@ mod tests {
             },
             10,
             14,
+            true,
         )
         .unwrap();
         assert_eq!(odin["summary"]["producers"], 2);
         assert_eq!(odin["summary"]["facts"], 3);
         assert_eq!(odin["summary"]["missingProducerMetadataFacts"], 0);
+
+        let missing = producer_inventory_value(
+            &db,
+            &MatrixContext {
+                zone: Some("missing".to_string()),
+                ..MatrixContext::default()
+            },
+            10,
+            14,
+            true,
+        )
+        .unwrap();
+        assert_eq!(missing["audit"][0]["code"], "no-producers");
     }
 
     #[test]

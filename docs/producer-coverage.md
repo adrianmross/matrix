@@ -22,6 +22,7 @@ Agents can combine both structured outputs when they need an org-level answer:
 
 ```bash
 matrix producers --zone odin --stale-days 7 -o json
+matrix producers --zone odin --stale-days 7 --audit -o json
 wiz repo health --repo red-wiz/eos -o json
 ```
 
@@ -73,6 +74,16 @@ wiz repo health --repo red-wiz/eos -o json
 when recommending producer cleanup. It means Matrix could ingest the fact, but
 the producer should start sending explicit `source.repo` or
 `sourceRepository`.
+
+Add `--audit` when you want Matrix to return fact-side findings:
+
+```bash
+matrix producers --repo red-wiz/eos --audit -o json
+```
+
+Audit findings are limited to Matrix-owned evidence: no matching producers,
+stale producers, invalid facts, and missing producer metadata. Use Wiz repo
+health for workflow adoption, pinning, and OIDC posture.
 
 ## Wiz Handoff
 

@@ -90,6 +90,7 @@ matrix works-with putto aphrodite
 matrix versions eunomia --for aphrodite
 matrix why aphrodite eunomia
 matrix producers --zone odin
+matrix producers --zone odin --audit -o json
 ```
 
 Graph answers rank paths and show confidence. Add `-o json` for agents and
