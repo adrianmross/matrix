@@ -4279,6 +4279,226 @@ fn parse_repl_get_args(args: Vec<&str>) -> Result<FactGetArgs> {
     }
 }
 
+#[cfg(feature = "interactive")]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ReplGraphArgs {
+    query: Option<String>,
+    file: Option<PathBuf>,
+    vars: Vec<String>,
+    schema: bool,
+    limit: usize,
+}
+
+#[cfg(feature = "interactive")]
+fn parse_repl_graph_args(args: Vec<&str>) -> Result<ReplGraphArgs> {
+    let mut parsed = ReplGraphArgs {
+        limit: 10,
+        ..ReplGraphArgs::default()
+    };
+    let mut query = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let value = args[index];
+        match value {
+            "--schema" => parsed.schema = true,
+            "-f" | "--file" => {
+                index += 1;
+                let Some(path) = args.get(index) else {
+                    bail!("{value} requires a file path");
+                };
+                parsed.file = Some(PathBuf::from(path));
+            }
+            "--var" => {
+                index += 1;
+                let Some(var) = args.get(index) else {
+                    bail!("--var requires NAME=VALUE");
+                };
+                parsed.vars.push((*var).to_string());
+            }
+            "--limit" => {
+                index += 1;
+                let Some(limit) = args.get(index) else {
+                    bail!("--limit requires a number");
+                };
+                parsed.limit = limit
+                    .parse::<usize>()
+                    .with_context(|| format!("invalid graph limit {limit:?}"))?
+                    .max(1);
+            }
+            value if value.starts_with("--var=") => {
+                parsed
+                    .vars
+                    .push(value.trim_start_matches("--var=").to_string());
+            }
+            value if value.starts_with("--limit=") => {
+                let limit = value.trim_start_matches("--limit=");
+                parsed.limit = limit
+                    .parse::<usize>()
+                    .with_context(|| format!("invalid graph limit {limit:?}"))?
+                    .max(1);
+            }
+            value => {
+                query.push(value.to_string());
+                query.extend(args[index + 1..].iter().map(|value| (*value).to_string()));
+                break;
+            }
+        }
+        index += 1;
+    }
+    if !query.is_empty() {
+        parsed.query = Some(query.join(" "));
+    }
+    if parsed.query.is_some() && parsed.file.is_some() {
+        bail!("provide a graph query inline or with --file, not both");
+    }
+    Ok(parsed)
+}
+
+#[cfg(feature = "interactive")]
+fn repl_graph_query_text(args: &ReplGraphArgs) -> Result<String> {
+    query_text(args.query.clone(), args.file.clone(), "graph query")
+}
+
+#[cfg(feature = "interactive")]
+fn graph_input_description(input: &GraphQlInput) -> Value {
+    match input {
+        GraphQlInput::String(value) => json!({"kind": "string", "value": value}),
+        GraphQlInput::Int(value) => json!({"kind": "int", "value": value}),
+        GraphQlInput::Bool(value) => json!({"kind": "bool", "value": value}),
+        GraphQlInput::Variable(value) => json!({"kind": "variable", "name": value}),
+        GraphQlInput::Null => json!({"kind": "null"}),
+    }
+}
+
+#[cfg(feature = "interactive")]
+fn graph_field_description(field: &GraphQlField) -> Value {
+    json!({
+        "responseKey": field.response_key,
+        "field": field.name,
+        "arguments": field.args.iter().map(|(name, value)| {
+            json!({"name": name, "value": graph_input_description(value)})
+        }).collect::<Vec<_>>(),
+        "selection": field.selection.iter().map(graph_field_description).collect::<Vec<_>>(),
+    })
+}
+
+#[cfg(feature = "interactive")]
+fn graph_request_description(request: &GraphRequest) -> Value {
+    match request {
+        GraphRequest::Path { source, target } => json!({
+            "type": "path",
+            "source": source,
+            "target": target,
+        }),
+        GraphRequest::WorksWith { left, right } => json!({
+            "type": "worksWith",
+            "left": left,
+            "right": right,
+        }),
+        GraphRequest::Status { component } => json!({
+            "type": "status",
+            "component": component,
+        }),
+        GraphRequest::VersionsFor {
+            component,
+            for_component,
+        } => json!({
+            "type": "versions",
+            "component": component,
+            "for": for_component,
+        }),
+    }
+}
+
+#[cfg(feature = "interactive")]
+fn repl_snippet_dir() -> Result<PathBuf> {
+    let dirs = ProjectDirs::from("dev", "matrix", "matrix")
+        .ok_or_else(|| anyhow!("could not determine config directory"))?;
+    Ok(dirs.config_dir().join("queries"))
+}
+
+#[cfg(feature = "interactive")]
+fn sanitize_repl_snippet_name(name: &str) -> Result<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        bail!("snippet name cannot be empty");
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') || trimmed == "." || trimmed == ".." {
+        bail!("snippet names cannot include path separators");
+    }
+    if !trimmed
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+    {
+        bail!("snippet names can only use letters, numbers, '.', '-', and '_'");
+    }
+    Ok(trimmed.to_string())
+}
+
+#[cfg(feature = "interactive")]
+fn repl_snippet_path(name: &str, query: Option<&str>) -> Result<PathBuf> {
+    let name = sanitize_repl_snippet_name(name)?;
+    let path = Path::new(&name);
+    let name = if path.extension().is_some() {
+        name
+    } else if query.is_some_and(is_repl_graph_snippet) {
+        format!("{name}.graphql")
+    } else {
+        format!("{name}.sql")
+    };
+    Ok(repl_snippet_dir()?.join(name))
+}
+
+#[cfg(feature = "interactive")]
+fn is_repl_graph_snippet(query: &str) -> bool {
+    is_native_graphql_query(query) || parse_graph_query(query).is_ok()
+}
+
+#[cfg(feature = "interactive")]
+fn resolve_repl_snippet_path(name: &str) -> Result<PathBuf> {
+    let exact = repl_snippet_path(name, None)?;
+    if exact.exists() {
+        return Ok(exact);
+    }
+    for extension in ["graphql", "gql", "sql"] {
+        let candidate =
+            repl_snippet_dir()?.join(format!("{}.{extension}", sanitize_repl_snippet_name(name)?));
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    bail!("saved query {name:?} was not found")
+}
+
+#[cfg(feature = "interactive")]
+fn list_repl_snippets_value() -> Result<Value> {
+    let dir = repl_snippet_dir()?;
+    let mut rows = Vec::new();
+    if dir.exists() {
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_file() {
+                rows.push(json!({
+                    "name": path.file_name().and_then(|value| value.to_str()).unwrap_or_default(),
+                    "path": path.display().to_string(),
+                    "kind": match path.extension().and_then(|value| value.to_str()) {
+                        Some("graphql" | "gql") => "graphql",
+                        Some("sql") => "sql",
+                        _ => "query",
+                    },
+                }));
+            }
+        }
+    }
+    rows.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
+    Ok(json!({
+        "kind": "repl-snippets",
+        "directory": dir.display().to_string(),
+        "queries": rows,
+    }))
+}
+
 fn tags_query_sql(db: &Connection, context: &MatrixContext, limit: usize) -> String {
     format!(
         "select row_number() over (order by max(observed_at) desc, tag desc) as pick,
@@ -4640,12 +4860,45 @@ impl<'a> ReplSession<'a> {
         Ok(())
     }
 
-    fn run_graph_query(&self, query: &str, limit: usize) -> Result<()> {
+    fn run_graph_query(&self, query: &str, vars: &[String], limit: usize) -> Result<()> {
         let graph = self.graph()?;
         let value = if is_native_graphql_query(query) {
-            execute_graphql_document(&self.db, &graph, query, &BTreeMap::new(), limit.max(1))?
+            let vars = parse_graphql_variables(vars)?;
+            execute_graphql_document(&self.db, &graph, query, &vars, limit.max(1))?
         } else {
-            graph.execute_request(parse_graph_query(query)?, limit.max(1))?
+            let query = apply_graph_query_vars(query, vars)?;
+            graph.execute_request(parse_graph_query(&query)?, limit.max(1))?
+        };
+        self.print_value(&value)
+    }
+
+    fn explain_graph_query(&self, query: &str, vars: &[String], limit: usize) -> Result<()> {
+        let graph = self.graph()?;
+        let variables = parse_graphql_variables(vars)?;
+        let value = if is_native_graphql_query(query) {
+            let fields = GraphQlParser::parse(query)?;
+            let result = execute_graphql_document(&self.db, &graph, query, &variables, limit)?;
+            json!({
+                "kind": "graph-query-explain",
+                "dialect": "graphql",
+                "variables": variables,
+                "rootFields": fields.iter().map(graph_field_description).collect::<Vec<_>>(),
+                "resultKeys": result.get("data").and_then(Value::as_object).map(|data| {
+                    data.keys().cloned().collect::<Vec<_>>()
+                }).unwrap_or_default(),
+            })
+        } else {
+            let query = apply_graph_query_vars(query, vars)?;
+            let request = parse_graph_query(&query)?;
+            let result = graph.execute_request(request.clone(), limit)?;
+            json!({
+                "kind": "graph-query-explain",
+                "dialect": "matrix-graph-shorthand",
+                "request": graph_request_description(&request),
+                "resultKind": result.get("kind").cloned().unwrap_or(Value::Null),
+                "status": result.get("status").cloned().unwrap_or(Value::Null),
+                "recommended": result.get("recommended").cloned().unwrap_or(Value::Null),
+            })
         };
         self.print_value(&value)
     }
@@ -4805,16 +5058,59 @@ impl<'a> ReplSession<'a> {
                 }
             }
             "graph" | "graphql" => {
-                let query = parts.collect::<Vec<_>>().join(" ");
-                if query.is_empty() {
-                    eprintln!("Usage: .graph <query> or .graph -f <query.graphql>");
-                } else if let Some(path) = query.strip_prefix("-f ").or_else(|| query.strip_prefix("--file ")) {
-                    let query = fs::read_to_string(path.trim())
-                        .with_context(|| format!("failed to read graph query file {}", path.trim()))?;
-                    self.run_graph_query(&query, 10)?;
+                let args = parse_repl_graph_args(parts.collect::<Vec<_>>())?;
+                if args.schema {
+                    self.print_value(&json!({
+                        "kind": "graphql-schema",
+                        "schema": MATRIX_GRAPHQL_SCHEMA,
+                    }))?;
+                } else if args.query.is_none() && args.file.is_none() {
+                    eprintln!("Usage: .graphql [--var name=value] [--limit N] <query> or .graphql -f <query.graphql>");
                 } else {
-                    self.run_graph_query(&query, 10)?;
+                    let query = repl_graph_query_text(&args)?;
+                    self.run_graph_query(&query, &args.vars, args.limit)?;
                 }
+            }
+            "save" => {
+                let mut args = parts.collect::<Vec<_>>();
+                if args.len() < 2 {
+                    eprintln!("Usage: .save <name> <sql-or-graph-query>");
+                } else {
+                    let name = args.remove(0);
+                    let query = args.join(" ");
+                    let path = repl_snippet_path(name, Some(&query))?;
+                    if let Some(parent) = path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::write(&path, query.trim())?;
+                    eprintln!("Saved {}", path.display());
+                }
+            }
+            "open" | "run" => {
+                let mut args = parts.collect::<Vec<_>>();
+                if args.is_empty() {
+                    eprintln!("Usage: .open <name> [--var name=value] [--limit N]");
+                } else {
+                    let name = args.remove(0);
+                    let path = resolve_repl_snippet_path(name)?;
+                    let query = fs::read_to_string(&path)
+                        .with_context(|| format!("failed to read saved query {}", path.display()))?;
+                    let graph_args = parse_repl_graph_args(args)?;
+                    match path.extension().and_then(|value| value.to_str()) {
+                        Some("graphql" | "gql") => {
+                            self.run_graph_query(&query, &graph_args.vars, graph_args.limit)?;
+                        }
+                        Some("sql") => self.run_sql(query.trim().trim_end_matches(';').trim())?,
+                        _ if is_native_graphql_query(&query) => {
+                            self.run_graph_query(&query, &graph_args.vars, graph_args.limit)?;
+                        }
+                        _ => self.run_sql(query.trim().trim_end_matches(';').trim())?,
+                    }
+                }
+            }
+            "snippets" | "queries" => {
+                let value = list_repl_snippets_value()?;
+                self.print_value(&value)?;
             }
             "producers" | "coverage" => {
                 let value = producer_inventory_value(&self.db, 50, 14)?;
@@ -4917,10 +5213,19 @@ impl<'a> ReplSession<'a> {
                 }
             }
             "explain" => {
-                let sql = parts.collect::<Vec<_>>().join(" ");
-                if sql.is_empty() {
-                    eprintln!("Usage: .explain select ...");
+                let args = parts.collect::<Vec<_>>();
+                if matches!(args.first(), Some(&"graph" | &"graphql")) {
+                    let graph_args = parse_repl_graph_args(args.into_iter().skip(1).collect())?;
+                    if graph_args.query.is_none() && graph_args.file.is_none() {
+                        eprintln!("Usage: .explain graph [--var name=value] <query>");
+                    } else {
+                        let query = repl_graph_query_text(&graph_args)?;
+                        self.explain_graph_query(&query, &graph_args.vars, graph_args.limit)?;
+                    }
+                } else if args.is_empty() {
+                    eprintln!("Usage: .explain select ... or .explain graph <query>");
                 } else {
+                    let sql = args.join(" ");
                     self.run_sql(&format!("explain query plan {sql}"))?;
                 }
             }
@@ -6210,13 +6515,19 @@ Matrix shell commands
   .works-with <a> <b>       Check whether two components connect
   .why <a> <b>              Explain pair compatibility
   .resolve <name>           Explain component/repo/package alias resolution
-  .graph <query>            Run a GraphQL-style graph query
-  .graph -f <file>          Run a saved graph query file
+  .graphql <query>          Run native GraphQL or graph shorthand
+  .graphql -f <file>        Run a graph query file
+  .graphql --var n=v ...    Bind GraphQL variables
+  .graphql --schema         Print the native Matrix GraphQL schema
+  .save <name> <query>      Save a SQL or graph query snippet
+  .open <name>              Run a saved query snippet
+  .snippets                 List saved query snippets
   .producers                Show fact producer coverage and freshness
   .coverage                 Alias for .producers
   .read <file>              Run a saved SQL query file
   .examples                 Show copyable query examples
   .explain <sql>            Run EXPLAIN QUERY PLAN
+  .explain graph <query>    Explain a graph or GraphQL query
   red, red-pill, .exit      Exit
   blue, blue-pill           Clear the current session context
 
@@ -6235,8 +6546,7 @@ SQL
 
 #[cfg(feature = "interactive")]
 fn print_repl_examples() {
-    println!(
-        r#"Matrix SQL examples
+    let examples = r#"Matrix SQL examples
 
 select * from current;
 
@@ -6260,8 +6570,13 @@ where fact_id==release-bundle.api.1.0.0;
 .history release-bundle.api.1.0.0 --as-of 2026-06-19
 .compare ledger-service
 .why example/ledger-service --target-version v2.4.0
-"#
-    );
+.graphql --schema
+.graphql --var component=eunomia --var for=aphrodite query Matrix($component:String!,$for:String!) { versions(component:$component, for:$for) { versions } }
+.explain graph aphrodite -> eunomia
+.save aphrodite-path { path(from:"aphrodite", to:"eunomia") { status paths { confidence nodes { component version } } } }
+.open aphrodite-path
+"#;
+    println!("{examples}");
 }
 
 #[cfg(feature = "interactive")]
@@ -6322,12 +6637,16 @@ impl MatrixCompleter {
             ".members",
             ".mode",
             ".offline",
+            ".open",
             ".path",
             ".read",
             ".refresh",
             ".resolve",
+            ".run",
             ".schema",
             ".source",
+            ".save",
+            ".snippets",
             ".status",
             ".component",
             ".components",
@@ -6354,6 +6673,8 @@ impl MatrixCompleter {
             "--relative",
             "--revision",
             "--target-version",
+            "--schema",
+            "--var",
             "blue",
             "by",
             "capabilities",
@@ -6384,6 +6705,7 @@ impl MatrixCompleter {
             "kind",
             "load",
             "limit",
+            "producers",
             "members",
             "observed_at",
             "accepted_at",
@@ -10064,6 +10386,64 @@ mod tests {
             json!({"version": "3.1.0", "confidence": "medium", "score": 119})
         );
         assert!(value["data"]["versions"].get("kind").is_none());
+    }
+
+    #[cfg(feature = "interactive")]
+    #[test]
+    fn parses_repl_graph_args_for_native_graphql() {
+        let args = parse_repl_graph_args(vec![
+            "--var",
+            "component=eunomia",
+            "--var=for=aphrodite",
+            "--limit",
+            "3",
+            "query",
+            "Matrix($component:String!,$for:String!)",
+            "{",
+            "versions(component:$component,",
+            "for:$for)",
+            "{",
+            "versions",
+            "}",
+            "}",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.query,
+            Some(
+                "query Matrix($component:String!,$for:String!) { versions(component:$component, for:$for) { versions } }"
+                    .to_string()
+            )
+        );
+        assert_eq!(args.vars, vec!["component=eunomia", "for=aphrodite"]);
+        assert_eq!(args.limit, 3);
+    }
+
+    #[cfg(feature = "interactive")]
+    #[test]
+    fn repl_snippet_names_stay_inside_query_directory() {
+        assert!(sanitize_repl_snippet_name("aphrodite-path").is_ok());
+        assert!(sanitize_repl_snippet_name("../secret").is_err());
+        assert!(sanitize_repl_snippet_name("nested/query").is_err());
+        assert!(sanitize_repl_snippet_name("bad name").is_err());
+
+        let graphql =
+            repl_snippet_path("aphrodite-path", Some("{ path(from:\"a\", to:\"b\") }")).unwrap();
+        assert_eq!(
+            graphql.file_name().and_then(|value| value.to_str()),
+            Some("aphrodite-path.graphql")
+        );
+        let shorthand = repl_snippet_path("short-path", Some("aphrodite -> eunomia")).unwrap();
+        assert_eq!(
+            shorthand.file_name().and_then(|value| value.to_str()),
+            Some("short-path.graphql")
+        );
+        let sql = repl_snippet_path("current", Some("select * from current")).unwrap();
+        assert_eq!(
+            sql.file_name().and_then(|value| value.to_str()),
+            Some("current.sql")
+        );
     }
 
     #[test]
