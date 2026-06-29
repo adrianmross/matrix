@@ -47,7 +47,13 @@ matrix> .why aphrodite eunomia
 matrix> .resolve aphrodite
 matrix> .producers
 matrix> .read queries/current-runtime.sql
+matrix> .graphql --schema
+matrix> .graphql --var component=eunomia --var for=aphrodite query Matrix($component:String!,$for:String!) { versions(component:$component, for:$for) { versions } }
 matrix> .graphql -f queries/aphrodite-path.graphql
+matrix> .explain graph aphrodite -> eunomia
+matrix> .save aphrodite-path { path(from:"aphrodite", to:"eunomia") { status paths { confidence nodes { component version } } } }
+matrix> .open aphrodite-path
+matrix> .snippets
 matrix> .mode json
 matrix> .mode yaml
 matrix> .refresh
@@ -79,7 +85,18 @@ clears the current local session context.
   resolves into graph nodes.
 - `.graph <query>` or `.graphql <query>`: run native GraphQL documents or legacy
   graph shorthand from the session fact cache.
-- `.graph -f <file>` or `.graphql -f <file>`: run a saved graph query file.
+- `.graph -f <file>` or `.graphql -f <file>`: run a graph query file.
+- `.graphql --schema`: print the native Matrix GraphQL schema.
+- `.graphql --var <name=value> <query>`: bind a native GraphQL variable. Values
+  parse as JSON when possible and fall back to strings.
+- `.explain graph <query>`: show how Matrix parsed a native GraphQL document or
+  legacy graph shorthand, plus the result keys or recommendation summary.
+- `.save <name> <query>`: save a SQL or graph query snippet under the Matrix
+  config directory. Names without an extension get `.graphql` for native
+  GraphQL documents or graph shorthand and `.sql` otherwise.
+- `.open <name>` or `.run <name>`: run a saved snippet. GraphQL snippets accept
+  `--var <name=value>` and `--limit <n>`.
+- `.snippets` or `.queries`: list saved snippets and their on-disk path.
 - `.producers` or `.coverage`: summarize fact producers, coverage, invalid
   facts, and freshness.
 - `.read <file>`, `.load <file>`, or `.source <file>`: run a saved SQL query
@@ -107,6 +124,39 @@ clears the current local session context.
 - `.zones`, `.subjects`, `.trace <subject>`: Matrix-native inspection helpers.
 - `.gate <zone> [level]`: fetch a gate decision from the construct.
 - `.explain <sql>`: run `EXPLAIN QUERY PLAN`.
+
+## Useful GraphQL
+
+Native GraphQL is useful for agents and scripts because it is structured,
+projectable, and accepts variables:
+
+```text
+.graphql --schema
+
+.graphql --var component=eunomia --var for=aphrodite query Matrix($component:String!,$for:String!) {
+  versions(component:$component, for:$for) {
+    versions
+    versionCandidates { version confidence score }
+  }
+}
+
+.graphql {
+  aphroditeToEunomia: path(from:"aphrodite", to:"eunomia", limit:1) {
+    status
+    paths { confidence nodes { component version } }
+  }
+}
+
+.explain graph aphrodite -> eunomia
+```
+
+Save repeated queries as snippets:
+
+```text
+.save aphrodite-path { path(from:"aphrodite", to:"eunomia") { status paths { confidence nodes { component version } } } }
+.open aphrodite-path
+.snippets
+```
 
 ## Useful SQL
 
