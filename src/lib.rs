@@ -151,6 +151,10 @@ type ProducerSummary {
   staleProducers: Int!
   facts: Int!
   invalidFacts: Int!
+  sourceRepoFacts: Int!
+  inferredSubjectRepoFacts: Int!
+  unknownProducerFacts: Int!
+  missingProducerMetadataFacts: Int!
   staleAfterDays: Int!
 }
 
@@ -161,6 +165,10 @@ type Producer {
   components: Int!
   zones: Int!
   invalid_facts: Int!
+  source_repo_facts: Int!
+  inferred_subject_repo_facts: Int!
+  unknown_producer_facts: Int!
+  producer_metadata: String!
   last_observed_at: String
   freshness: String!
 }
@@ -2470,10 +2478,21 @@ async fn graph_why_command(matrix: &Matrix, args: GraphPairArgs) -> Result<Value
 }
 
 async fn producer_inventory_command(matrix: &Matrix, args: ProducerInventoryArgs) -> Result<Value> {
+    let filter_context = MatrixContext {
+        zone: args.context.zone.clone(),
+        repo: args.context.repo.clone(),
+        component: args.context.component.clone(),
+        ..MatrixContext::default()
+    };
     let context = MatrixContext::detect_browsing(args.context);
     let (db, cache) = query_db(matrix, args.max_facts, &context, &args.cache).await?;
-    producer_inventory_value(&db, args.limit.max(1), args.stale_days.max(1))
-        .map(|value| with_cache_summary(value, &cache))
+    producer_inventory_value(
+        &db,
+        &filter_context,
+        args.limit.max(1),
+        args.stale_days.max(1),
+    )
+    .map(|value| with_cache_summary(value, &cache))
 }
 
 async fn graph_status_command(matrix: &Matrix, args: GraphStatusArgs) -> Result<Value> {
@@ -2670,8 +2689,13 @@ enum GraphRequest {
     },
 }
 
-fn producer_inventory_value(db: &Connection, limit: usize, stale_days: i64) -> Result<Value> {
-    let rows = execute_readonly_sql(db, &producer_inventory_sql(limit, stale_days))?;
+fn producer_inventory_value(
+    db: &Connection,
+    context: &MatrixContext,
+    limit: usize,
+    stale_days: i64,
+) -> Result<Value> {
+    let rows = execute_readonly_sql(db, &producer_inventory_sql(context, limit, stale_days))?;
     let producers = query_rows(&rows).as_array().cloned().unwrap_or_default();
     let total_producers = producers.len();
     let stale_producers = producers
@@ -2690,6 +2714,21 @@ fn producer_inventory_value(db: &Connection, limit: usize, stale_days: i64) -> R
         .iter()
         .filter_map(|row| row.get("invalid_facts").and_then(Value::as_i64))
         .sum::<i64>();
+    let source_repo_facts = producers
+        .iter()
+        .filter_map(|row| row.get("source_repo_facts").and_then(Value::as_i64))
+        .sum::<i64>();
+    let inferred_subject_repo_facts = producers
+        .iter()
+        .filter_map(|row| {
+            row.get("inferred_subject_repo_facts")
+                .and_then(Value::as_i64)
+        })
+        .sum::<i64>();
+    let unknown_producer_facts = producers
+        .iter()
+        .filter_map(|row| row.get("unknown_producer_facts").and_then(Value::as_i64))
+        .sum::<i64>();
     Ok(json!({
         "kind": "producer-inventory",
         "summary": {
@@ -2697,6 +2736,10 @@ fn producer_inventory_value(db: &Connection, limit: usize, stale_days: i64) -> R
             "staleProducers": stale_producers,
             "facts": total_facts,
             "invalidFacts": invalid_facts,
+            "sourceRepoFacts": source_repo_facts,
+            "inferredSubjectRepoFacts": inferred_subject_repo_facts,
+            "unknownProducerFacts": unknown_producer_facts,
+            "missingProducerMetadataFacts": inferred_subject_repo_facts + unknown_producer_facts,
             "staleAfterDays": stale_days,
         },
         "columns": rows["columns"].clone(),
@@ -2704,7 +2747,8 @@ fn producer_inventory_value(db: &Connection, limit: usize, stale_days: i64) -> R
     }))
 }
 
-fn producer_inventory_sql(limit: usize, stale_days: i64) -> String {
+fn producer_inventory_sql(context: &MatrixContext, limit: usize, stale_days: i64) -> String {
+    let filters = producer_context_filter_sql(context);
     format!(
         "select row_number() over (order by max(coalesce(accepted_at, observed_at)) desc, producer asc) as pick,
             producer,
@@ -2712,6 +2756,15 @@ fn producer_inventory_sql(limit: usize, stale_days: i64) -> String {
             count(distinct component) as components,
             count(distinct zone) as zones,
             sum(case when status in ('incompatible', 'failed', 'invalid', 'blocked') then 1 else 0 end) as invalid_facts,
+            sum(has_explicit_producer) as source_repo_facts,
+            sum(inferred_subject_repo) as inferred_subject_repo_facts,
+            sum(unknown_producer) as unknown_producer_facts,
+            case
+              when sum(unknown_producer) > 0 then 'unknown'
+              when sum(inferred_subject_repo) > 0 and sum(has_explicit_producer) > 0 then 'mixed'
+              when sum(inferred_subject_repo) > 0 then 'inferred-subject-repo'
+              else 'explicit-source'
+            end as producer_metadata,
             max(coalesce(accepted_at, observed_at)) as last_observed_at,
             case
               when max(coalesce(accepted_at, observed_at)) is null then 'unknown'
@@ -2720,15 +2773,38 @@ fn producer_inventory_sql(limit: usize, stale_days: i64) -> String {
             end as freshness
          from (
             select coalesce(nullif(source_repository, ''), nullif(source_repo, ''), nullif(repo, ''), 'unknown') as producer,
-                   component, zone, status, observed_at, accepted_at
+                   component, zone, status, observed_at, accepted_at,
+                   case when coalesce(nullif(source_repository, ''), nullif(source_repo, '')) is not null then 1 else 0 end as has_explicit_producer,
+                   case when coalesce(nullif(source_repository, ''), nullif(source_repo, '')) is null and nullif(repo, '') is not null then 1 else 0 end as inferred_subject_repo,
+                   case when coalesce(nullif(source_repository, ''), nullif(source_repo, ''), nullif(repo, '')) is null then 1 else 0 end as unknown_producer
             from facts
+            where 1=1 {}
          )
          group by producer
          order by last_observed_at desc, producer asc
          limit {}",
         stale_days.max(1),
+        filters,
         limit.max(1)
     )
+}
+
+fn producer_context_filter_sql(context: &MatrixContext) -> String {
+    let mut filters = Vec::new();
+    if let Some(zone) = context.zone.as_deref() {
+        filters.push(format!("facts.zone = {}", sql_literal(zone)));
+    }
+    if let Some(repo) = context.repo.as_deref() {
+        filters.push(format!("facts.repo = {}", sql_literal(repo)));
+    }
+    if let Some(component) = context.component.as_deref() {
+        filters.push(identity_match_sql(Some("facts"), component));
+    }
+    if filters.is_empty() {
+        String::new()
+    } else {
+        format!(" and {}", filters.join(" and "))
+    }
 }
 
 fn apply_graph_query_vars(query: &str, vars: &[String]) -> Result<String> {
@@ -2878,7 +2954,7 @@ fn execute_graphql_field(
             let stale_days = graphql_i64_arg(field, vars, &["staleDays", "stale_days"])?
                 .unwrap_or(14)
                 .max(1);
-            producer_inventory_value(db, limit.max(1), stale_days)
+            producer_inventory_value(db, &MatrixContext::default(), limit.max(1), stale_days)
         }
         other => bail!(
             "unsupported GraphQL root field {other:?}; expected path, worksWith, status, versions, resolve, or producers"
@@ -5113,7 +5189,7 @@ impl<'a> ReplSession<'a> {
                 self.print_value(&value)?;
             }
             "producers" | "coverage" => {
-                let value = producer_inventory_value(&self.db, 50, 14)?;
+                let value = producer_inventory_value(&self.db, &self.context, 50, 14)?;
                 self.print_value(&value)?;
             }
             "examples" => print_repl_examples(),
@@ -8147,8 +8223,17 @@ fn producer_inventory_human_text(object: &serde_json::Map<String, Value>) -> Str
         .and_then(|value| value.get("facts"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let mut text =
-        format!("Producer inventory: {producers} producers, {facts} facts, {stale} stale\n");
+    let invalid = summary
+        .and_then(|value| value.get("invalidFacts"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let missing_metadata = summary
+        .and_then(|value| value.get("missingProducerMetadataFacts"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let mut text = format!(
+        "Producer inventory: {producers} producers, {facts} facts, {stale} stale, {invalid} invalid, {missing_metadata} missing producer metadata\n"
+    );
     for row in object
         .get("rows")
         .and_then(Value::as_array)
@@ -8165,8 +8250,12 @@ fn producer_inventory_human_text(object: &serde_json::Map<String, Value>) -> Str
             .get("freshness")
             .and_then(Value::as_str)
             .unwrap_or("unknown");
+        let metadata = row
+            .get("producer_metadata")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
         text.push_str(&format!(
-            "- {producer}: {facts} facts, {components} components, {freshness}\n"
+            "- {producer}: {facts} facts, {components} components, {freshness}, {metadata}\n"
         ));
     }
     if let Some(cache) = object.get("cache").and_then(Value::as_object) {
@@ -10541,15 +10630,43 @@ mod tests {
                 "observedAt": "2026-06-28T00:02:00Z",
                 "subject": {"type": "service", "name": "putto", "version": "0.8.1", "repo": "red-wiz/putto"}
             }),
+            json!({
+                "id": "producer-c-1",
+                "track": "runtime",
+                "status": "passed",
+                "observedAt": "2026-06-28T00:03:00Z",
+                "subject": {"type": "service", "name": "athena", "version": "4.0.0", "repo": "red-wiz/athena"}
+            }),
         ];
         let db = build_facts_db(&facts, &MatrixContext::default()).unwrap();
-        let value = producer_inventory_value(&db, 10, 14).unwrap();
+        let value = producer_inventory_value(&db, &MatrixContext::default(), 10, 14).unwrap();
 
         assert_eq!(value["kind"], "producer-inventory");
-        assert_eq!(value["summary"]["producers"], 2);
-        assert_eq!(value["summary"]["facts"], 3);
-        assert_eq!(value["rows"][0]["producer"], "red-wiz/putto");
-        assert_eq!(value["rows"][1]["invalid_facts"], 1);
+        assert_eq!(value["summary"]["producers"], 3);
+        assert_eq!(value["summary"]["facts"], 4);
+        assert_eq!(value["summary"]["sourceRepoFacts"], 3);
+        assert_eq!(value["summary"]["inferredSubjectRepoFacts"], 1);
+        assert_eq!(value["summary"]["missingProducerMetadataFacts"], 1);
+        assert_eq!(value["rows"][0]["producer"], "red-wiz/athena");
+        assert_eq!(
+            value["rows"][0]["producer_metadata"],
+            "inferred-subject-repo"
+        );
+        assert_eq!(value["rows"][2]["invalid_facts"], 1);
+
+        let odin = producer_inventory_value(
+            &db,
+            &MatrixContext {
+                zone: Some("odin".to_string()),
+                ..MatrixContext::default()
+            },
+            10,
+            14,
+        )
+        .unwrap();
+        assert_eq!(odin["summary"]["producers"], 2);
+        assert_eq!(odin["summary"]["facts"], 3);
+        assert_eq!(odin["summary"]["missingProducerMetadataFacts"], 0);
     }
 
     #[test]
