@@ -5419,7 +5419,119 @@ struct ReplSession<'a> {
     expanded: bool,
     timing: bool,
     last_refresh: SystemTime,
+    tutorial: Option<ReplTutorial>,
 }
+
+#[cfg(feature = "interactive")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReplTutorial {
+    step: usize,
+}
+
+#[cfg(feature = "interactive")]
+impl ReplTutorial {
+    fn current(&self) -> Option<&'static TutorialStep> {
+        REPL_TUTORIAL_STEPS.get(self.step)
+    }
+
+    fn next(&mut self) -> bool {
+        if self.step + 1 < REPL_TUTORIAL_STEPS.len() {
+            self.step += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn back(&mut self) {
+        self.step = self.step.saturating_sub(1);
+    }
+}
+
+#[cfg(feature = "interactive")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TutorialCommand {
+    Next,
+    Back,
+    Run,
+    Shell,
+    Status,
+    Steps,
+    Print,
+    Quit,
+}
+
+#[cfg(feature = "interactive")]
+#[derive(Clone, Copy, Debug)]
+struct TutorialStep {
+    title: &'static str,
+    goal: &'static str,
+    repl: &'static [&'static str],
+    shell: &'static [&'static str],
+}
+
+#[cfg(feature = "interactive")]
+const REPL_TUTORIAL_STEPS: &[TutorialStep] = &[
+    TutorialStep {
+        title: "Check session state and cache freshness",
+        goal: "Start by seeing which construct, profile, cache, and context this REPL is using.",
+        repl: &[".status"],
+        shell: &["matrix cache status", "matrix doctor"],
+    },
+    TutorialStep {
+        title: "See built-in examples",
+        goal: "Use examples before writing custom GraphQL or SQL.",
+        repl: &[".examples"],
+        shell: &["matrix examples list"],
+    },
+    TutorialStep {
+        title: "Ask which Eunomia version Aphrodite uses",
+        goal: "Run a native GraphQL example through the local fact cache.",
+        repl: &[".example version-for"],
+        shell: &["matrix examples run version-for -o json"],
+    },
+    TutorialStep {
+        title: "Inspect why Aphrodite and Eunomia connect",
+        goal: "Look at the inferred graph path and edge evidence.",
+        repl: &[".example aphrodite-eunomia-path"],
+        shell: &["matrix examples run aphrodite-eunomia-path -o json"],
+    },
+    TutorialStep {
+        title: "Check producer coverage",
+        goal: "See which producers emitted facts, whether they are fresh, and whether metadata is explicit.",
+        repl: &[".producers"],
+        shell: &["matrix producers --audit -o json"],
+    },
+    TutorialStep {
+        title: "Confirm a repo after Wiz repo health",
+        goal: "Use Wiz for repo wiring and Matrix for fact-side readback.",
+        repl: &[".repo red-wiz/aphrodite", ".producers"],
+        shell: &[
+            "wiz repo health --repo red-wiz/aphrodite -v",
+            "matrix producers --readback --repo red-wiz/aphrodite --audit -o json",
+        ],
+    },
+    TutorialStep {
+        title: "Inspect current repo context",
+        goal: "Focus the REPL on a repo and inspect the current-runtime SQL view.",
+        repl: &[
+            ".repo red-wiz/aphrodite",
+            ".read examples/queries/current-runtime.sql",
+        ],
+        shell: &[
+            "matrix query -f examples/queries/current-runtime.sql --repo red-wiz/aphrodite -o json",
+        ],
+    },
+    TutorialStep {
+        title: "Work offline after warming the cache",
+        goal: "Switch the REPL to persisted SQLite cache mode for fast local iteration.",
+        repl: &[".offline", ".example version-for"],
+        shell: &[
+            "matrix sync --max-facts 10000",
+            "matrix examples run version-for --offline -o json",
+        ],
+    },
+];
 
 #[cfg(feature = "interactive")]
 impl<'a> ReplSession<'a> {
@@ -5447,6 +5559,7 @@ impl<'a> ReplSession<'a> {
             expanded: false,
             timing: false,
             last_refresh: SystemTime::now(),
+            tutorial: None,
         })
     }
 
@@ -5522,7 +5635,12 @@ impl<'a> ReplSession<'a> {
             match line_editor.read_line(active_prompt) {
                 Ok(Signal::Success(line)) => {
                     let line = line.trim();
-                    if line.is_empty() {
+                    if line.is_empty() && self.tutorial.is_none() {
+                        continue;
+                    }
+
+                    if self.tutorial.is_some() {
+                        self.handle_tutorial_input(line).await?;
                         continue;
                     }
 
@@ -5685,7 +5803,7 @@ impl<'a> ReplSession<'a> {
                 eprintln!("Session context reset to auto-detected values.");
             }
             "help" | "?" => print_repl_help(),
-            "tutorial" => print_repl_tutorial(),
+            "tutorial" => self.handle_tutorial_command(parts.collect::<Vec<_>>()).await?,
             "context" | "ctx" => self.handle_context_command(parts.collect::<Vec<_>>())?,
             "zone" | "repo" | "component" | "version" | "tag" | "sha" | "ref" => {
                 self.set_context_field(name, &parts.collect::<Vec<_>>().join(" "))?;
@@ -6006,6 +6124,177 @@ impl<'a> ReplSession<'a> {
         }
 
         Ok(false)
+    }
+
+    async fn handle_tutorial_command(&mut self, args: Vec<&str>) -> Result<()> {
+        let command = args.first().copied().unwrap_or("start");
+        if matches!(command, "print" | "static") {
+            print_repl_tutorial_static();
+            return Ok(());
+        }
+        self.tutorial = Some(ReplTutorial { step: 0 });
+        println!("Starting Matrix interactive tutorial.");
+        println!("Controls: Enter/next, back, run, shell, status, steps, quit.");
+        if let Some(parsed) = parse_tutorial_command(command)
+            && !matches!(parsed, TutorialCommand::Next)
+        {
+            self.apply_tutorial_command(parsed).await?;
+            return Ok(());
+        }
+        self.print_tutorial_step();
+        Ok(())
+    }
+
+    async fn handle_tutorial_input(&mut self, raw: &str) -> Result<()> {
+        let Some(command) = parse_tutorial_command(raw) else {
+            eprintln!(
+                "Unknown tutorial command {raw:?}. Use next, back, run, shell, status, steps, or quit."
+            );
+            return Ok(());
+        };
+        self.apply_tutorial_command(command).await
+    }
+
+    async fn apply_tutorial_command(&mut self, command: TutorialCommand) -> Result<()> {
+        match command {
+            TutorialCommand::Next => {
+                if let Some(tutorial) = &mut self.tutorial
+                    && !tutorial.next()
+                {
+                    println!(
+                        "Tutorial complete. Type `quit` to leave tutorial mode or `back` to review."
+                    );
+                }
+                self.print_tutorial_step();
+            }
+            TutorialCommand::Back => {
+                if let Some(tutorial) = &mut self.tutorial {
+                    tutorial.back();
+                }
+                self.print_tutorial_step();
+            }
+            TutorialCommand::Run => self.run_tutorial_step().await?,
+            TutorialCommand::Shell => self.print_tutorial_shell(),
+            TutorialCommand::Status => self.print_tutorial_status(),
+            TutorialCommand::Steps => self.print_tutorial_steps(),
+            TutorialCommand::Print => print_repl_tutorial_static(),
+            TutorialCommand::Quit => {
+                self.tutorial = None;
+                println!("Left tutorial mode. Type `.tutorial` to start again.");
+            }
+        }
+        Ok(())
+    }
+
+    fn print_tutorial_step(&self) {
+        let Some(tutorial) = &self.tutorial else {
+            return;
+        };
+        let Some(step) = tutorial.current() else {
+            return;
+        };
+        println!(
+            "\nStep {}/{}: {}",
+            tutorial.step + 1,
+            REPL_TUTORIAL_STEPS.len(),
+            step.title
+        );
+        println!("{}", step.goal);
+        println!("REPL:");
+        for command in step.repl {
+            println!("  {command}");
+        }
+        println!("Shell:");
+        for command in step.shell {
+            println!("  {command}");
+        }
+        println!("Controls: run, next, back, shell, status, steps, quit");
+    }
+
+    fn print_tutorial_shell(&self) {
+        let Some(tutorial) = &self.tutorial else {
+            return;
+        };
+        if let Some(step) = tutorial.current() {
+            println!("Equivalent shell commands:");
+            for command in step.shell {
+                println!("{command}");
+            }
+        }
+    }
+
+    fn print_tutorial_status(&self) {
+        let Some(tutorial) = &self.tutorial else {
+            println!("Tutorial is not active.");
+            return;
+        };
+        println!(
+            "Tutorial step {}/{}",
+            tutorial.step + 1,
+            REPL_TUTORIAL_STEPS.len()
+        );
+        self.print_tutorial_step();
+    }
+
+    fn print_tutorial_steps(&self) {
+        println!("Matrix tutorial steps");
+        for (index, step) in REPL_TUTORIAL_STEPS.iter().enumerate() {
+            println!("{}. {}", index + 1, step.title);
+        }
+    }
+
+    async fn run_tutorial_step(&mut self) -> Result<()> {
+        let Some(tutorial) = &self.tutorial else {
+            return Ok(());
+        };
+        let step = tutorial
+            .current()
+            .ok_or_else(|| anyhow!("tutorial step is out of range"))?;
+        for command in step.repl {
+            println!("matrix> {command}");
+            self.run_tutorial_repl_command(command).await?;
+        }
+        Ok(())
+    }
+
+    async fn run_tutorial_repl_command(&mut self, raw: &str) -> Result<()> {
+        let command = raw.trim().trim_start_matches('.').trim();
+        let mut parts = command.split_whitespace();
+        let Some(name) = parts.next() else {
+            return Ok(());
+        };
+        match name {
+            "status" => self.print_status(),
+            "examples" => {
+                print_repl_examples();
+                Ok(())
+            }
+            "example" => {
+                let name = parts
+                    .next()
+                    .ok_or_else(|| anyhow!("tutorial example command is missing a name"))?;
+                self.run_query_example(name, &[], 10)
+            }
+            "producers" | "coverage" => {
+                let value = producer_inventory_value(&self.db, &self.context, 50, 14, false)?;
+                self.print_value(&value)
+            }
+            "repo" => {
+                self.set_context_field("repo", &parts.collect::<Vec<_>>().join(" "))?;
+                Ok(())
+            }
+            "read" => {
+                let path = parts.collect::<Vec<_>>().join(" ");
+                self.run_sql_file(&path)
+            }
+            "offline" => {
+                self.reload(FactLoadOptions {
+                    policy: CachePolicy::Offline,
+                })
+                .await
+            }
+            other => bail!("tutorial cannot run unsupported REPL command .{other}"),
+        }
     }
 
     fn print_status(&self) -> Result<()> {
@@ -7300,7 +7589,8 @@ Matrix shell commands
   .read <file>              Run a saved SQL query file
   .examples                 Show copyable query examples
   .example <name>           Run a built-in query example
-  .tutorial                 Show a short guided workflow with shell equivalents
+  .tutorial                 Start the interactive tutorial
+  .tutorial print           Print the static tutorial with shell equivalents
   .explain <sql>            Run EXPLAIN QUERY PLAN
   .explain graph <query>    Explain a graph or GraphQL query
   red, red-pill, .exit      Exit
@@ -7337,8 +7627,10 @@ fn print_repl_examples() {
 }
 
 #[cfg(feature = "interactive")]
-fn print_repl_tutorial() {
+fn print_repl_tutorial_static() {
     let tutorial = r#"Matrix tutorial
+
+Run `.tutorial` inside `matrix enter` for the interactive version.
 
 1. Check session state and cache freshness.
    REPL:  .status
@@ -7376,6 +7668,34 @@ fn print_repl_tutorial() {
           matrix examples run version-for --offline -o json
 "#;
     println!("{tutorial}");
+}
+
+#[cfg(feature = "interactive")]
+fn parse_tutorial_command(raw: &str) -> Option<TutorialCommand> {
+    let command = raw
+        .trim()
+        .trim_start_matches('.')
+        .trim_start_matches('/')
+        .trim();
+    if command.is_empty() {
+        return Some(TutorialCommand::Next);
+    }
+    match command
+        .split_whitespace()
+        .next()?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "n" | "next" | "enter" => Some(TutorialCommand::Next),
+        "b" | "back" | "prev" | "previous" => Some(TutorialCommand::Back),
+        "r" | "run" => Some(TutorialCommand::Run),
+        "s" | "shell" | "cmd" | "commands" => Some(TutorialCommand::Shell),
+        "status" | "where" => Some(TutorialCommand::Status),
+        "steps" | "list" => Some(TutorialCommand::Steps),
+        "p" | "print" | "static" => Some(TutorialCommand::Print),
+        "q" | "quit" | "exit" | "done" => Some(TutorialCommand::Quit),
+        _ => None,
+    }
 }
 
 #[cfg(feature = "interactive")]
@@ -11377,6 +11697,49 @@ mod tests {
         );
         assert_eq!(args.vars, vec!["component=eunomia", "for=aphrodite"]);
         assert_eq!(args.limit, 3);
+    }
+
+    #[cfg(feature = "interactive")]
+    #[test]
+    fn parses_interactive_tutorial_commands() {
+        assert_eq!(parse_tutorial_command(""), Some(TutorialCommand::Next));
+        assert_eq!(parse_tutorial_command("next"), Some(TutorialCommand::Next));
+        assert_eq!(parse_tutorial_command(".back"), Some(TutorialCommand::Back));
+        assert_eq!(parse_tutorial_command("run"), Some(TutorialCommand::Run));
+        assert_eq!(
+            parse_tutorial_command("shell"),
+            Some(TutorialCommand::Shell)
+        );
+        assert_eq!(
+            parse_tutorial_command("steps"),
+            Some(TutorialCommand::Steps)
+        );
+        assert_eq!(parse_tutorial_command("quit"), Some(TutorialCommand::Quit));
+        assert_eq!(parse_tutorial_command("wat"), None);
+    }
+
+    #[cfg(feature = "interactive")]
+    #[test]
+    fn interactive_tutorial_tracks_steps_and_shell_equivalents() {
+        assert!(REPL_TUTORIAL_STEPS.len() >= 6);
+        for step in REPL_TUTORIAL_STEPS {
+            assert!(!step.title.trim().is_empty());
+            assert!(!step.goal.trim().is_empty());
+            assert!(!step.repl.is_empty());
+            assert!(!step.shell.is_empty());
+        }
+
+        let mut tutorial = ReplTutorial { step: 0 };
+        assert_eq!(
+            tutorial.current().map(|step| step.title),
+            Some("Check session state and cache freshness")
+        );
+        assert!(tutorial.next());
+        assert_eq!(tutorial.step, 1);
+        tutorial.back();
+        assert_eq!(tutorial.step, 0);
+        tutorial.back();
+        assert_eq!(tutorial.step, 0);
     }
 
     #[cfg(feature = "interactive")]
