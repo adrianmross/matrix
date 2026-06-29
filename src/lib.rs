@@ -28,6 +28,150 @@ const RED_WIZ_TOKEN_COMMAND: &str = "wiz auth token --audience platform-api --fo
 const UPDATE_CHECK_TTL: Duration = Duration::from_secs(60 * 60 * 24);
 const FACT_CACHE_STALE_AFTER: Duration = Duration::from_secs(60 * 60 * 24);
 const DEFAULT_FACT_CACHE_MAX_FACTS: usize = 1000;
+const MATRIX_GRAPHQL_SCHEMA: &str = r#"schema {
+  query: Query
+}
+
+type Query {
+  path(from: String, source: String, to: String, target: String, limit: Int): GraphPathAnswer!
+  worksWith(left: String!, right: String!, limit: Int): GraphWorksWithAnswer!
+  status(component: String, name: String, limit: Int): GraphStatusAnswer!
+  versions(component: String!, for: String, forComponent: String, limit: Int): GraphVersionsForAnswer!
+  resolve(name: String, component: String): GraphResolveAnswer!
+  producers(limit: Int, staleDays: Int): ProducerInventory!
+}
+
+type GraphPathAnswer {
+  kind: String!
+  status: String!
+  found: Boolean!
+  confidence: String!
+  source: Component
+  target: Component
+  recommended: GraphPath
+  pathCount: Int!
+  paths: [GraphPath!]!
+  missing: [String!]!
+}
+
+type GraphWorksWithAnswer {
+  kind: String!
+  status: String!
+  compatible: Boolean!
+  confidence: String!
+  direction: String!
+  left: Component
+  right: Component
+  recommended: GraphPath
+  pathCount: Int!
+  paths: [GraphPath!]!
+  reasons: [String!]!
+  missing: [String!]!
+}
+
+type GraphVersionsForAnswer {
+  kind: String!
+  component: Component
+  for: Component
+  versions: [String!]!
+  versionCandidates: [VersionCandidate!]!
+}
+
+type GraphStatusAnswer {
+  kind: String!
+  component: Component
+  outgoing: [GraphEdge!]!
+  incoming: [GraphEdge!]!
+  outgoingCount: Int!
+  incomingCount: Int!
+}
+
+type GraphResolveAnswer {
+  kind: String!
+  requested: String!
+  name: String!
+  version: String
+  resolved: Component
+  ambiguous: Boolean!
+  matchCount: Int!
+  matches: [ResolveMatch!]!
+  warnings: [String!]!
+}
+
+type ProducerInventory {
+  kind: String!
+  summary: ProducerSummary!
+  rows: [Producer!]!
+}
+
+type Component {
+  requested: String
+  key: String!
+  component: String!
+  version: String
+  identity: String
+  subjectName: String
+  repo: String
+  status: String
+  lastObservedAt: String
+}
+
+type GraphPath {
+  length: Int!
+  score: Int!
+  confidence: String!
+  reasons: [String!]!
+  nodes: [Component!]!
+  edges: [GraphEdge!]!
+}
+
+type GraphEdge {
+  from: Component
+  to: Component
+  relationship: String!
+  capability: String
+  capabilityVersion: String
+  sourceVersion: String
+  targetVersion: String
+  sourceFactId: String
+  targetFactId: String
+  status: String
+  observedAt: String
+}
+
+type VersionCandidate {
+  version: String!
+  score: Int!
+  confidence: String!
+  pathCount: Int!
+}
+
+type ProducerSummary {
+  producers: Int!
+  staleProducers: Int!
+  facts: Int!
+  invalidFacts: Int!
+  staleAfterDays: Int!
+}
+
+type Producer {
+  pick: Int!
+  producer: String!
+  facts: Int!
+  components: Int!
+  zones: Int!
+  invalid_facts: Int!
+  last_observed_at: String
+  freshness: String!
+}
+
+type ResolveMatch {
+  node: Component
+  aliasKinds: [String!]!
+  outgoingCount: Int!
+  incomingCount: Int!
+}
+"#;
 
 #[cfg(feature = "interactive")]
 use comfy_table::{Table, presets::UTF8_FULL};
@@ -512,7 +656,7 @@ struct GraphStatusArgs {
 
 #[derive(Args, Clone)]
 struct GraphQueryArgs {
-    #[arg(value_name = "QUERY", required_unless_present = "file")]
+    #[arg(value_name = "QUERY", required_unless_present_any = ["file", "schema"])]
     query: Option<String>,
     #[arg(
         short = 'f',
@@ -527,6 +671,8 @@ struct GraphQueryArgs {
     limit: usize,
     #[arg(long = "var", value_name = "NAME=VALUE")]
     vars: Vec<String>,
+    #[arg(long, help = "Print the native Matrix GraphQL schema")]
+    schema: bool,
     #[command(flatten)]
     cache: FactCacheArgs,
 }
@@ -2352,21 +2498,45 @@ async fn graph_versions_for_command(matrix: &Matrix, args: GraphPairArgs) -> Res
 }
 
 async fn graph_query_command(matrix: &Matrix, args: GraphQueryArgs) -> Result<Value> {
+    if args.schema {
+        return Ok(json!({
+            "kind": "graphql-schema",
+            "schema": MATRIX_GRAPHQL_SCHEMA,
+        }));
+    }
     let query = query_text(args.query, args.file, "graph query")?;
-    let query = apply_graph_query_vars(&query, &args.vars)?;
-    graph_query_value(matrix, &query, args.max_facts, args.limit, &args.cache).await
+    graph_query_value(
+        matrix,
+        &query,
+        &args.vars,
+        args.max_facts,
+        args.limit,
+        &args.cache,
+    )
+    .await
 }
 
 async fn graph_query_value(
     matrix: &Matrix,
     query: &str,
+    vars: &[String],
     max_facts: Option<usize>,
     limit: usize,
     cache_args: &FactCacheArgs,
 ) -> Result<Value> {
+    if is_native_graphql_query(query) {
+        let max_facts = matrix.max_facts(max_facts)?;
+        let options = matrix.fact_load_options(cache_args)?;
+        let cached = load_query_db(matrix, max_facts, &MatrixContext::default(), options).await?;
+        let graph = GraphIndex::from_db(&cached.db)?;
+        let variables = parse_graphql_variables(vars)?;
+        return execute_graphql_document(&cached.db, &graph, query, &variables, limit.max(1))
+            .map(|value| with_cache_summary(value, &cached.cache));
+    }
+    let query = apply_graph_query_vars(query, vars)?;
     let (graph, cache) = load_graph(matrix, max_facts, cache_args).await?;
     graph
-        .execute_request(parse_graph_query(query)?, limit.max(1))
+        .execute_request(parse_graph_query(&query)?, limit.max(1))
         .map(|value| with_cache_summary(value, &cache))
 }
 
@@ -2576,6 +2746,487 @@ fn apply_graph_query_vars(query: &str, vars: &[String]) -> Result<String> {
         rendered = rendered.replace(&format!("${{{name}}}"), &encoded);
     }
     Ok(rendered)
+}
+
+#[derive(Clone, Debug)]
+enum GraphQlInput {
+    String(String),
+    Int(i64),
+    Bool(bool),
+    Null,
+    Variable(String),
+}
+
+#[derive(Clone, Debug)]
+struct GraphQlField {
+    response_key: String,
+    name: String,
+    args: BTreeMap<String, GraphQlInput>,
+    selection: Vec<GraphQlField>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum GraphQlToken {
+    Name(String),
+    String(String),
+    Int(i64),
+    Dollar,
+    Punct(char),
+}
+
+struct GraphQlParser {
+    tokens: Vec<GraphQlToken>,
+    index: usize,
+}
+
+fn is_native_graphql_query(query: &str) -> bool {
+    let trimmed = query.trim_start();
+    trimmed.starts_with('{') || trimmed.to_ascii_lowercase().starts_with("query")
+}
+
+fn parse_graphql_variables(vars: &[String]) -> Result<BTreeMap<String, Value>> {
+    let mut values = BTreeMap::new();
+    for var in vars {
+        let Some((name, value)) = var.split_once('=') else {
+            bail!("graphql --var expects NAME=VALUE, got {var:?}");
+        };
+        let name = name.trim();
+        if name.is_empty() || !is_sql_identifier(name) {
+            bail!("invalid GraphQL variable name {name:?}");
+        }
+        let value = value.trim();
+        let parsed = serde_json::from_str::<Value>(value)
+            .unwrap_or_else(|_| Value::String(value.to_string()));
+        values.insert(name.to_string(), parsed);
+    }
+    Ok(values)
+}
+
+fn execute_graphql_document(
+    db: &Connection,
+    graph: &GraphIndex,
+    query: &str,
+    vars: &BTreeMap<String, Value>,
+    default_limit: usize,
+) -> Result<Value> {
+    let fields = GraphQlParser::parse(query)?;
+    if fields.is_empty() {
+        bail!("GraphQL query must select at least one root field");
+    }
+    let mut data = serde_json::Map::new();
+    for field in fields {
+        let value = execute_graphql_field(db, graph, &field, vars, default_limit)?;
+        let value = if field.selection.is_empty() {
+            value
+        } else {
+            project_graphql_value(&value, &field.selection)
+        };
+        data.insert(field.response_key.clone(), value);
+    }
+    Ok(json!({
+        "kind": "graphql-result",
+        "schemaVersion": 1,
+        "data": Value::Object(data),
+    }))
+}
+
+fn execute_graphql_field(
+    db: &Connection,
+    graph: &GraphIndex,
+    field: &GraphQlField,
+    vars: &BTreeMap<String, Value>,
+    default_limit: usize,
+) -> Result<Value> {
+    match field.name.as_str() {
+        "path" => {
+            let source = graphql_string_arg(field, vars, &["from", "source"])?
+                .ok_or_else(|| anyhow!("GraphQL path requires from/source"))?;
+            let target = graphql_string_arg(field, vars, &["to", "target"])?
+                .ok_or_else(|| anyhow!("GraphQL path requires to/target"))?;
+            let limit = graphql_usize_arg(field, vars, "limit")?.unwrap_or(default_limit);
+            graph.path_answer(&source, &target, limit.max(1))
+        }
+        "worksWith" | "works_with" => {
+            let left = graphql_string_arg(field, vars, &["left"])?
+                .ok_or_else(|| anyhow!("GraphQL worksWith requires left"))?;
+            let right = graphql_string_arg(field, vars, &["right"])?
+                .ok_or_else(|| anyhow!("GraphQL worksWith requires right"))?;
+            let limit = graphql_usize_arg(field, vars, "limit")?.unwrap_or(default_limit);
+            graph.works_with_answer(&left, &right, limit.max(1))
+        }
+        "status" => {
+            let component = graphql_string_arg(field, vars, &["component", "name"])?
+                .ok_or_else(|| anyhow!("GraphQL status requires component/name"))?;
+            let limit = graphql_usize_arg(field, vars, "limit")?.unwrap_or(default_limit);
+            graph.status_answer(&component, limit.max(1))
+        }
+        "versions" => {
+            let component = graphql_string_arg(field, vars, &["component"])?
+                .ok_or_else(|| anyhow!("GraphQL versions requires component"))?;
+            let for_component = graphql_string_arg(field, vars, &["for", "forComponent"])?
+                .ok_or_else(|| anyhow!("GraphQL versions requires for/forComponent"))?;
+            let limit = graphql_usize_arg(field, vars, "limit")?.unwrap_or(default_limit);
+            graph.versions_for_answer(&component, &for_component, limit.max(1))
+        }
+        "resolve" => {
+            let name = graphql_string_arg(field, vars, &["name", "component"])?
+                .ok_or_else(|| anyhow!("GraphQL resolve requires name/component"))?;
+            graph.resolve_answer(&name)
+        }
+        "producers" => {
+            let limit = graphql_usize_arg(field, vars, "limit")?.unwrap_or(default_limit);
+            let stale_days = graphql_i64_arg(field, vars, &["staleDays", "stale_days"])?
+                .unwrap_or(14)
+                .max(1);
+            producer_inventory_value(db, limit.max(1), stale_days)
+        }
+        other => bail!(
+            "unsupported GraphQL root field {other:?}; expected path, worksWith, status, versions, resolve, or producers"
+        ),
+    }
+}
+
+fn graphql_string_arg(
+    field: &GraphQlField,
+    vars: &BTreeMap<String, Value>,
+    names: &[&str],
+) -> Result<Option<String>> {
+    for name in names {
+        if let Some(value) = field.args.get(*name) {
+            return graphql_input_string(value, vars).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+fn graphql_usize_arg(
+    field: &GraphQlField,
+    vars: &BTreeMap<String, Value>,
+    name: &str,
+) -> Result<Option<usize>> {
+    Ok(graphql_i64_arg(field, vars, &[name])?.map(|value| value.max(1) as usize))
+}
+
+fn graphql_i64_arg(
+    field: &GraphQlField,
+    vars: &BTreeMap<String, Value>,
+    names: &[&str],
+) -> Result<Option<i64>> {
+    for name in names {
+        if let Some(value) = field.args.get(*name) {
+            return graphql_input_i64(value, vars).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+fn graphql_input_string(input: &GraphQlInput, vars: &BTreeMap<String, Value>) -> Result<String> {
+    match resolve_graphql_input(input, vars)? {
+        Value::String(value) => Ok(value),
+        other => bail!(
+            "GraphQL argument expected String, got {}",
+            human_inline_value(&other)
+        ),
+    }
+}
+
+fn graphql_input_i64(input: &GraphQlInput, vars: &BTreeMap<String, Value>) -> Result<i64> {
+    match resolve_graphql_input(input, vars)? {
+        Value::Number(value) => value
+            .as_i64()
+            .ok_or_else(|| anyhow!("GraphQL argument expected integer")),
+        Value::String(value) => value
+            .parse::<i64>()
+            .with_context(|| format!("GraphQL argument expected integer, got {value:?}")),
+        other => bail!(
+            "GraphQL argument expected Int, got {}",
+            human_inline_value(&other)
+        ),
+    }
+}
+
+fn resolve_graphql_input(input: &GraphQlInput, vars: &BTreeMap<String, Value>) -> Result<Value> {
+    match input {
+        GraphQlInput::String(value) => Ok(Value::String(value.clone())),
+        GraphQlInput::Int(value) => Ok(json!(value)),
+        GraphQlInput::Bool(value) => Ok(json!(value)),
+        GraphQlInput::Null => Ok(Value::Null),
+        GraphQlInput::Variable(name) => vars
+            .get(name)
+            .cloned()
+            .ok_or_else(|| anyhow!("missing GraphQL variable ${name}")),
+    }
+}
+
+fn project_graphql_value(value: &Value, selection: &[GraphQlField]) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut projected = serde_json::Map::new();
+            for field in selection {
+                let child = object.get(&field.name).cloned().unwrap_or(Value::Null);
+                let child = if field.selection.is_empty() {
+                    child
+                } else {
+                    project_graphql_value(&child, &field.selection)
+                };
+                projected.insert(field.response_key.clone(), child);
+            }
+            Value::Object(projected)
+        }
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .map(|value| project_graphql_value(value, selection))
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+impl GraphQlParser {
+    fn parse(query: &str) -> Result<Vec<GraphQlField>> {
+        let mut parser = Self {
+            tokens: tokenize_graphql(query)?,
+            index: 0,
+        };
+        parser.parse_document()
+    }
+
+    fn parse_document(&mut self) -> Result<Vec<GraphQlField>> {
+        if self.consume_name("query") {
+            if matches!(self.peek(), Some(GraphQlToken::Name(_))) {
+                self.index += 1;
+            }
+            if matches!(self.peek(), Some(GraphQlToken::Punct('('))) {
+                self.skip_balanced('(', ')')?;
+            }
+        } else if self.peek_name("mutation") || self.peek_name("subscription") {
+            bail!("Matrix GraphQL only supports query operations");
+        }
+        let fields = self.parse_selection_set()?;
+        if self.peek().is_some() {
+            bail!("unexpected token after GraphQL query");
+        }
+        Ok(fields)
+    }
+
+    fn parse_selection_set(&mut self) -> Result<Vec<GraphQlField>> {
+        self.expect_punct('{')?;
+        let mut fields = Vec::new();
+        while !self.consume_punct('}') {
+            if self.peek().is_none() {
+                bail!("unterminated GraphQL selection set");
+            }
+            fields.push(self.parse_field()?);
+        }
+        Ok(fields)
+    }
+
+    fn parse_field(&mut self) -> Result<GraphQlField> {
+        let first = self.expect_name()?;
+        let (response_key, name) = if self.consume_punct(':') {
+            (first, self.expect_name()?)
+        } else {
+            (first.clone(), first)
+        };
+        let args = if self.consume_punct('(') {
+            self.parse_args()?
+        } else {
+            BTreeMap::new()
+        };
+        let selection = if matches!(self.peek(), Some(GraphQlToken::Punct('{'))) {
+            self.parse_selection_set()?
+        } else {
+            Vec::new()
+        };
+        Ok(GraphQlField {
+            response_key,
+            name,
+            args,
+            selection,
+        })
+    }
+
+    fn parse_args(&mut self) -> Result<BTreeMap<String, GraphQlInput>> {
+        let mut args = BTreeMap::new();
+        while !self.consume_punct(')') {
+            if self.peek().is_none() {
+                bail!("unterminated GraphQL argument list");
+            }
+            let name = self.expect_name()?;
+            self.expect_punct(':')?;
+            let value = self.parse_input()?;
+            args.insert(name, value);
+        }
+        Ok(args)
+    }
+
+    fn parse_input(&mut self) -> Result<GraphQlInput> {
+        match self.next() {
+            Some(GraphQlToken::String(value)) => Ok(GraphQlInput::String(value)),
+            Some(GraphQlToken::Int(value)) => Ok(GraphQlInput::Int(value)),
+            Some(GraphQlToken::Dollar) => Ok(GraphQlInput::Variable(self.expect_name()?)),
+            Some(GraphQlToken::Name(value)) if value == "true" => Ok(GraphQlInput::Bool(true)),
+            Some(GraphQlToken::Name(value)) if value == "false" => Ok(GraphQlInput::Bool(false)),
+            Some(GraphQlToken::Name(value)) if value == "null" => Ok(GraphQlInput::Null),
+            Some(GraphQlToken::Name(value)) => Ok(GraphQlInput::String(value)),
+            other => bail!("expected GraphQL value, got {other:?}"),
+        }
+    }
+
+    fn skip_balanced(&mut self, open: char, close: char) -> Result<()> {
+        self.expect_punct(open)?;
+        let mut depth = 1usize;
+        while let Some(token) = self.next() {
+            match token {
+                GraphQlToken::Punct(value) if value == open => depth += 1,
+                GraphQlToken::Punct(value) if value == close => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Ok(());
+                    }
+                }
+                _ => {}
+            }
+        }
+        bail!("unterminated GraphQL variable definition list")
+    }
+
+    fn expect_name(&mut self) -> Result<String> {
+        match self.next() {
+            Some(GraphQlToken::Name(value)) => Ok(value),
+            other => bail!("expected GraphQL name, got {other:?}"),
+        }
+    }
+
+    fn expect_punct(&mut self, expected: char) -> Result<()> {
+        if self.consume_punct(expected) {
+            Ok(())
+        } else {
+            bail!("expected GraphQL punctuation {expected:?}")
+        }
+    }
+
+    fn consume_name(&mut self, expected: &str) -> bool {
+        if self.peek_name(expected) {
+            self.index += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn consume_punct(&mut self, expected: char) -> bool {
+        if matches!(self.peek(), Some(GraphQlToken::Punct(value)) if *value == expected) {
+            self.index += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn peek_name(&self, expected: &str) -> bool {
+        matches!(self.peek(), Some(GraphQlToken::Name(value)) if value == expected)
+    }
+
+    fn peek(&self) -> Option<&GraphQlToken> {
+        self.tokens.get(self.index)
+    }
+
+    fn next(&mut self) -> Option<GraphQlToken> {
+        let token = self.tokens.get(self.index).cloned();
+        if token.is_some() {
+            self.index += 1;
+        }
+        token
+    }
+}
+
+fn tokenize_graphql(query: &str) -> Result<Vec<GraphQlToken>> {
+    let mut tokens = Vec::new();
+    let mut chars = query.char_indices().peekable();
+    while let Some((_, character)) = chars.next() {
+        match character {
+            character if character.is_whitespace() || character == ',' => {}
+            '#' => {
+                for (_, next) in chars.by_ref() {
+                    if next == '\n' {
+                        break;
+                    }
+                }
+            }
+            '{' | '}' | '(' | ')' | ':' | '!' | '[' | ']' | '=' => {
+                tokens.push(GraphQlToken::Punct(character));
+            }
+            '$' => tokens.push(GraphQlToken::Dollar),
+            '"' => tokens.push(GraphQlToken::String(read_graphql_string(&mut chars)?)),
+            '-' | '0'..='9' => {
+                let mut text = character.to_string();
+                while let Some((_, next)) = chars.peek() {
+                    if next.is_ascii_digit() {
+                        text.push(*next);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                tokens
+                    .push(GraphQlToken::Int(text.parse::<i64>().with_context(
+                        || format!("invalid GraphQL integer {text:?}"),
+                    )?));
+            }
+            character if is_graphql_name_start(character) => {
+                let mut text = character.to_string();
+                while let Some((_, next)) = chars.peek() {
+                    if is_graphql_name_continue(*next) {
+                        text.push(*next);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                tokens.push(GraphQlToken::Name(text));
+            }
+            other => bail!("unexpected GraphQL character {other:?}"),
+        }
+    }
+    Ok(tokens)
+}
+
+fn read_graphql_string<I>(chars: &mut std::iter::Peekable<I>) -> Result<String>
+where
+    I: Iterator<Item = (usize, char)>,
+{
+    let mut value = String::new();
+    while let Some((_, character)) = chars.next() {
+        match character {
+            '"' => return Ok(value),
+            '\\' => {
+                let Some((_, escaped)) = chars.next() else {
+                    bail!("unterminated GraphQL string escape");
+                };
+                value.push(match escaped {
+                    '"' => '"',
+                    '\\' => '\\',
+                    '/' => '/',
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    other => other,
+                });
+            }
+            other => value.push(other),
+        }
+    }
+    bail!("unterminated GraphQL string")
+}
+
+fn is_graphql_name_start(character: char) -> bool {
+    character == '_' || character.is_ascii_alphabetic()
+}
+
+fn is_graphql_name_continue(character: char) -> bool {
+    character == '_' || character.is_ascii_alphanumeric()
 }
 
 impl GraphIndex {
@@ -3991,7 +4642,11 @@ impl<'a> ReplSession<'a> {
 
     fn run_graph_query(&self, query: &str, limit: usize) -> Result<()> {
         let graph = self.graph()?;
-        let value = graph.execute_request(parse_graph_query(query)?, limit.max(1))?;
+        let value = if is_native_graphql_query(query) {
+            execute_graphql_document(&self.db, &graph, query, &BTreeMap::new(), limit.max(1))?
+        } else {
+            graph.execute_request(parse_graph_query(query)?, limit.max(1))?
+        };
         self.print_value(&value)
     }
 
@@ -6807,6 +7462,16 @@ fn print_human_object(object: &serde_json::Map<String, Value>) {
     if object
         .get("kind")
         .and_then(Value::as_str)
+        .is_some_and(|kind| kind == "graphql-schema")
+    {
+        if let Some(schema) = object.get("schema").and_then(Value::as_str) {
+            println!("{schema}");
+        }
+        return;
+    }
+    if object
+        .get("kind")
+        .and_then(Value::as_str)
         .is_some_and(|kind| kind.starts_with("graph-"))
     {
         print!("{}", graph_answer_human_text(object));
@@ -9262,8 +9927,8 @@ mod tests {
         );
     }
 
-    fn graph_fixture() -> GraphIndex {
-        let facts = vec![
+    fn graph_fixture_facts() -> Vec<Value> {
+        vec![
             json!({
                 "id": "aphrodite.1.2.0",
                 "track": "odin",
@@ -9299,8 +9964,16 @@ mod tests {
                 "subject": {"type": "service", "name": "putto", "version": "0.8.1", "repo": "red-wiz/putto"},
                 "provides": [{"capability": "putto-client", "version": "0.8"}]
             }),
-        ];
-        let db = build_facts_db(&facts, &MatrixContext::default()).unwrap();
+        ]
+    }
+
+    fn graph_fixture_db() -> Connection {
+        let facts = graph_fixture_facts();
+        build_facts_db(&facts, &MatrixContext::default()).unwrap()
+    }
+
+    fn graph_fixture() -> GraphIndex {
+        let db = graph_fixture_db();
         GraphIndex::from_db(&db).unwrap()
     }
 
@@ -9362,23 +10035,103 @@ mod tests {
     }
 
     #[test]
-    fn graph_query_variables_render_for_saved_queries() {
-        let query = apply_graph_query_vars(
-            "query Matrix($component:String,$for:String) { versions(component:$component, for:$for) { versions } }",
-            &["component=putto".to_string(), "for=aphrodite".to_string()],
+    fn native_graphql_binds_variables_and_projects_selection() {
+        let db = graph_fixture_db();
+        let graph = GraphIndex::from_db(&db).unwrap();
+        let vars = parse_graphql_variables(&[
+            "component=eunomia".to_string(),
+            "for=aphrodite".to_string(),
+        ])
+        .unwrap();
+        let value = execute_graphql_document(
+            &db,
+            &graph,
+            "query Matrix($component:String!,$for:String!) {
+                versions(component:$component, for:$for) {
+                    versions
+                    versionCandidates { version confidence score }
+                }
+            }",
+            &vars,
+            5,
         )
         .unwrap();
 
-        match parse_graph_query(&query).unwrap() {
-            GraphRequest::VersionsFor {
-                component,
-                for_component,
-            } => {
-                assert_eq!(component, "putto");
-                assert_eq!(for_component, "aphrodite");
-            }
-            _ => panic!("expected versions request"),
-        }
+        assert_eq!(value["kind"], "graphql-result");
+        assert_eq!(value["data"]["versions"]["versions"], json!(["3.1.0"]));
+        assert_eq!(
+            value["data"]["versions"]["versionCandidates"][0],
+            json!({"version": "3.1.0", "confidence": "medium", "score": 119})
+        );
+        assert!(value["data"]["versions"].get("kind").is_none());
+    }
+
+    #[test]
+    fn native_graphql_supports_aliases_paths_and_producers() {
+        let db = graph_fixture_db();
+        let graph = GraphIndex::from_db(&db).unwrap();
+        let value = execute_graphql_document(
+            &db,
+            &graph,
+            "{
+                aphroditePath: path(from:\"aphrodite\", to:\"eunomia\", limit:1) {
+                    status
+                    paths { confidence nodes { component version } }
+                }
+                producers(limit:10) { summary { producers facts } rows { producer facts freshness } }
+            }",
+            &BTreeMap::new(),
+            5,
+        )
+        .unwrap();
+
+        assert_eq!(value["data"]["aphroditePath"]["status"], "connected");
+        assert_eq!(
+            value["data"]["aphroditePath"]["paths"][0]["nodes"][1]["component"],
+            "eos"
+        );
+        assert_eq!(value["data"]["producers"]["summary"]["facts"], 4);
+        assert!(
+            value["data"]["producers"]["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["producer"] == "red-wiz/putto")
+        );
+    }
+
+    #[test]
+    fn native_graphql_reports_missing_variables_and_unknown_fields() {
+        let db = graph_fixture_db();
+        let graph = GraphIndex::from_db(&db).unwrap();
+        let missing = execute_graphql_document(
+            &db,
+            &graph,
+            "{ versions(component:$component, for:\"aphrodite\") { versions } }",
+            &BTreeMap::new(),
+            5,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(missing.contains("missing GraphQL variable $component"));
+
+        let unsupported = execute_graphql_document(
+            &db,
+            &graph,
+            "{ ask(question:\"no\") { answer } }",
+            &BTreeMap::new(),
+            5,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(unsupported.contains("unsupported GraphQL root field"));
+    }
+
+    #[test]
+    fn matrix_graphql_schema_documents_root_fields() {
+        assert!(MATRIX_GRAPHQL_SCHEMA.contains("type Query"));
+        assert!(MATRIX_GRAPHQL_SCHEMA.contains("worksWith"));
+        assert!(MATRIX_GRAPHQL_SCHEMA.contains("producers"));
     }
 
     #[test]

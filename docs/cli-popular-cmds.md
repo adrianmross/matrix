@@ -41,9 +41,10 @@ For agents and scripts:
 matrix path aphrodite eunomia -o json
 matrix works-with putto aphrodite -o json
 matrix versions eunomia --for aphrodite -o json
+matrix graphql --schema
 matrix graphql '{ path(from:"aphrodite", to:"eunomia") { status paths { nodes { component version } } } }' -o json
 matrix graphql -f queries/aphrodite-path.graphql -o json
-matrix graphql '{ versions(component:"eunomia", for:"aphrodite") { versions } }' -o json
+matrix graphql 'query VersionFor($component:String!,$for:String!) { versions(component:$component, for:$for) { versions } }' --var component=eunomia --var for=aphrodite -o json
 ```
 
 ## Work Fast With A Local Snapshot

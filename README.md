@@ -87,6 +87,7 @@ matrix sync --max-facts 5000
 matrix cache status
 matrix query -f queries/current-runtime.sql -o json
 matrix query -f queries/current-runtime.sql --offline -o json
+matrix graphql --schema
 matrix graphql '{ path(from:"aphrodite", to:"eunomia") { status paths { nodes { component version } } } }' -o json
 matrix graphql -f queries/aphrodite-path.graphql -o json
 matrix graphql -f queries/aphrodite-path.graphql --offline -o json
@@ -122,6 +123,7 @@ matrix sync --max-facts 10000
 matrix cache status
 matrix path aphrodite eunomia --offline
 matrix query 'select id, zone, status from facts limit 20' --offline
+matrix graphql --schema
 matrix graphql '{ path(from:"aphrodite", to:"eunomia") { status paths { nodes { component version } } } }' -o json
 matrix graphql -f queries/aphrodite-path.graphql -o json
 ```
