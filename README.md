@@ -170,6 +170,7 @@ matrix --construct http://127.0.0.1:8080 list
 - [Query examples](docs/query-examples.md)
 - [Producer onboarding](docs/producer-onboarding.md)
 - [Producer coverage boundary](docs/producer-coverage.md)
+- [Legacy compatibility-matrix migration](docs/legacy-compatibility-migration.md)
 - [Interactive REPL](docs/cli-repl.md)
 
 ## Producers

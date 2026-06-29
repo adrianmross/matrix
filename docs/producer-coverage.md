@@ -94,3 +94,6 @@ wiz repo health --repo <owner/repo> -v
 
 Then use the Matrix producer output to confirm facts landed after the repo-side
 fix is merged and run.
+
+For old workflows that dispatch or checkout `red-wiz/compatibility-matrix`, see
+[Legacy compatibility-matrix migration](legacy-compatibility-migration.md).
