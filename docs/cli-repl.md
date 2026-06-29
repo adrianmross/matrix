@@ -77,8 +77,8 @@ clears the current local session context.
   compatibility questions from the session fact cache.
 - `.resolve <name>`: show how a repo, package, identity, or short component name
   resolves into graph nodes.
-- `.graph <query>` or `.graphql <query>`: run GraphQL-style graph queries from
-  the session fact cache.
+- `.graph <query>` or `.graphql <query>`: run native GraphQL documents or legacy
+  graph shorthand from the session fact cache.
 - `.graph -f <file>` or `.graphql -f <file>`: run a saved graph query file.
 - `.producers` or `.coverage`: summarize fact producers, coverage, invalid
   facts, and freshness.

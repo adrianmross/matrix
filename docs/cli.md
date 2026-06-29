@@ -112,18 +112,27 @@ matrix works-with putto aphrodite -o json
 matrix versions eunomia --for aphrodite -o json
 ```
 
-Matrix also accepts a small GraphQL-style query surface for agent promptability
-and script readability. Selection sets are accepted so the command can look
-like GraphQL, while Matrix still returns the standard JSON answer shape.
+Matrix also exposes a deterministic native GraphQL query surface for agents and
+scripts. It supports typed root fields, aliases, selection projection, saved
+documents, and native `--var NAME=VALUE` variable binding. Matrix does not do
+natural-language interpretation; agents should translate user language into
+these explicit fields.
 
 ```bash
+matrix graphql --schema
 matrix graphql '{ path(from:"aphrodite", to:"eunomia") { status paths { nodes { component version } } } }' -o json
 matrix graphql '{ worksWith(left:"putto", right:"aphrodite") { status paths { edges { capability } } } }' -o json
 matrix graphql '{ versions(component:"eunomia", for:"aphrodite") { versions } }' -o json
+matrix graphql '{ producers(limit:10) { summary { producers facts } rows { producer freshness } } }' -o json
 matrix graphql -f queries/aphrodite-path.graphql -o json
 matrix graphql -f queries/version-for.graphql --var component=eunomia --var for=aphrodite -o json
 matrix graph 'aphrodite -> eunomia' -o json
 ```
+
+GraphQL documents return `kind: graphql-result` with a `data` object keyed by
+the selected root fields or aliases. Legacy shorthand such as
+`matrix graph 'aphrodite -> eunomia'` still returns the existing graph answer
+shape directly.
 
 Use the lower-level API projection commands when you need exact construct
 objects rather than an inferred answer:
