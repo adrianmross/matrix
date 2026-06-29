@@ -34,6 +34,10 @@ than one-off human notes.
      `MATRIX_API_PREFIX=/v1/compatibility`, and a secret-backed `MATRIX_TOKEN`
      or runner-local `MATRIX_TOKEN_COMMAND`.
    - For local Red Wiz use, run `wiz auth login` and `matrix config use red-wiz`.
+   - Always include explicit producer metadata through `source.repo` or
+     `sourceRepository`. Matrix can fall back to the subject repo for older
+     facts, but `matrix producers -o json` reports those as
+     `missingProducerMetadataFacts`.
 
 ## Minimum Fact Fields
 
@@ -109,6 +113,8 @@ matrix upload matrix-facts.json
 Query what landed:
 
 ```bash
+matrix producers --repo example/example-api -o json
+
 matrix query --repo example/example-api \
   'select id, zone, type, status from active order by observed_at desc limit 20'
 

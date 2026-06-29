@@ -168,6 +168,7 @@ matrix --construct http://127.0.0.1:8080 list
 - [CLI guide](docs/cli.md)
 - [Popular commands](docs/cli-popular-cmds.md)
 - [Producer onboarding](docs/producer-onboarding.md)
+- [Producer coverage boundary](docs/producer-coverage.md)
 - [Interactive REPL](docs/cli-repl.md)
 
 ## Producers

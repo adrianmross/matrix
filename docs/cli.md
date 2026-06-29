@@ -479,6 +479,16 @@ matrix coverage -o json
 
 The summary groups by `sourceRepository`/`source.repo` first and falls back to
 the subject repo when older facts do not carry an explicit producer field.
+JSON output includes `sourceRepoFacts`, `inferredSubjectRepoFacts`,
+`unknownProducerFacts`, and `missingProducerMetadataFacts` so agents can
+distinguish explicit producer metadata from subject-repo fallback.
+
+Matrix producer coverage is fact-side coverage only. Use
+`wiz repo health --repo <owner/repo>` to check whether a repository should adopt
+the shared compatibility producer workflow, whether that action is pinned, and
+whether publish auth uses OIDC. See
+[Producer coverage boundary](producer-coverage.md) for the full split and JSON
+contract.
 
 ## SQL Packs
 
