@@ -1,0 +1,22 @@
+query ResolveComponent($name: String!) {
+  resolve(name: $name) {
+    requested
+    name
+    ambiguous
+    matchCount
+    resolved {
+      component
+      version
+      repo
+    }
+    matches {
+      aliasKinds
+      node {
+        component
+        version
+        repo
+      }
+    }
+    warnings
+  }
+}
