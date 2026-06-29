@@ -5457,6 +5457,7 @@ enum TutorialCommand {
     Shell,
     Status,
     Steps,
+    Show,
     Print,
     Quit,
 }
@@ -5627,8 +5628,22 @@ impl<'a> ReplSession<'a> {
         let mut buffer = String::new();
 
         loop {
+            let tutorial_prompt = self
+                .tutorial
+                .as_ref()
+                .filter(|_| buffer.trim().is_empty())
+                .map(|tutorial| {
+                    DefaultPrompt::new(
+                        DefaultPromptSegment::Basic(format!(
+                            "matrix:tutorial {}/{}",
+                            tutorial.step + 1,
+                            REPL_TUTORIAL_STEPS.len()
+                        )),
+                        DefaultPromptSegment::Empty,
+                    )
+                });
             let active_prompt = if buffer.trim().is_empty() {
-                &prompt
+                tutorial_prompt.as_ref().unwrap_or(&prompt)
             } else {
                 &continuation_prompt
             };
@@ -6133,8 +6148,13 @@ impl<'a> ReplSession<'a> {
             return Ok(());
         }
         self.tutorial = Some(ReplTutorial { step: 0 });
-        println!("Starting Matrix interactive tutorial.");
-        println!("Controls: Enter/next, back, run, shell, status, steps, quit.");
+        println!("{}", tutorial_title("Matrix interactive tutorial"));
+        println!(
+            "{}",
+            tutorial_muted(
+                "Type the REPL commands shown in each step. Use plain controls for the tutorial."
+            )
+        );
         if let Some(parsed) = parse_tutorial_command(command)
             && !matches!(parsed, TutorialCommand::Next)
         {
@@ -6146,10 +6166,25 @@ impl<'a> ReplSession<'a> {
     }
 
     async fn handle_tutorial_input(&mut self, raw: &str) -> Result<()> {
+        let raw = raw.trim();
+        if raw.starts_with('.') || raw.starts_with('/') {
+            if self.handle_command(raw).await? {
+                self.tutorial = None;
+                return Ok(());
+            }
+            self.print_tutorial_pin();
+            return Ok(());
+        }
+        if is_complete_sql(raw) {
+            self.run_sql(raw.trim_end_matches(';').trim())?;
+            self.print_tutorial_pin();
+            return Ok(());
+        }
         let Some(command) = parse_tutorial_command(raw) else {
             eprintln!(
-                "Unknown tutorial command {raw:?}. Use next, back, run, shell, status, steps, or quit."
+                "Unknown tutorial input {raw:?}. Type a dotted REPL command like `.status`, or use next, back, show, shell, steps, run, or quit."
             );
+            self.print_tutorial_pin();
             return Ok(());
         };
         self.apply_tutorial_command(command).await
@@ -6177,6 +6212,7 @@ impl<'a> ReplSession<'a> {
             TutorialCommand::Shell => self.print_tutorial_shell(),
             TutorialCommand::Status => self.print_tutorial_status(),
             TutorialCommand::Steps => self.print_tutorial_steps(),
+            TutorialCommand::Show => self.print_tutorial_step(),
             TutorialCommand::Print => print_repl_tutorial_static(),
             TutorialCommand::Quit => {
                 self.tutorial = None;
@@ -6194,21 +6230,9 @@ impl<'a> ReplSession<'a> {
             return;
         };
         println!(
-            "\nStep {}/{}: {}",
-            tutorial.step + 1,
-            REPL_TUTORIAL_STEPS.len(),
-            step.title
+            "{}",
+            tutorial_step_text(step, tutorial.step, REPL_TUTORIAL_STEPS.len())
         );
-        println!("{}", step.goal);
-        println!("REPL:");
-        for command in step.repl {
-            println!("  {command}");
-        }
-        println!("Shell:");
-        for command in step.shell {
-            println!("  {command}");
-        }
-        println!("Controls: run, next, back, shell, status, steps, quit");
     }
 
     fn print_tutorial_shell(&self) {
@@ -6216,10 +6240,11 @@ impl<'a> ReplSession<'a> {
             return;
         };
         if let Some(step) = tutorial.current() {
-            println!("Equivalent shell commands:");
+            println!("{}", tutorial_section("Equivalent shell commands"));
             for command in step.shell {
-                println!("{command}");
+                println!("{}", tutorial_command_line("$", command));
             }
+            self.print_tutorial_pin();
         }
     }
 
@@ -6229,18 +6254,43 @@ impl<'a> ReplSession<'a> {
             return;
         };
         println!(
-            "Tutorial step {}/{}",
-            tutorial.step + 1,
-            REPL_TUTORIAL_STEPS.len()
+            "{}",
+            tutorial_muted(&format!(
+                "Tutorial step {}/{}",
+                tutorial.step + 1,
+                REPL_TUTORIAL_STEPS.len()
+            ))
         );
-        self.print_tutorial_step();
+        self.print_tutorial_pin();
     }
 
     fn print_tutorial_steps(&self) {
-        println!("Matrix tutorial steps");
+        let active = self.tutorial.as_ref().map(|tutorial| tutorial.step);
+        println!("{}", tutorial_title("Matrix tutorial steps"));
         for (index, step) in REPL_TUTORIAL_STEPS.iter().enumerate() {
-            println!("{}. {}", index + 1, step.title);
+            if Some(index) == active {
+                println!(
+                    "{}",
+                    tutorial_command(&format!("> {}. {}", index + 1, step.title))
+                );
+            } else {
+                println!("  {}. {}", index + 1, step.title);
+            }
         }
+        self.print_tutorial_pin();
+    }
+
+    fn print_tutorial_pin(&self) {
+        let Some(tutorial) = &self.tutorial else {
+            return;
+        };
+        let Some(step) = tutorial.current() else {
+            return;
+        };
+        println!(
+            "{}",
+            tutorial_pin(step, tutorial.step, REPL_TUTORIAL_STEPS.len())
+        );
     }
 
     async fn run_tutorial_step(&mut self) -> Result<()> {
@@ -6251,9 +6301,10 @@ impl<'a> ReplSession<'a> {
             .current()
             .ok_or_else(|| anyhow!("tutorial step is out of range"))?;
         for command in step.repl {
-            println!("matrix> {command}");
+            println!("{}", tutorial_command_line("matrix>", command));
             self.run_tutorial_repl_command(command).await?;
         }
+        self.print_tutorial_pin();
         Ok(())
     }
 
@@ -7628,46 +7679,101 @@ fn print_repl_examples() {
 
 #[cfg(feature = "interactive")]
 fn print_repl_tutorial_static() {
-    let tutorial = r#"Matrix tutorial
+    println!("{}", tutorial_title("Matrix tutorial"));
+    println!(
+        "{}",
+        tutorial_muted("Run `.tutorial` inside `matrix enter` for the interactive version.")
+    );
+    for (index, step) in REPL_TUTORIAL_STEPS.iter().enumerate() {
+        println!(
+            "{}",
+            tutorial_step_text(step, index, REPL_TUTORIAL_STEPS.len())
+        );
+    }
+}
 
-Run `.tutorial` inside `matrix enter` for the interactive version.
+#[cfg(feature = "interactive")]
+fn tutorial_step_text(step: &TutorialStep, index: usize, total: usize) -> String {
+    let mut text = String::new();
+    text.push_str(&tutorial_rule());
+    text.push('\n');
+    text.push_str(&format!(
+        "{}  {}\n",
+        tutorial_title(&format!("Step {}/{}", index + 1, total)),
+        tutorial_title(step.title)
+    ));
+    text.push_str(&tutorial_muted(step.goal));
+    text.push_str("\n\n");
+    text.push_str(&tutorial_section("REPL"));
+    text.push('\n');
+    for command in step.repl {
+        text.push_str(&tutorial_command_line("matrix>", command));
+        text.push('\n');
+    }
+    text.push('\n');
+    text.push_str(&tutorial_section("SHELL"));
+    text.push('\n');
+    for command in step.shell {
+        text.push_str(&tutorial_command_line("$", command));
+        text.push('\n');
+    }
+    text.push('\n');
+    text.push_str(&tutorial_controls());
+    text.push('\n');
+    text.push_str(&tutorial_rule());
+    text
+}
 
-1. Check session state and cache freshness.
-   REPL:  .status
-   Shell: matrix cache status
+#[cfg(feature = "interactive")]
+fn tutorial_pin(step: &TutorialStep, index: usize, total: usize) -> String {
+    format!(
+        "{} {}",
+        tutorial_muted(&format!("tutorial {}/{}: {}", index + 1, total, step.title)),
+        tutorial_controls()
+    )
+}
 
-2. See the built-in examples.
-   REPL:  .examples
-   Shell: matrix examples list
+#[cfg(feature = "interactive")]
+fn tutorial_controls() -> String {
+    format!(
+        "{} {}",
+        tutorial_section("Controls"),
+        tutorial_command("next | back | show | shell | steps | run | quit")
+    )
+}
 
-3. Ask which Eunomia version Aphrodite uses.
-   REPL:  .example version-for
-   Shell: matrix examples run version-for -o json
+#[cfg(feature = "interactive")]
+fn tutorial_command_line(prompt: &str, command: &str) -> String {
+    format!("  {} {}", tutorial_muted(prompt), tutorial_command(command))
+}
 
-4. Inspect why Aphrodite and Eunomia connect.
-   REPL:  .example aphrodite-eunomia-path
-   Shell: matrix examples run aphrodite-eunomia-path -o json
+#[cfg(feature = "interactive")]
+fn tutorial_rule() -> String {
+    tutorial_muted("----------------------------------------------------------------")
+}
 
-5. Check producer freshness and metadata.
-   REPL:  .producers
-   Shell: matrix producers --audit -o json
+#[cfg(feature = "interactive")]
+fn tutorial_title(text: &str) -> String {
+    Style::new().bold().fg(Color::Cyan).paint(text).to_string()
+}
 
-6. Confirm fact readback after Wiz repo health.
-   REPL:  .repo red-wiz/aphrodite
-          .producers
-   Shell: wiz repo health --repo red-wiz/aphrodite -v
-          matrix producers --readback --repo red-wiz/aphrodite --audit -o json
+#[cfg(feature = "interactive")]
+fn tutorial_section(text: &str) -> String {
+    Style::new()
+        .bold()
+        .fg(Color::Purple)
+        .paint(text)
+        .to_string()
+}
 
-7. Switch to a repo or component context.
-   REPL:  .repo red-wiz/aphrodite
-   Shell: matrix query -f examples/queries/current-runtime.sql --repo red-wiz/aphrodite -o json
+#[cfg(feature = "interactive")]
+fn tutorial_command(text: &str) -> String {
+    Style::new().bold().fg(Color::Green).paint(text).to_string()
+}
 
-8. Work offline after warming the cache.
-   REPL:  .offline
-   Shell: matrix sync --max-facts 10000
-          matrix examples run version-for --offline -o json
-"#;
-    println!("{tutorial}");
+#[cfg(feature = "interactive")]
+fn tutorial_muted(text: &str) -> String {
+    Style::new().fg(Color::LightGray).paint(text).to_string()
 }
 
 #[cfg(feature = "interactive")]
@@ -7692,6 +7798,7 @@ fn parse_tutorial_command(raw: &str) -> Option<TutorialCommand> {
         "s" | "shell" | "cmd" | "commands" => Some(TutorialCommand::Shell),
         "status" | "where" => Some(TutorialCommand::Status),
         "steps" | "list" => Some(TutorialCommand::Steps),
+        "show" | "help" | "h" | "?" => Some(TutorialCommand::Show),
         "p" | "print" | "static" => Some(TutorialCommand::Print),
         "q" | "quit" | "exit" | "done" => Some(TutorialCommand::Quit),
         _ => None,
@@ -11714,6 +11821,8 @@ mod tests {
             parse_tutorial_command("steps"),
             Some(TutorialCommand::Steps)
         );
+        assert_eq!(parse_tutorial_command("show"), Some(TutorialCommand::Show));
+        assert_eq!(parse_tutorial_command("help"), Some(TutorialCommand::Show));
         assert_eq!(parse_tutorial_command("quit"), Some(TutorialCommand::Quit));
         assert_eq!(parse_tutorial_command("wat"), None);
     }
@@ -11740,6 +11849,27 @@ mod tests {
         assert_eq!(tutorial.step, 0);
         tutorial.back();
         assert_eq!(tutorial.step, 0);
+    }
+
+    #[cfg(feature = "interactive")]
+    #[test]
+    fn interactive_tutorial_renders_command_blocks_and_pin() {
+        let step = &REPL_TUTORIAL_STEPS[0];
+        let text = tutorial_step_text(step, 0, REPL_TUTORIAL_STEPS.len());
+        assert!(text.contains("Step 1/"));
+        assert!(text.contains("REPL"));
+        assert!(text.contains("matrix>"));
+        assert!(text.contains(".status"));
+        assert!(text.contains("SHELL"));
+        assert!(text.contains("$"));
+        assert!(text.contains("matrix cache status"));
+        assert!(text.contains("Controls"));
+        assert!(text.contains("show"));
+
+        let pin = tutorial_pin(step, 0, REPL_TUTORIAL_STEPS.len());
+        assert!(pin.contains("tutorial 1/"));
+        assert!(pin.contains(step.title));
+        assert!(pin.contains("next | back | show"));
     }
 
     #[cfg(feature = "interactive")]
