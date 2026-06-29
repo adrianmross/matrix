@@ -121,6 +121,7 @@ matrix versions eunomia --for aphrodite
 matrix why aphrodite eunomia
 matrix resolve aphrodite
 matrix producers --zone odin
+matrix producers --readback --repo red-wiz/aphrodite --audit -o json
 matrix examples run aphrodite-eunomia-path -o json
 matrix sync --max-facts 10000
 matrix cache status
@@ -171,6 +172,7 @@ matrix --construct http://127.0.0.1:8080 list
 - [CLI guide](docs/cli.md)
 - [Popular commands](docs/cli-popular-cmds.md)
 - [Query examples](docs/query-examples.md)
+- [GraphQL reference](docs/graphql.md)
 - [Producer onboarding](docs/producer-onboarding.md)
 - [Producer coverage boundary](docs/producer-coverage.md)
 - [Legacy compatibility-matrix migration](docs/legacy-compatibility-migration.md)

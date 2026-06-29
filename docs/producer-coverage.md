@@ -12,6 +12,7 @@ Use this split:
 | --- | --- | --- |
 | Which repositories have emitted compatibility facts? | Matrix | `matrix producers -o json` |
 | Are emitted facts fresh or stale? | Matrix | `matrix producers --stale-days 7` |
+| Did this specific repo publish fresh facts after adoption? | Matrix | `matrix producers --readback --repo <owner/repo> -o json` |
 | Which zones/components are represented by facts? | Matrix | `matrix producers --zone odin` |
 | Are facts missing explicit producer metadata? | Matrix | `matrix producers -o json` |
 | Should this repo install the shared compatibility producer workflow? | Wiz repo health | `wiz repo health --repo <owner/repo>` |
@@ -23,6 +24,7 @@ Agents can combine both structured outputs when they need an org-level answer:
 ```bash
 matrix producers --zone odin --stale-days 7 -o json
 matrix producers --zone odin --stale-days 7 --audit -o json
+matrix producers --readback --repo red-wiz/eos --audit -o json
 wiz repo health --repo red-wiz/eos -o json
 ```
 
@@ -84,6 +86,26 @@ matrix producers --repo red-wiz/eos --audit -o json
 Audit findings are limited to Matrix-owned evidence: no matching producers,
 stale producers, invalid facts, and missing producer metadata. Use Wiz repo
 health for workflow adoption, pinning, and OIDC posture.
+
+## Producer Readback
+
+Use readback after `wiz repo health` reports that repository wiring is present:
+
+```bash
+wiz repo health --repo red-wiz/aphrodite -v
+matrix producers --readback --repo red-wiz/aphrodite --audit -o json
+```
+
+Readback answers fact-side state only:
+
+- whether Matrix has seen facts for the producer repo;
+- whether those facts are fresh under `--stale-days`;
+- whether producer metadata is explicit or inferred from subject repo fallback;
+- whether any emitted facts are invalid, failed, blocked, or incompatible;
+- which components and recent facts were seen.
+
+It intentionally does not assert workflow installation, OIDC setup, action
+pinning, or repository policy. Keep those checks in `wiz repo health`.
 
 ## Wiz Handoff
 

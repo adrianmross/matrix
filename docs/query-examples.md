@@ -40,7 +40,14 @@ matrix graphql -f examples/queries/producer-coverage.graphql \
   --var limit=25 \
   --var staleDays=7 \
   -o json
+
+matrix graphql -f examples/queries/resolve-component.graphql \
+  --var name=red-wiz/eunomia \
+  -o json
 ```
+
+For the supported native GraphQL fields, variable handling, aliases, output
+shape, and errors, see [Matrix GraphQL Reference](graphql.md).
 
 Run SQL examples against the local SQLite fact cache with `matrix query -f`:
 
@@ -70,6 +77,7 @@ matrix graphql -f examples/queries/version-for.graphql \
 | What version of Eunomia is Aphrodite using? | `matrix graphql -f examples/queries/version-for.graphql --var component=eunomia --var for=aphrodite -o json` |
 | What is connected to Aphrodite right now? | `matrix graphql -f examples/queries/component-status.graphql --var component=aphrodite -o json` |
 | Which producers are stale or missing metadata? | `matrix graphql -f examples/queries/producer-coverage.graphql --var limit=25 --var staleDays=7 -o json` |
+| What did Matrix resolve this name to? | `matrix graphql -f examples/queries/resolve-component.graphql --var name=red-wiz/eunomia -o json` |
 | Which chaincode members are in an EOS bundle? | `matrix query -f examples/queries/eos-chaincode-members.sql --offline -o table` |
 | Which chaincode facts connect to Athena? | `matrix query -f examples/queries/chaincode-athena-compatibility.sql --offline -o json` |
 | What does my current repo context see? | `matrix query -f examples/queries/current-runtime.sql --repo red-wiz/aphrodite -o json` |

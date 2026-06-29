@@ -123,6 +123,7 @@ matrix examples show version-for
 matrix examples run version-for -o json
 matrix examples run aphrodite-eunomia-path -o json
 matrix examples run producer-coverage -o json
+matrix examples run resolve-component -o json
 matrix examples run eos-chaincode-members --offline -o table
 ```
 
@@ -152,6 +153,9 @@ GraphQL documents return `kind: graphql-result` with a `data` object keyed by
 the selected root fields or aliases. Legacy shorthand such as
 `matrix graph 'aphrodite -> eunomia'` still returns the existing graph answer
 shape directly.
+
+See [Matrix GraphQL Reference](graphql.md) for root fields, variables, aliases,
+projection behavior, and error handling.
 
 Use the lower-level API projection commands when you need exact construct
 objects rather than an inferred answer:
@@ -496,6 +500,7 @@ their evidence looks fresh:
 matrix producers
 matrix producers --zone odin --stale-days 7
 matrix producers --zone odin --stale-days 7 --audit -o json
+matrix producers --readback --repo red-wiz/aphrodite --audit -o json
 matrix coverage -o json
 ```
 
@@ -511,6 +516,10 @@ the shared compatibility producer workflow, whether that action is pinned, and
 whether publish auth uses OIDC. See
 [Producer coverage boundary](producer-coverage.md) for the full split and JSON
 contract.
+
+After Wiz reports repo-side wiring is present, use
+`matrix producers --readback --repo <owner/repo> --audit -o json` to confirm
+fresh fact-side readback without duplicating repo-health checks in Matrix.
 
 ## SQL Packs
 

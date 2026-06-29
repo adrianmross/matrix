@@ -19,6 +19,7 @@ matrix examples show version-for
 matrix examples run version-for -o json
 matrix examples run aphrodite-eunomia-path -o json
 matrix examples run producer-coverage -o json
+matrix examples run resolve-component -o json
 ```
 
 ## Query The Construct
@@ -43,6 +44,7 @@ matrix versions eunomia --for aphrodite
 matrix why aphrodite eunomia
 matrix status aphrodite
 matrix resolve aphrodite
+matrix graphql -f examples/queries/resolve-component.graphql --var name=red-wiz/eunomia -o json
 ```
 
 For agents and scripts:
@@ -101,6 +103,7 @@ matrix versions eunomia --for aphrodite
 matrix why aphrodite eunomia
 matrix producers --zone odin
 matrix producers --zone odin --audit -o json
+matrix producers --readback --repo red-wiz/aphrodite --audit -o json
 ```
 
 Graph answers rank paths and show confidence. Add `-o json` for agents and

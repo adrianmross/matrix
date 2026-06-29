@@ -117,15 +117,56 @@ Use [Query examples](query-examples.md) for copyable GraphQL and SQL files.
    wiz repo health --repo <owner/repo> -v
    ```
 
-6. Verify fact-side coverage:
+6. Verify fact-side readback:
 
    ```bash
-   matrix producers --repo <owner/repo> -o json
+   matrix producers --readback --repo <owner/repo> --audit -o json
    matrix graphql -f examples/queries/producer-coverage.graphql \
      --var limit=25 \
      --var staleDays=7 \
      -o json
    ```
+
+## Representative Migration
+
+Use this shape for a Red Wiz repo that still dispatches the legacy matrix
+workflow:
+
+1. Remove the legacy dispatch:
+
+   ```bash
+   rg 'compatibility-matrix|workflow run' .github/workflows
+   ```
+
+2. Add or keep the shared producer action in the repo workflow:
+
+   ```yaml
+   - uses: red-wiz/submit-compatibility-facts-action@<immutable-version>
+     with:
+       facts: path/to/facts.json
+   ```
+
+3. Confirm repo-side governance:
+
+   ```bash
+   wiz repo health --repo red-wiz/eos -v
+   ```
+
+4. Rerun the producing workflow, then confirm Matrix readback:
+
+   ```bash
+   matrix producers --readback --repo red-wiz/eos --audit -o json
+   ```
+
+5. Use broad inventory only after per-repo readback passes:
+
+   ```bash
+   matrix producers --zone odin --stale-days 7 --audit -o json
+   ```
+
+Expected result: Wiz owns the answer to "is this repo wired and governed
+correctly?" Matrix owns the answer to "did fresh, valid facts with explicit
+producer metadata arrive?"
 
 ## Ownership Boundary
 

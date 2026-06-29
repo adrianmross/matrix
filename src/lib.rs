@@ -37,6 +37,8 @@ const QUERY_EXAMPLE_COMPONENT_STATUS: &str =
     include_str!("../examples/queries/component-status.graphql");
 const QUERY_EXAMPLE_PRODUCER_COVERAGE: &str =
     include_str!("../examples/queries/producer-coverage.graphql");
+const QUERY_EXAMPLE_RESOLVE_COMPONENT: &str =
+    include_str!("../examples/queries/resolve-component.graphql");
 const QUERY_EXAMPLE_CURRENT_RUNTIME: &str = include_str!("../examples/queries/current-runtime.sql");
 const QUERY_EXAMPLE_EOS_CHAINCODE_MEMBERS: &str =
     include_str!("../examples/queries/eos-chaincode-members.sql");
@@ -690,6 +692,11 @@ struct ProducerInventoryArgs {
     stale_days: i64,
     #[arg(long, help = "Include fact-side producer audit findings")]
     audit: bool,
+    #[arg(
+        long,
+        help = "Report readback for one producer repo instead of the full producer inventory"
+    )]
+    readback: bool,
     #[command(flatten)]
     cache: FactCacheArgs,
     #[command(flatten)]
@@ -2524,6 +2531,30 @@ async fn graph_why_command(matrix: &Matrix, args: GraphPairArgs) -> Result<Value
 }
 
 async fn producer_inventory_command(matrix: &Matrix, args: ProducerInventoryArgs) -> Result<Value> {
+    if args.readback {
+        let repo = args
+            .context
+            .repo
+            .clone()
+            .or_else(current_repo)
+            .ok_or_else(|| {
+                anyhow!(
+                    "--repo is required for producer readback when git remote origin cannot be detected"
+                )
+            })?;
+        let context = MatrixContext {
+            zone: args.context.zone.clone(),
+            ..MatrixContext::default()
+        };
+        let (db, cache) = query_db(matrix, args.max_facts, &context, &args.cache).await?;
+        return producer_readback_value(
+            &db,
+            &repo,
+            args.context.zone.as_deref(),
+            args.stale_days.max(1),
+        )
+        .map(|value| with_cache_summary(value, &cache));
+    }
     let filter_context = MatrixContext {
         zone: args.context.zone.clone(),
         repo: args.context.repo.clone(),
@@ -2673,6 +2704,16 @@ const QUERY_EXAMPLES: &[QueryExample] = &[
         path: "examples/queries/producer-coverage.graphql",
         text: QUERY_EXAMPLE_PRODUCER_COVERAGE,
         vars: &[("limit", "25"), ("staleDays", "7")],
+        offline_recommended: false,
+    },
+    QueryExample {
+        name: "resolve-component",
+        title: "Resolve a component name",
+        question: "What component did Matrix resolve this name to?",
+        kind: QueryExampleKind::Graphql,
+        path: "examples/queries/resolve-component.graphql",
+        text: QUERY_EXAMPLE_RESOLVE_COMPONENT,
+        vars: &[("name", "red-wiz/eunomia")],
         offline_recommended: false,
     },
     QueryExample {
@@ -3080,6 +3121,213 @@ fn producer_inventory_value(
         }
     }
     Ok(value)
+}
+
+fn producer_readback_value(
+    db: &Connection,
+    repo: &str,
+    zone: Option<&str>,
+    stale_days: i64,
+) -> Result<Value> {
+    let summary = execute_readonly_sql(db, &producer_readback_summary_sql(repo, zone, stale_days))?;
+    let summary_row = query_rows(&summary)
+        .as_array()
+        .and_then(|rows| rows.first().cloned())
+        .unwrap_or_else(|| json!({}));
+    let facts = summary_row
+        .get("facts")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let invalid_facts = summary_row
+        .get("invalid_facts")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let explicit_facts = summary_row
+        .get("explicit_producer_facts")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let inferred_facts = summary_row
+        .get("inferred_subject_repo_facts")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let freshness = summary_row
+        .get("freshness")
+        .and_then(Value::as_str)
+        .unwrap_or("missing");
+    let producer_metadata = if explicit_facts > 0 && inferred_facts > 0 {
+        "mixed"
+    } else if explicit_facts > 0 {
+        "explicit-source"
+    } else if inferred_facts > 0 {
+        "inferred-subject-repo"
+    } else {
+        "missing"
+    };
+    let status = if facts == 0 {
+        "missing"
+    } else if invalid_facts > 0 {
+        "invalid"
+    } else if freshness == "stale" {
+        "stale"
+    } else if explicit_facts == 0 {
+        "metadata-missing"
+    } else {
+        "fresh"
+    };
+    let components = query_rows(&execute_readonly_sql(
+        db,
+        &producer_readback_components_sql(repo, zone, stale_days),
+    )?);
+    let recent = query_rows(&execute_readonly_sql(
+        db,
+        &producer_readback_recent_sql(repo, zone),
+    )?);
+    Ok(json!({
+        "kind": "producer-readback",
+        "producer": repo,
+        "zone": zone,
+        "seen": facts > 0,
+        "status": status,
+        "freshness": freshness,
+        "staleAfterDays": stale_days,
+        "facts": facts,
+        "components": summary_row.get("components").cloned().unwrap_or(json!(0)),
+        "zones": summary_row.get("zones").cloned().unwrap_or(json!(0)),
+        "invalidFacts": invalid_facts,
+        "explicitProducerFacts": explicit_facts,
+        "inferredSubjectRepoFacts": inferred_facts,
+        "producerMetadata": producer_metadata,
+        "lastObservedAt": summary_row.get("last_observed_at").cloned().unwrap_or(Value::Null),
+        "componentReadback": components,
+        "recentFacts": recent,
+        "hints": producer_readback_hints(repo, status, explicit_facts, inferred_facts, invalid_facts),
+        "handoff": {
+            "repoHealthCommand": format!("wiz repo health --repo {repo} -v"),
+            "matrixCommand": format!("matrix producers --readback --repo {repo} --audit -o json"),
+        }
+    }))
+}
+
+fn producer_readback_hints(
+    repo: &str,
+    status: &str,
+    explicit_facts: i64,
+    inferred_facts: i64,
+    invalid_facts: i64,
+) -> Vec<Value> {
+    let mut hints = Vec::new();
+    if status == "missing" {
+        hints.push(json!({
+            "severity": "warn",
+            "code": "no-facts-seen",
+            "detail": "Matrix did not find compatibility facts for this producer repo",
+            "fix": format!("confirm repo wiring with `wiz repo health --repo {repo} -v`, then publish facts with Matrix or the shared producer action"),
+        }));
+    }
+    if status == "stale" {
+        hints.push(json!({
+            "severity": "warn",
+            "code": "stale-readback",
+            "detail": "Matrix found facts for this producer, but none inside the configured stale window",
+            "fix": "rerun the producer workflow or inspect its last publish step",
+        }));
+    }
+    if invalid_facts > 0 {
+        hints.push(json!({
+            "severity": "warn",
+            "code": "invalid-facts",
+            "facts": invalid_facts,
+            "detail": "this producer has facts with failed, incompatible, invalid, or blocked status",
+            "fix": "inspect recentFacts and query invalid_facts for the producer",
+        }));
+    }
+    if explicit_facts == 0 && inferred_facts > 0 {
+        hints.push(json!({
+            "severity": "info",
+            "code": "inferred-producer",
+            "detail": "Matrix only found this repo through subject repo fallback",
+            "fix": "emit explicit source.repo, source.sha, and source.ref metadata",
+        }));
+    }
+    if hints.is_empty() {
+        hints.push(json!({
+            "severity": "info",
+            "code": "readback-ok",
+            "detail": "Matrix found fresh facts with explicit producer metadata",
+            "fix": Value::Null,
+        }));
+    }
+    hints
+}
+
+fn producer_readback_where_sql(repo: &str, zone: Option<&str>) -> String {
+    let repo = sql_literal(repo);
+    let mut filters = vec![format!(
+        "((coalesce(nullif(source_repository, ''), nullif(source_repo, '')) = {repo})
+          or (coalesce(nullif(source_repository, ''), nullif(source_repo, '')) is null and repo = {repo}))"
+    )];
+    if let Some(zone) = zone {
+        filters.push(format!("zone = {}", sql_literal(zone)));
+    }
+    filters.join(" and ")
+}
+
+fn producer_readback_summary_sql(repo: &str, zone: Option<&str>, stale_days: i64) -> String {
+    let where_sql = producer_readback_where_sql(repo, zone);
+    format!(
+        "select count(*) as facts,
+                count(distinct component) as components,
+                count(distinct zone) as zones,
+                sum(case when status in ('incompatible', 'failed', 'invalid', 'blocked') then 1 else 0 end) as invalid_facts,
+                sum(case when coalesce(nullif(source_repository, ''), nullif(source_repo, '')) is not null then 1 else 0 end) as explicit_producer_facts,
+                sum(case when coalesce(nullif(source_repository, ''), nullif(source_repo, '')) is null and repo is not null then 1 else 0 end) as inferred_subject_repo_facts,
+                max(coalesce(accepted_at, observed_at)) as last_observed_at,
+                case
+                  when count(*) = 0 then 'missing'
+                  when max(coalesce(accepted_at, observed_at)) is null then 'unknown'
+                  when julianday('now') - julianday(max(coalesce(accepted_at, observed_at))) > {} then 'stale'
+                  else 'fresh'
+                end as freshness
+         from facts
+         where {}",
+        stale_days.max(1),
+        where_sql
+    )
+}
+
+fn producer_readback_components_sql(repo: &str, zone: Option<&str>, stale_days: i64) -> String {
+    let where_sql = producer_readback_where_sql(repo, zone);
+    format!(
+        "select component,
+                count(*) as facts,
+                sum(case when status in ('incompatible', 'failed', 'invalid', 'blocked') then 1 else 0 end) as invalid_facts,
+                max(coalesce(accepted_at, observed_at)) as last_observed_at,
+                case
+                  when max(coalesce(accepted_at, observed_at)) is null then 'unknown'
+                  when julianday('now') - julianday(max(coalesce(accepted_at, observed_at))) > {} then 'stale'
+                  else 'fresh'
+                end as freshness
+         from facts
+         where {} and component is not null
+         group by component
+         order by last_observed_at desc, component asc
+         limit 25",
+        stale_days.max(1),
+        where_sql
+    )
+}
+
+fn producer_readback_recent_sql(repo: &str, zone: Option<&str>) -> String {
+    let where_sql = producer_readback_where_sql(repo, zone);
+    format!(
+        "select id, zone, component, version, status, repo, source_repository, source_sha, source_ref,
+                coalesce(accepted_at, observed_at) as observed_at
+         from facts
+         where {}
+         order by coalesce(accepted_at, observed_at) desc, id asc
+         limit 10",
+        where_sql
+    )
 }
 
 fn producer_audit_findings(producers: &[Value]) -> Vec<Value> {
@@ -7112,11 +7360,17 @@ fn print_repl_tutorial() {
    REPL:  .producers
    Shell: matrix producers --audit -o json
 
-6. Switch to a repo or component context.
+6. Confirm fact readback after Wiz repo health.
+   REPL:  .repo red-wiz/aphrodite
+          .producers
+   Shell: wiz repo health --repo red-wiz/aphrodite -v
+          matrix producers --readback --repo red-wiz/aphrodite --audit -o json
+
+7. Switch to a repo or component context.
    REPL:  .repo red-wiz/aphrodite
    Shell: matrix query -f examples/queries/current-runtime.sql --repo red-wiz/aphrodite -o json
 
-7. Work offline after warming the cache.
+8. Work offline after warming the cache.
    REPL:  .offline
    Shell: matrix sync --max-facts 10000
           matrix examples run version-for --offline -o json
@@ -7185,6 +7439,8 @@ impl MatrixCompleter {
             ".offline",
             ".open",
             ".path",
+            ".producers",
+            ".coverage",
             ".read",
             ".refresh",
             ".resolve",
@@ -7420,12 +7676,25 @@ async fn doctor(matrix: &Matrix) -> Result<Value> {
     } else {
         json!({"reachable": false, "error": "no construct configured"})
     };
+    let cache = fact_cache_status(matrix).unwrap_or_else(|error| {
+        json!({
+            "kind": "fact-cache-status",
+            "cache": {
+                "exists": false,
+                "error": error.to_string(),
+            }
+        })
+    });
     Ok(json!({
+        "kind": "matrix-doctor",
         "configPath": matrix.config_path,
         "profile": matrix.profile.map(ConfigProfile::as_str),
         "construct": construct,
         "apiPrefix": matrix.api_prefix,
+        "cachePolicy": matrix.cache_policy().map(CachePolicy::as_str).unwrap_or("invalid"),
+        "cacheMaxFacts": matrix.max_facts(None).unwrap_or(DEFAULT_FACT_CACHE_MAX_FACTS),
         "auth": auth_diagnostic(matrix),
+        "cache": cache["cache"].clone(),
         "reachable": reachability["reachable"].as_bool().unwrap_or(false),
         "reachability": reachability,
     }))
@@ -8357,6 +8626,14 @@ fn print_human_object(object: &serde_json::Map<String, Value>) {
     if object
         .get("kind")
         .and_then(Value::as_str)
+        .is_some_and(|kind| kind == "producer-readback")
+    {
+        print!("{}", producer_readback_human_text(object));
+        return;
+    }
+    if object
+        .get("kind")
+        .and_then(Value::as_str)
         .is_some_and(|kind| kind.starts_with("fact-cache-"))
     {
         print_cache_command_human(object);
@@ -8396,8 +8673,16 @@ fn print_human_object(object: &serde_json::Map<String, Value>) {
         print_object_field(object, "configPath", "Config");
         print_object_field(object, "construct", "Construct");
         print_object_field(object, "apiPrefix", "API prefix");
+        print_object_field(object, "cachePolicy", "Cache policy");
+        print_object_field(object, "cacheMaxFacts", "Cache max facts");
         print_object_field(object, "hasToken", "Token");
         print_object_field(object, "reachable", "Reachable");
+        if let Some(cache) = object.get("cache").and_then(Value::as_object) {
+            print_object_field(cache, "exists", "Cache exists");
+            print_object_field(cache, "path", "Cache path");
+            print_object_field(cache, "ageHuman", "Cache age");
+            print_object_field(cache, "stale", "Cache stale");
+        }
         return;
     }
     if let (Some(zone), Some(level), Some(gate)) = (
@@ -8728,6 +9013,69 @@ fn producer_inventory_human_text(object: &serde_json::Map<String, Value>) -> Str
         text.push_str(&format!(
             "- {producer}: {facts} facts, {components} components, {freshness}, {metadata}\n"
         ));
+    }
+    if let Some(cache) = object.get("cache").and_then(Value::as_object) {
+        text.push_str(&cache_human_line(cache));
+    }
+    text
+}
+
+fn producer_readback_human_text(object: &serde_json::Map<String, Value>) -> String {
+    let producer = object
+        .get("producer")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let status = object
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let facts = object.get("facts").and_then(Value::as_i64).unwrap_or(0);
+    let explicit = object
+        .get("explicitProducerFacts")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let inferred = object
+        .get("inferredSubjectRepoFacts")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let invalid = object
+        .get("invalidFacts")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let last_observed = object
+        .get("lastObservedAt")
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    let mut text = format!(
+        "Producer readback: {producer} {status}\nFacts: {facts}, explicit producer: {explicit}, inferred: {inferred}, invalid: {invalid}\nLast observed: {last_observed}\n"
+    );
+    let components = object
+        .get("componentReadback")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if !components.is_empty() {
+        text.push_str("Components\n");
+        for component in components {
+            let name = component
+                .get("component")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let facts = component.get("facts").and_then(Value::as_i64).unwrap_or(0);
+            let freshness = component
+                .get("freshness")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            text.push_str(&format!("- {name}: {facts} facts, {freshness}\n"));
+        }
+    }
+    if let Some(hints) = object.get("hints").and_then(Value::as_array) {
+        text.push_str("Hints\n");
+        for hint in hints {
+            let code = hint.get("code").and_then(Value::as_str).unwrap_or("hint");
+            let detail = hint.get("detail").and_then(Value::as_str).unwrap_or("");
+            text.push_str(&format!("- {code}: {detail}\n"));
+        }
     }
     if let Some(cache) = object.get("cache").and_then(Value::as_object) {
         text.push_str(&cache_human_line(cache));
@@ -9322,6 +9670,24 @@ mod tests {
         match versions.command {
             Commands::Versions(args) => assert!(args.cache.offline),
             _ => panic!("expected versions command"),
+        }
+
+        let readback = Cli::try_parse_from([
+            "matrix",
+            "producers",
+            "--readback",
+            "--repo",
+            "red-wiz/aphrodite",
+            "-o",
+            "json",
+        ])
+        .unwrap();
+        match readback.command {
+            Commands::Producers(args) => {
+                assert!(args.readback);
+                assert_eq!(args.context.repo.as_deref(), Some("red-wiz/aphrodite"));
+            }
+            _ => panic!("expected producers command"),
         }
     }
 
@@ -11105,6 +11471,24 @@ mod tests {
         assert!(MATRIX_GRAPHQL_SCHEMA.contains("type Query"));
         assert!(MATRIX_GRAPHQL_SCHEMA.contains("worksWith"));
         assert!(MATRIX_GRAPHQL_SCHEMA.contains("producers"));
+        let docs = include_str!("../docs/graphql.md");
+        for field in [
+            "path",
+            "worksWith",
+            "status",
+            "versions",
+            "resolve",
+            "producers",
+        ] {
+            assert!(
+                MATRIX_GRAPHQL_SCHEMA.contains(&format!("{field}(")),
+                "schema missing {field}"
+            );
+            assert!(
+                docs.contains(&format!("### `{field}`")),
+                "docs missing {field}"
+            );
+        }
     }
 
     #[test]
@@ -11241,6 +11625,71 @@ mod tests {
         )
         .unwrap();
         assert_eq!(missing["audit"][0]["code"], "no-producers");
+    }
+
+    #[test]
+    fn producer_readback_reports_fact_side_handoff_state() {
+        let facts = vec![
+            json!({
+                "id": "producer-a-1",
+                "track": "odin",
+                "status": "passed",
+                "sourceRepository": "red-wiz/aphrodite",
+                "observedAt": "2026-06-28T00:00:00Z",
+                "subject": {"type": "service", "name": "aphrodite", "version": "1.2.0", "repo": "red-wiz/aphrodite"}
+            }),
+            json!({
+                "id": "producer-a-2",
+                "track": "odin",
+                "status": "failed",
+                "sourceRepository": "red-wiz/aphrodite",
+                "observedAt": "2026-06-28T00:01:00Z",
+                "subject": {"type": "service", "name": "eos", "version": "24.6.0", "repo": "red-wiz/eos"}
+            }),
+            json!({
+                "id": "producer-c-1",
+                "track": "runtime",
+                "status": "passed",
+                "observedAt": "2026-06-28T00:03:00Z",
+                "subject": {"type": "service", "name": "athena", "version": "4.0.0", "repo": "red-wiz/athena"}
+            }),
+        ];
+        let db = build_facts_db(&facts, &MatrixContext::default()).unwrap();
+        let value = producer_readback_value(&db, "red-wiz/aphrodite", Some("odin"), 14).unwrap();
+
+        assert_eq!(value["kind"], "producer-readback");
+        assert_eq!(value["producer"], "red-wiz/aphrodite");
+        assert_eq!(value["seen"], true);
+        assert_eq!(value["facts"], 2);
+        assert_eq!(value["explicitProducerFacts"], 2);
+        assert_eq!(value["invalidFacts"], 1);
+        assert_eq!(value["producerMetadata"], "explicit-source");
+        assert!(
+            value["hints"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|hint| hint["code"] == "invalid-facts")
+        );
+        assert_eq!(
+            value["handoff"]["repoHealthCommand"],
+            "wiz repo health --repo red-wiz/aphrodite -v"
+        );
+
+        let inferred = producer_readback_value(&db, "red-wiz/athena", None, 14).unwrap();
+        assert_eq!(inferred["producerMetadata"], "inferred-subject-repo");
+        assert!(
+            inferred["hints"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|hint| hint["code"] == "inferred-producer")
+        );
+
+        let missing = producer_readback_value(&db, "red-wiz/missing", None, 14).unwrap();
+        assert_eq!(missing["status"], "missing");
+        assert_eq!(missing["seen"], false);
+        assert_eq!(missing["hints"][0]["code"], "no-facts-seen");
     }
 
     #[test]
