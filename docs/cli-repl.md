@@ -38,6 +38,8 @@ matrix> .zones
 matrix> .describe facts
 matrix> .views
 matrix> .examples
+matrix> .tutorial
+matrix> .example version-for
 matrix> .members release-bundle.api.1.0.0
 matrix> .deref release-bundle.api.1.0.0
 matrix> .compare ledger-service
@@ -72,6 +74,10 @@ clears the current local session context.
 - `.tables`, `.views`, `.schema [table]`, `.describe [table]`: inspect the
   local query model.
 - `.examples`: print copyable SQL and helper-command examples.
+- `.example <name>`: run a built-in GraphQL or SQL query example from the
+  current session cache.
+- `.tutorial`: print a short guided workflow with equivalent shell commands for
+  each REPL step.
 - `.get <fact-id>`: show the current or selected revision of a fact.
 - `.members <fact-id>`: show tuple members for a fact.
 - `.deref <fact-id>`: show member, requirement, and provide edges for a fact.
@@ -126,6 +132,22 @@ clears the current local session context.
 - `.explain <sql>`: run `EXPLAIN QUERY PLAN`.
 
 For copyable GraphQL and SQL files, see [Query examples](query-examples.md).
+
+## Tutorial
+
+Start here when you want a Vim-style guided path that still maps each step to a
+normal command:
+
+```text
+.tutorial
+.examples
+.example version-for
+.example aphrodite-eunomia-path
+.producers
+```
+
+The tutorial output includes the equivalent `matrix ...` shell command beside
+each REPL command, so the same flow can be copied into scripts or agent plans.
 
 ## Useful GraphQL
 
