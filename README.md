@@ -161,6 +161,13 @@ SQLite database directly, `--refresh-cache` forces a refresh, and
 defaults once with `matrix config set cache-policy auto` and
 `matrix config set cache-max-facts 10000`.
 
+When the service-backed construct exposes cache headers, `matrix cache status
+-o json` and command JSON include `cache.service`. That block describes the
+remote compatibility-service cache, such as Redis/Dapr hit or miss state,
+observed Matrix-to-service latency, request count, backend, and request ID. It
+is separate from Matrix's local SQLite cache. If `cache.service` is absent, the
+service did not expose those headers for the last sync or digest check.
+
 Run a local construct:
 
 ```bash
