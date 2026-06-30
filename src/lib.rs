@@ -5463,6 +5463,13 @@ enum TutorialCommand {
 }
 
 #[cfg(feature = "interactive")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplInterrupt {
+    ExitTutorial,
+    ExitShell,
+}
+
+#[cfg(feature = "interactive")]
 #[derive(Clone, Copy, Debug)]
 struct TutorialStep {
     title: &'static str,
@@ -5587,7 +5594,7 @@ impl<'a> ReplSession<'a> {
 
     async fn run(&mut self) -> Result<()> {
         eprintln!(
-            "Matrix shell. Type SQL ending in `;`, `.help` for commands, `red` to exit, `blue` to clear."
+            "Matrix shell. Type SQL ending in `;`, `.help` for commands, Ctrl-D/Ctrl-C to exit, `blue` to clear."
         );
         eprintln!("Loaded {} facts into the local session.", self.fact_count);
 
@@ -5655,7 +5662,9 @@ impl<'a> ReplSession<'a> {
                     }
 
                     if self.tutorial.is_some() {
-                        self.handle_tutorial_input(line).await?;
+                        if self.handle_tutorial_input(line).await? {
+                            break;
+                        }
                         continue;
                     }
 
@@ -5680,14 +5689,14 @@ impl<'a> ReplSession<'a> {
                     }
                 }
                 Ok(Signal::CtrlD) => break,
-                Ok(Signal::CtrlC) => {
-                    if buffer.is_empty() {
-                        eprintln!("Use `red` to exit.");
-                    } else {
+                Ok(Signal::CtrlC) => match repl_ctrl_c_action(self.tutorial.is_some()) {
+                    ReplInterrupt::ExitTutorial => {
+                        self.tutorial = None;
                         buffer.clear();
-                        eprintln!("Cleared query buffer.");
+                        eprintln!("Left tutorial mode. Press Ctrl-C or Ctrl-D again to exit.");
                     }
-                }
+                    ReplInterrupt::ExitShell => break,
+                },
                 Ok(Signal::HostCommand(command)) => {
                     if self.handle_command(&command).await? {
                         break;
@@ -6165,29 +6174,34 @@ impl<'a> ReplSession<'a> {
         Ok(())
     }
 
-    async fn handle_tutorial_input(&mut self, raw: &str) -> Result<()> {
+    async fn handle_tutorial_input(&mut self, raw: &str) -> Result<bool> {
         let raw = raw.trim();
+        if is_tutorial_shell_exit(raw) {
+            self.tutorial = None;
+            return Ok(true);
+        }
         if raw.starts_with('.') || raw.starts_with('/') {
             if self.handle_command(raw).await? {
                 self.tutorial = None;
-                return Ok(());
+                return Ok(true);
             }
             self.print_tutorial_pin();
-            return Ok(());
+            return Ok(false);
         }
         if is_complete_sql(raw) {
             self.run_sql(raw.trim_end_matches(';').trim())?;
             self.print_tutorial_pin();
-            return Ok(());
+            return Ok(false);
         }
         let Some(command) = parse_tutorial_command(raw) else {
             eprintln!(
                 "Unknown tutorial input {raw:?}. Type a dotted REPL command like `.status`, or use next, back, show, shell, steps, run, or quit."
             );
             self.print_tutorial_pin();
-            return Ok(());
+            return Ok(false);
         };
-        self.apply_tutorial_command(command).await
+        self.apply_tutorial_command(command).await?;
+        Ok(false)
     }
 
     async fn apply_tutorial_command(&mut self, command: TutorialCommand) -> Result<()> {
@@ -7644,7 +7658,8 @@ Matrix shell commands
   .tutorial print           Print the static tutorial with shell equivalents
   .explain <sql>            Run EXPLAIN QUERY PLAN
   .explain graph <query>    Explain a graph or GraphQL query
-  red, red-pill, .exit      Exit
+  Ctrl-D, Ctrl-C            Exit the shell
+  red, red-pill, quit       Exit the shell
   blue, blue-pill           Clear the current session context
 
 SQL
@@ -7738,7 +7753,7 @@ fn tutorial_controls() -> String {
     format!(
         "{} {}",
         tutorial_section("Controls"),
-        tutorial_command("next | back | show | shell | steps | run | quit")
+        tutorial_command("next | back | show | shell | steps | run | quit | Ctrl-C")
     )
 }
 
@@ -7774,6 +7789,28 @@ fn tutorial_command(text: &str) -> String {
 #[cfg(feature = "interactive")]
 fn tutorial_muted(text: &str) -> String {
     Style::new().fg(Color::LightGray).paint(text).to_string()
+}
+
+#[cfg(feature = "interactive")]
+fn repl_ctrl_c_action(tutorial_active: bool) -> ReplInterrupt {
+    if tutorial_active {
+        ReplInterrupt::ExitTutorial
+    } else {
+        ReplInterrupt::ExitShell
+    }
+}
+
+#[cfg(feature = "interactive")]
+fn is_tutorial_shell_exit(raw: &str) -> bool {
+    let command = raw
+        .trim()
+        .trim_start_matches('.')
+        .trim_start_matches('/')
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(command.as_str(), "red" | "red-pill" | "exit" | "q")
 }
 
 #[cfg(feature = "interactive")]
@@ -11825,6 +11862,24 @@ mod tests {
         assert_eq!(parse_tutorial_command("help"), Some(TutorialCommand::Show));
         assert_eq!(parse_tutorial_command("quit"), Some(TutorialCommand::Quit));
         assert_eq!(parse_tutorial_command("wat"), None);
+    }
+
+    #[cfg(feature = "interactive")]
+    #[test]
+    fn ctrl_c_exits_tutorial_before_shell() {
+        assert_eq!(repl_ctrl_c_action(true), ReplInterrupt::ExitTutorial);
+        assert_eq!(repl_ctrl_c_action(false), ReplInterrupt::ExitShell);
+    }
+
+    #[cfg(feature = "interactive")]
+    #[test]
+    fn tutorial_accepts_shell_exit_words() {
+        assert!(is_tutorial_shell_exit("red"));
+        assert!(is_tutorial_shell_exit("red-pill"));
+        assert!(is_tutorial_shell_exit(".exit"));
+        assert!(is_tutorial_shell_exit("/q"));
+        assert!(!is_tutorial_shell_exit("quit"));
+        assert_eq!(parse_tutorial_command("quit"), Some(TutorialCommand::Quit));
     }
 
     #[cfg(feature = "interactive")]

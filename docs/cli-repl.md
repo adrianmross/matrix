@@ -65,7 +65,9 @@ matrix> red
 ```
 
 SQL errors print in the shell without exiting the session. `red` exits. `blue`
-clears the current local session context.
+clears the current local session context. `Ctrl-D` exits the shell. `Ctrl-C`
+exits tutorial mode when the tutorial is active; outside tutorial mode it exits
+the shell.
 
 ## Commands
 
@@ -77,7 +79,8 @@ clears the current local session context.
 - `.example <name>`: run a built-in GraphQL or SQL query example from the
   current session cache.
 - `.tutorial`: start an interactive guided workflow with equivalent shell
-  commands for each REPL step.
+  commands for each REPL step. `Ctrl-C` leaves tutorial mode and returns to the
+  normal shell.
 - `.tutorial print`: print the static tutorial without entering tutorial mode.
 - `.get <fact-id>`: show the current or selected revision of a fact.
 - `.members <fact-id>`: show tuple members for a fact.
@@ -155,6 +158,8 @@ current step, `run` to execute the step's safe REPL commands, `shell` to print
 the equivalent non-REPL commands, `steps` to list the whole path, and `quit` to
 leave tutorial mode. Tutorial mode keeps a compact hint visible near the prompt
 and uses highlighted command blocks when the terminal supports ANSI color.
+`Ctrl-C` also leaves tutorial mode; `Ctrl-D` exits the shell. `red` and `.exit`
+exit the shell even from tutorial mode.
 
 While tutorial mode is active, dotted input such as `.status`, `.examples`, or
 `.graphql ...` runs as a normal REPL command and then returns to the tutorial.
