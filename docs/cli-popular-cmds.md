@@ -104,6 +104,7 @@ matrix why aphrodite eunomia
 matrix producers --zone odin
 matrix producers --zone odin --audit -o json
 matrix producers --readback --repo red-wiz/aphrodite --audit -o json
+matrix producers --readback-file repos.txt --zone odin --audit -o table
 ```
 
 Graph answers rank paths and show confidence. Add `-o json` for agents and

@@ -90,6 +90,7 @@ matrix config use red-wiz
 matrix sync --max-facts 10000
 matrix producers --repo red-wiz/eos -o json
 matrix producers --zone odin --stale-days 7 -o json
+matrix producers --readback-file repos.txt --zone odin --audit -o table
 matrix query -f examples/queries/current-runtime.sql --repo red-wiz/aphrodite -o json
 matrix graphql -f examples/queries/version-for.graphql \
   --var component=eunomia \
@@ -121,6 +122,7 @@ Use [Query examples](query-examples.md) for copyable GraphQL and SQL files.
 
    ```bash
    matrix producers --readback --repo <owner/repo> --audit -o json
+   matrix producers --readback-file repos.txt --zone odin --stale-days 7 --audit -o table
    matrix graphql -f examples/queries/producer-coverage.graphql \
      --var limit=25 \
      --var staleDays=7 \
@@ -161,6 +163,7 @@ workflow:
 5. Use broad inventory only after per-repo readback passes:
 
    ```bash
+   matrix producers --readback-file repos.txt --zone odin --stale-days 7 --audit -o table
    matrix producers --zone odin --stale-days 7 --audit -o json
    ```
 

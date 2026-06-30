@@ -501,6 +501,7 @@ matrix producers
 matrix producers --zone odin --stale-days 7
 matrix producers --zone odin --stale-days 7 --audit -o json
 matrix producers --readback --repo red-wiz/aphrodite --audit -o json
+matrix producers --readback-file repos.txt --zone odin --audit -o table
 matrix coverage -o json
 ```
 
@@ -520,6 +521,9 @@ contract.
 After Wiz reports repo-side wiring is present, use
 `matrix producers --readback --repo <owner/repo> --audit -o json` to confirm
 fresh fact-side readback without duplicating repo-health checks in Matrix.
+For migration batches, `--readback-file` accepts one `owner/repo` per line,
+ignores blank lines and `#` comments, and returns compact status rows for
+table, CSV, JSON, and YAML output.
 
 ## SQL Packs
 

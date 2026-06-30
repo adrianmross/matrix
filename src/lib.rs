@@ -697,6 +697,13 @@ struct ProducerInventoryArgs {
         help = "Report readback for one producer repo instead of the full producer inventory"
     )]
     readback: bool,
+    #[arg(
+        long = "readback-file",
+        value_name = "FILE",
+        conflicts_with = "readback",
+        help = "Report readback for each producer repo listed in FILE"
+    )]
+    readback_file: Option<PathBuf>,
     #[command(flatten)]
     cache: FactCacheArgs,
     #[command(flatten)]
@@ -2555,6 +2562,21 @@ async fn producer_inventory_command(matrix: &Matrix, args: ProducerInventoryArgs
         )
         .map(|value| with_cache_summary(value, &cache));
     }
+    if let Some(readback_file) = &args.readback_file {
+        let repos = read_producer_readback_repos(readback_file)?;
+        let context = MatrixContext {
+            zone: args.context.zone.clone(),
+            ..MatrixContext::default()
+        };
+        let (db, cache) = query_db(matrix, args.max_facts, &context, &args.cache).await?;
+        return producer_readback_batch_value(
+            &db,
+            &repos,
+            args.context.zone.as_deref(),
+            args.stale_days.max(1),
+        )
+        .map(|value| with_cache_summary(value, &cache));
+    }
     let filter_context = MatrixContext {
         zone: args.context.zone.clone(),
         repo: args.context.repo.clone(),
@@ -3205,6 +3227,130 @@ fn producer_readback_value(
             "repoHealthCommand": format!("wiz repo health --repo {repo} -v"),
             "matrixCommand": format!("matrix producers --readback --repo {repo} --audit -o json"),
         }
+    }))
+}
+
+fn read_producer_readback_repos(path: &Path) -> Result<Vec<String>> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("failed to read producer readback file {}", path.display()))?;
+    let mut repos = Vec::new();
+    let mut seen = BTreeSet::new();
+    for (index, line) in text.lines().enumerate() {
+        let repo = line.split('#').next().unwrap_or("").trim();
+        if repo.is_empty() {
+            continue;
+        }
+        if repo.chars().any(char::is_whitespace) {
+            bail!(
+                "invalid repository on line {} in {}: repository names cannot contain whitespace",
+                index + 1,
+                path.display()
+            );
+        }
+        if seen.insert(repo.to_string()) {
+            repos.push(repo.to_string());
+        }
+    }
+    if repos.is_empty() {
+        bail!(
+            "producer readback file {} did not contain any repositories",
+            path.display()
+        );
+    }
+    Ok(repos)
+}
+
+fn producer_readback_batch_value(
+    db: &Connection,
+    repos: &[String],
+    zone: Option<&str>,
+    stale_days: i64,
+) -> Result<Value> {
+    let mut rows = Vec::with_capacity(repos.len());
+    let mut summary = BTreeMap::<String, i64>::new();
+    let mut total_facts = 0_i64;
+    let mut total_invalid_facts = 0_i64;
+    let mut total_explicit_facts = 0_i64;
+    let mut total_inferred_facts = 0_i64;
+
+    for repo in repos {
+        let readback = producer_readback_value(db, repo, zone, stale_days)?;
+        let status = readback
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        *summary.entry(status.clone()).or_insert(0) += 1;
+        let facts = readback.get("facts").and_then(Value::as_i64).unwrap_or(0);
+        let invalid_facts = readback
+            .get("invalidFacts")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let explicit_facts = readback
+            .get("explicitProducerFacts")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let inferred_facts = readback
+            .get("inferredSubjectRepoFacts")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        total_facts += facts;
+        total_invalid_facts += invalid_facts;
+        total_explicit_facts += explicit_facts;
+        total_inferred_facts += inferred_facts;
+        rows.push(json!({
+            "producer": repo,
+            "status": status,
+            "facts": facts,
+            "explicitProducerFacts": explicit_facts,
+            "inferredSubjectRepoFacts": inferred_facts,
+            "invalidFacts": invalid_facts,
+            "producerMetadata": readback.get("producerMetadata").cloned().unwrap_or(Value::Null),
+            "lastObservedAt": readback.get("lastObservedAt").cloned().unwrap_or(Value::Null),
+            "matrixCommand": readback
+                .get("handoff")
+                .and_then(|handoff| handoff.get("matrixCommand"))
+                .cloned()
+                .unwrap_or_else(|| json!(format!("matrix producers --readback --repo {repo} --audit -o json"))),
+            "repoHealthCommand": readback
+                .get("handoff")
+                .and_then(|handoff| handoff.get("repoHealthCommand"))
+                .cloned()
+                .unwrap_or_else(|| json!(format!("wiz repo health --repo {repo} -v"))),
+        }));
+    }
+
+    let summary = json!({
+        "repositories": repos.len(),
+        "fresh": summary.get("fresh").copied().unwrap_or(0),
+        "missing": summary.get("missing").copied().unwrap_or(0),
+        "stale": summary.get("stale").copied().unwrap_or(0),
+        "invalid": summary.get("invalid").copied().unwrap_or(0),
+        "metadataMissing": summary.get("metadata-missing").copied().unwrap_or(0),
+        "facts": total_facts,
+        "explicitProducerFacts": total_explicit_facts,
+        "inferredSubjectRepoFacts": total_inferred_facts,
+        "invalidFacts": total_invalid_facts,
+        "staleAfterDays": stale_days,
+    });
+
+    Ok(json!({
+        "kind": "producer-readback-batch",
+        "zone": zone,
+        "summary": summary,
+        "columns": [
+            "producer",
+            "status",
+            "facts",
+            "explicitProducerFacts",
+            "inferredSubjectRepoFacts",
+            "invalidFacts",
+            "producerMetadata",
+            "lastObservedAt",
+            "matrixCommand",
+            "repoHealthCommand",
+        ],
+        "rows": rows,
     }))
 }
 
@@ -10153,6 +10299,26 @@ mod tests {
             }
             _ => panic!("expected producers command"),
         }
+
+        let readback_batch = Cli::try_parse_from([
+            "matrix",
+            "producers",
+            "--readback-file",
+            "repos.txt",
+            "--audit",
+            "-o",
+            "table",
+        ])
+        .unwrap();
+        assert_eq!(readback_batch.output, OutputFormat::Table);
+        match readback_batch.command {
+            Commands::Producers(args) => {
+                assert!(!args.readback);
+                assert!(args.audit);
+                assert_eq!(args.readback_file.as_deref(), Some(Path::new("repos.txt")));
+            }
+            _ => panic!("expected producers command"),
+        }
     }
 
     #[test]
@@ -12238,6 +12404,70 @@ mod tests {
         assert_eq!(missing["status"], "missing");
         assert_eq!(missing["seen"], false);
         assert_eq!(missing["hints"][0]["code"], "no-facts-seen");
+    }
+
+    #[test]
+    fn producer_readback_file_parser_ignores_comments_and_dedupes() {
+        let path = env::temp_dir().join(format!(
+            "matrix-producer-readback-repos-{}-{}.txt",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(
+            &path,
+            "\n# producers\nred-wiz/aphrodite\nred-wiz/putto # inline comment\nred-wiz/aphrodite\n",
+        )
+        .unwrap();
+        let repos = read_producer_readback_repos(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(repos, vec!["red-wiz/aphrodite", "red-wiz/putto"]);
+    }
+
+    #[test]
+    fn producer_readback_batch_summarizes_each_repo() {
+        let facts = vec![
+            json!({
+                "id": "producer-a-1",
+                "track": "odin",
+                "status": "passed",
+                "sourceRepository": "red-wiz/aphrodite",
+                "observedAt": "2026-06-28T00:00:00Z",
+                "subject": {"type": "service", "name": "aphrodite", "version": "1.2.0", "repo": "red-wiz/aphrodite"}
+            }),
+            json!({
+                "id": "producer-b-1",
+                "track": "odin",
+                "status": "passed",
+                "observedAt": "2026-06-28T00:03:00Z",
+                "subject": {"type": "service", "name": "athena", "version": "4.0.0", "repo": "red-wiz/athena"}
+            }),
+        ];
+        let db = build_facts_db(&facts, &MatrixContext::default()).unwrap();
+        let repos = vec![
+            "red-wiz/aphrodite".to_string(),
+            "red-wiz/athena".to_string(),
+            "red-wiz/missing".to_string(),
+        ];
+        let value = producer_readback_batch_value(&db, &repos, Some("odin"), 14).unwrap();
+
+        assert_eq!(value["kind"], "producer-readback-batch");
+        assert_eq!(value["summary"]["repositories"], 3);
+        assert_eq!(value["summary"]["fresh"], 1);
+        assert_eq!(value["summary"]["metadataMissing"], 1);
+        assert_eq!(value["summary"]["missing"], 1);
+        assert_eq!(value["summary"]["facts"], 2);
+        assert_eq!(value["rows"][0]["producer"], "red-wiz/aphrodite");
+        assert_eq!(value["rows"][0]["status"], "fresh");
+        assert_eq!(value["rows"][1]["producer"], "red-wiz/athena");
+        assert_eq!(value["rows"][1]["status"], "metadata-missing");
+        assert_eq!(
+            value["rows"][2]["matrixCommand"],
+            "matrix producers --readback --repo red-wiz/missing --audit -o json"
+        );
     }
 
     #[test]
