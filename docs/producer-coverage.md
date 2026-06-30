@@ -13,6 +13,7 @@ Use this split:
 | Which repositories have emitted compatibility facts? | Matrix | `matrix producers -o json` |
 | Are emitted facts fresh or stale? | Matrix | `matrix producers --stale-days 7` |
 | Did this specific repo publish fresh facts after adoption? | Matrix | `matrix producers --readback --repo <owner/repo> -o json` |
+| Did this batch of repos publish fresh facts after adoption? | Matrix | `matrix producers --readback-file repos.txt -o table` |
 | Which zones/components are represented by facts? | Matrix | `matrix producers --zone odin` |
 | Are facts missing explicit producer metadata? | Matrix | `matrix producers -o json` |
 | Should this repo install the shared compatibility producer workflow? | Wiz repo health | `wiz repo health --repo <owner/repo>` |
@@ -25,6 +26,7 @@ Agents can combine both structured outputs when they need an org-level answer:
 matrix producers --zone odin --stale-days 7 -o json
 matrix producers --zone odin --stale-days 7 --audit -o json
 matrix producers --readback --repo red-wiz/eos --audit -o json
+matrix producers --readback-file repos.txt --audit -o table
 wiz repo health --repo red-wiz/eos -o json
 ```
 
@@ -106,6 +108,27 @@ Readback answers fact-side state only:
 
 It intentionally does not assert workflow installation, OIDC setup, action
 pinning, or repository policy. Keep those checks in `wiz repo health`.
+
+For migration waves, put one `owner/repo` per line in a readback file. Blank
+lines and `#` comments are ignored:
+
+```text
+# ODIN producer wave
+red-wiz/aphrodite
+red-wiz/eos
+red-wiz/putto
+```
+
+Then run:
+
+```bash
+matrix producers --readback-file repos.txt --zone odin --stale-days 7 --audit -o table
+matrix producers --readback-file repos.txt --zone odin --stale-days 7 --audit -o json
+```
+
+The batch result is compact: `summary` counts repositories by readback status,
+and each row includes facts, invalid facts, explicit-vs-inferred producer
+metadata, last observed time, and the single-repo Matrix/Wiz handoff commands.
 
 ## Wiz Handoff
 

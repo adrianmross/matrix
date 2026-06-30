@@ -122,6 +122,7 @@ matrix why aphrodite eunomia
 matrix resolve aphrodite
 matrix producers --zone odin
 matrix producers --readback --repo red-wiz/aphrodite --audit -o json
+matrix producers --readback-file repos.txt --zone odin --audit -o table
 matrix examples run aphrodite-eunomia-path -o json
 matrix sync --max-facts 10000
 matrix cache status
