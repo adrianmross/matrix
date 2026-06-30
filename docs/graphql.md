@@ -33,8 +33,11 @@ query Path($from: String!, $to: String!) {
     confidence
     paths {
       confidence
+      freshness
+      sourceFactIds
+      evidence { statuses freshness latestObservedAt blockers { status factIds } }
       nodes { component version repo }
-      edges { relationship capability status sourceFactId }
+      edges { relationship capability status factIds observedAt }
     }
   }
 }
@@ -51,7 +54,10 @@ query WorksWith($left: String!, $right: String!) {
     direction
     confidence
     reasons
-    paths { nodes { component version } }
+    paths {
+      blockers { status relationship factIds }
+      nodes { component version }
+    }
   }
 }
 ```
@@ -80,10 +86,32 @@ Find versions of one component used by or connected to another component.
 query VersionFor($component: String!, $for: String!) {
   versions(component: $component, for: $for, limit: 5) {
     versions
-    versionCandidates { version confidence score pathCount }
+    versionCandidates {
+      version
+      confidence
+      freshness
+      sourceFactIds
+      evidence { statuses latestObservedAt blockers { status factIds } }
+    }
   }
 }
 ```
+
+Use the packaged examples when an operator or agent needs an explanation with
+evidence pointers:
+
+```bash
+matrix examples run operator-evidence --var from=aphrodite --var to=eunomia -o json
+matrix examples run version-evidence --var component=eunomia --var for=aphrodite -o json
+```
+
+Evidence fields are deterministic and derived from local Matrix facts:
+
+- `sourceFactIds`: fact IDs used by the path or version candidate.
+- `freshness`: `observed` when the evidence has fact timestamps, otherwise
+  `unknown`.
+- `evidence.statuses`: statuses seen across supporting edges.
+- `blockers`: invalid, failed, incompatible, or blocked edges with fact IDs.
 
 ### `resolve`
 

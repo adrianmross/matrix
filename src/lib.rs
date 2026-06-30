@@ -36,6 +36,10 @@ const QUERY_EXAMPLE_APHRODITE_EUNOMIA_PATH: &str =
 const QUERY_EXAMPLE_PUTTO_APHRODITE_WORKS_WITH: &str =
     include_str!("../examples/queries/putto-aphrodite-works-with.graphql");
 const QUERY_EXAMPLE_VERSION_FOR: &str = include_str!("../examples/queries/version-for.graphql");
+const QUERY_EXAMPLE_OPERATOR_EVIDENCE: &str =
+    include_str!("../examples/queries/operator-evidence.graphql");
+const QUERY_EXAMPLE_VERSION_EVIDENCE: &str =
+    include_str!("../examples/queries/version-evidence.graphql");
 const QUERY_EXAMPLE_COMPONENT_STATUS: &str =
     include_str!("../examples/queries/component-status.graphql");
 const QUERY_EXAMPLE_PRODUCER_COVERAGE: &str =
@@ -139,7 +143,11 @@ type GraphPath {
   length: Int!
   score: Int!
   confidence: String!
+  freshness: String!
   reasons: [String!]!
+  sourceFactIds: [String!]!
+  blockers: [GraphBlocker!]!
+  evidence: GraphEvidence!
   nodes: [Component!]!
   edges: [GraphEdge!]!
 }
@@ -154,6 +162,7 @@ type GraphEdge {
   targetVersion: String
   sourceFactId: String
   targetFactId: String
+  factIds: [String!]!
   status: String
   observedAt: String
 }
@@ -163,6 +172,27 @@ type VersionCandidate {
   score: Int!
   confidence: String!
   pathCount: Int!
+  freshness: String!
+  sourceFactIds: [String!]!
+  blockers: [GraphBlocker!]!
+  evidence: GraphEvidence!
+}
+
+type GraphEvidence {
+  sourceFactIds: [String!]!
+  statuses: [String!]!
+  freshness: String!
+  latestObservedAt: String
+  blockers: [GraphBlocker!]!
+}
+
+type GraphBlocker {
+  status: String!
+  relationship: String!
+  factIds: [String!]!
+  from: Component
+  to: Component
+  observedAt: String
 }
 
 type ProducerSummary {
@@ -2922,6 +2952,26 @@ const QUERY_EXAMPLES: &[QueryExample] = &[
         offline_recommended: false,
     },
     QueryExample {
+        name: "operator-evidence",
+        title: "Operator path evidence",
+        question: "Why is a path connected, blocked, stale, or unknown?",
+        kind: QueryExampleKind::Graphql,
+        path: "examples/queries/operator-evidence.graphql",
+        text: QUERY_EXAMPLE_OPERATOR_EVIDENCE,
+        vars: &[("from", "aphrodite"), ("to", "eunomia")],
+        offline_recommended: false,
+    },
+    QueryExample {
+        name: "version-evidence",
+        title: "Version evidence",
+        question: "What version is used, and which facts support it?",
+        kind: QueryExampleKind::Graphql,
+        path: "examples/queries/version-evidence.graphql",
+        text: QUERY_EXAMPLE_VERSION_EVIDENCE,
+        vars: &[("component", "eunomia"), ("for", "aphrodite")],
+        offline_recommended: false,
+    },
+    QueryExample {
         name: "component-status",
         title: "Component status",
         question: "What is connected to Aphrodite right now?",
@@ -3252,6 +3302,18 @@ struct GraphPathScore {
     score: i64,
     confidence: &'static str,
     reasons: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct VersionCandidateEvidence {
+    score: i64,
+    confidence: String,
+    path_count: usize,
+    freshness: String,
+    latest_observed_at: Option<String>,
+    source_fact_ids: BTreeSet<String>,
+    statuses: BTreeSet<String>,
+    blockers: Vec<Value>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -4444,7 +4506,7 @@ impl GraphIndex {
                    r.version as source_version, p.version as target_version,
                    r.fact_id as source_fact_id, p.fact_id as target_fact_id,
                    coalesce(p.status, r.status) as status,
-                   null as observed_at
+                   coalesce(p.observed_at, r.observed_at) as observed_at
             from requirements r
             join capabilities p
               on p.capability = r.capability
@@ -4455,7 +4517,7 @@ impl GraphIndex {
                    'contains' as relationship, null as capability, null as capability_version,
                    fact_version as source_version, version as target_version,
                    fact_id as source_fact_id, fact_id as target_fact_id,
-                   fact_status as status, null as observed_at
+                   fact_status as status, fact_observed_at as observed_at
             from members
             where fact_component is not null and component is not null";
         let mut stmt = db.prepare(sql)?;
@@ -4738,23 +4800,24 @@ impl GraphIndex {
     ) -> Result<Value> {
         let component_ref = self.resolve(component);
         let for_ref = self.resolve(for_component);
-        let mut versions: BTreeMap<String, (i64, String, usize)> = BTreeMap::new();
+        let mut versions: BTreeMap<String, VersionCandidateEvidence> = BTreeMap::new();
         for path in self
             .find_paths(&for_ref.name, &component_ref.name, limit)
             .into_iter()
             .chain(self.find_paths(&component_ref.name, &for_ref.name, limit))
         {
             let score = self.score_path(&path);
+            let evidence = self.path_evidence(&path);
             for edge in path.edges {
                 if edge.source == component_ref.name
                     && let Some(version) = edge.source_version
                 {
-                    record_version_candidate(&mut versions, version, &score);
+                    record_version_candidate(&mut versions, version, &score, &evidence);
                 }
                 if edge.target == component_ref.name
                     && let Some(version) = edge.target_version
                 {
-                    record_version_candidate(&mut versions, version, &score);
+                    record_version_candidate(&mut versions, version, &score, &evidence);
                 }
             }
         }
@@ -4762,16 +4825,30 @@ impl GraphIndex {
             && let Some(node) = self.nodes.get(&component_ref.name)
             && let Some(version) = node.version.clone()
         {
-            versions.insert(version, (25, "low".to_string(), 1));
+            versions.insert(
+                version,
+                VersionCandidateEvidence {
+                    score: 25,
+                    confidence: "low".to_string(),
+                    path_count: 1,
+                    freshness: "unknown".to_string(),
+                    ..VersionCandidateEvidence::default()
+                },
+            );
         }
         let mut candidates = versions
             .into_iter()
-            .map(|(version, (score, confidence, path_count))| {
+            .map(|(version, evidence)| {
+                let evidence_value = version_candidate_evidence_value(&evidence);
                 json!({
                     "version": version,
-                    "score": score,
-                    "confidence": confidence,
-                    "pathCount": path_count,
+                    "score": evidence.score,
+                    "confidence": evidence.confidence,
+                    "pathCount": evidence.path_count,
+                    "freshness": evidence.freshness,
+                    "sourceFactIds": evidence.source_fact_ids.into_iter().collect::<Vec<_>>(),
+                    "blockers": evidence.blockers,
+                    "evidence": evidence_value,
                 })
             })
             .collect::<Vec<_>>();
@@ -4939,6 +5016,7 @@ impl GraphIndex {
 
     fn path_value(&self, path: &GraphPath) -> Value {
         let score = self.score_path(path);
+        let evidence = self.path_evidence(path);
         let nodes = path
             .node_keys()
             .into_iter()
@@ -4948,7 +5026,11 @@ impl GraphIndex {
             "length": path.edges.len(),
             "score": score.score,
             "confidence": score.confidence,
+            "freshness": evidence.get("freshness").cloned().unwrap_or_else(|| json!("unknown")),
             "reasons": score.reasons,
+            "sourceFactIds": evidence.get("sourceFactIds").cloned().unwrap_or_else(|| json!([])),
+            "blockers": evidence.get("blockers").cloned().unwrap_or_else(|| json!([])),
+            "evidence": evidence,
             "nodes": nodes,
             "edges": path.edges.iter().map(|edge| self.edge_value(edge)).collect::<Vec<_>>(),
         })
@@ -4989,7 +5071,49 @@ impl GraphIndex {
             "targetVersion": edge.target_version,
             "sourceFactId": edge.source_fact_id,
             "targetFactId": edge.target_fact_id,
+            "factIds": edge.fact_ids(),
             "status": edge.status,
+            "observedAt": edge.observed_at,
+        })
+    }
+
+    fn path_evidence(&self, path: &GraphPath) -> Value {
+        let source_fact_ids = path.source_fact_ids().into_iter().collect::<Vec<_>>();
+        let statuses = path
+            .edges
+            .iter()
+            .filter_map(|edge| edge.status.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let latest_observed_at = path.latest_observed_at();
+        let freshness = if latest_observed_at.is_some() {
+            "observed"
+        } else {
+            "unknown"
+        };
+        let blockers = path
+            .edges
+            .iter()
+            .filter(|edge| is_invalid_status(edge.status.as_deref()))
+            .map(|edge| self.blocker_value(edge))
+            .collect::<Vec<_>>();
+        json!({
+            "sourceFactIds": source_fact_ids,
+            "statuses": statuses,
+            "freshness": freshness,
+            "latestObservedAt": latest_observed_at,
+            "blockers": blockers,
+        })
+    }
+
+    fn blocker_value(&self, edge: &GraphEdge) -> Value {
+        json!({
+            "status": edge.status.clone().unwrap_or_else(|| "unknown".to_string()),
+            "relationship": edge.relationship,
+            "factIds": edge.fact_ids(),
+            "from": self.node_value(&edge.source, &edge.source),
+            "to": self.node_value(&edge.target, &edge.target),
             "observedAt": edge.observed_at,
         })
     }
@@ -5005,6 +5129,33 @@ impl GraphPath {
             nodes.push(edge.target.clone());
         }
         nodes
+    }
+
+    fn source_fact_ids(&self) -> BTreeSet<String> {
+        self.edges
+            .iter()
+            .flat_map(GraphEdge::fact_ids)
+            .collect::<BTreeSet<_>>()
+    }
+
+    fn latest_observed_at(&self) -> Option<String> {
+        self.edges
+            .iter()
+            .filter_map(|edge| edge.observed_at.clone())
+            .max()
+    }
+}
+
+impl GraphEdge {
+    fn fact_ids(&self) -> Vec<String> {
+        let mut ids = BTreeSet::new();
+        if let Some(id) = &self.source_fact_id {
+            ids.insert(id.clone());
+        }
+        if let Some(id) = &self.target_fact_id {
+            ids.insert(id.clone());
+        }
+        ids.into_iter().collect()
     }
 }
 
@@ -5064,18 +5215,71 @@ fn is_positive_status(status: Option<&str>) -> bool {
 }
 
 fn record_version_candidate(
-    versions: &mut BTreeMap<String, (i64, String, usize)>,
+    versions: &mut BTreeMap<String, VersionCandidateEvidence>,
     version: String,
     score: &GraphPathScore,
+    evidence: &Value,
 ) {
     versions
         .entry(version)
         .and_modify(|existing| {
-            existing.0 = existing.0.max(score.score);
-            existing.1 = strongest_confidence(&existing.1, score.confidence).to_string();
-            existing.2 += 1;
+            existing.score = existing.score.max(score.score);
+            existing.confidence =
+                strongest_confidence(&existing.confidence, score.confidence).to_string();
+            existing.path_count += 1;
+            merge_version_candidate_evidence(existing, evidence);
         })
-        .or_insert((score.score, score.confidence.to_string(), 1));
+        .or_insert_with(|| {
+            let mut candidate = VersionCandidateEvidence {
+                score: score.score,
+                confidence: score.confidence.to_string(),
+                path_count: 1,
+                freshness: "unknown".to_string(),
+                ..VersionCandidateEvidence::default()
+            };
+            merge_version_candidate_evidence(&mut candidate, evidence);
+            candidate
+        });
+}
+
+fn merge_version_candidate_evidence(candidate: &mut VersionCandidateEvidence, evidence: &Value) {
+    if let Some(ids) = evidence.get("sourceFactIds").and_then(Value::as_array) {
+        for id in ids.iter().filter_map(Value::as_str) {
+            candidate.source_fact_ids.insert(id.to_string());
+        }
+    }
+    if let Some(statuses) = evidence.get("statuses").and_then(Value::as_array) {
+        for status in statuses.iter().filter_map(Value::as_str) {
+            candidate.statuses.insert(status.to_string());
+        }
+    }
+    if let Some(freshness) = evidence.get("freshness").and_then(Value::as_str)
+        && freshness != "unknown"
+    {
+        candidate.freshness = freshness.to_string();
+    }
+    if let Some(latest) = evidence.get("latestObservedAt").and_then(Value::as_str)
+        && candidate
+            .latest_observed_at
+            .as_deref()
+            .map(|existing| latest > existing)
+            .unwrap_or(true)
+    {
+        candidate.latest_observed_at = Some(latest.to_string());
+    }
+    if let Some(blockers) = evidence.get("blockers").and_then(Value::as_array) {
+        candidate.blockers.extend(blockers.iter().cloned());
+    }
+}
+
+fn version_candidate_evidence_value(evidence: &VersionCandidateEvidence) -> Value {
+    json!({
+        "sourceFactIds": evidence.source_fact_ids.iter().cloned().collect::<Vec<_>>(),
+        "statuses": evidence.statuses.iter().cloned().collect::<Vec<_>>(),
+        "freshness": evidence.freshness.clone(),
+        "latestObservedAt": evidence.latest_observed_at.clone(),
+        "blockers": evidence.blockers.clone(),
+    })
 }
 
 fn strongest_confidence(left: &str, right: &str) -> &'static str {
@@ -7174,6 +7378,7 @@ fn create_matrix_views(db: &Connection, context: &MatrixContext, zones: &[String
         create temp view requirements as
           select f.id as fact_id, f.zone, f.type, f.subject_class, f.component,
                  f.canonical_component, f.identity, f.subject_name, f.repo, f.version, f.status,
+                 f.observed_at, f.accepted_at,
                  json_extract(item.value, '$.capability') as capability,
                  json_extract(item.value, '$.version') as capability_version,
                  item.value as requirement
@@ -7181,6 +7386,7 @@ fn create_matrix_views(db: &Connection, context: &MatrixContext, zones: &[String
         create temp view capabilities as
           select f.id as fact_id, f.zone, f.type, f.subject_class, f.component,
                  f.canonical_component, f.identity, f.subject_name, f.repo, f.version, f.status,
+                 f.observed_at, f.accepted_at,
                  json_extract(item.value, '$.capability') as capability,
                  json_extract(item.value, '$.version') as capability_version,
                  item.value as provides
@@ -7188,6 +7394,7 @@ fn create_matrix_views(db: &Connection, context: &MatrixContext, zones: &[String
         create temp view members as
           select f.id as fact_id, f.zone, f.type as fact_type, f.component as fact_component,
                  f.repo as fact_repo, f.version as fact_version, f.status as fact_status,
+                 f.observed_at as fact_observed_at, f.accepted_at as fact_accepted_at,
                  json_extract(item.value, '$.component') as component,
                  json_extract(item.value, '$.version') as version,
                  json_extract(item.value, '$.logicalChaincode') as logical_chaincode,
@@ -12380,6 +12587,7 @@ mod tests {
                 "id": "aphrodite.1.2.0",
                 "track": "odin",
                 "status": "passed",
+                "observedAt": "2026-06-28T00:00:00Z",
                 "subject": {"type": "service", "name": "aphrodite", "version": "1.2.0", "repo": "red-wiz/aphrodite"},
                 "requires": [
                     {"capability": "eos-platform", "version": "24.6"},
@@ -12390,6 +12598,7 @@ mod tests {
                 "id": "eos.24.6.0",
                 "track": "odin",
                 "status": "passed",
+                "observedAt": "2026-06-28T00:01:00Z",
                 "subject": {"type": "release-bundle", "name": "eos", "version": "24.6.0", "repo": "red-wiz/eos"},
                 "provides": [{"capability": "eos-platform", "version": "24.6"}],
                 "members": [
@@ -12402,12 +12611,14 @@ mod tests {
                 "id": "eunomia.3.1.0",
                 "track": "odin",
                 "status": "passed",
+                "observedAt": "2026-06-28T00:02:00Z",
                 "subject": {"type": "service", "name": "eunomia", "version": "3.1.0", "repo": "red-wiz/eunomia"}
             }),
             json!({
                 "id": "putto.0.8.1",
                 "track": "odin",
                 "status": "passed",
+                "observedAt": "2026-06-28T00:03:00Z",
                 "subject": {"type": "service", "name": "putto", "version": "0.8.1", "repo": "red-wiz/putto"},
                 "provides": [{"capability": "putto-client", "version": "0.8"}]
             }),
@@ -12435,6 +12646,15 @@ mod tests {
         assert_eq!(path["paths"][0]["nodes"][2]["component"], "eunomia");
         assert_eq!(path["paths"][0]["edges"][0]["relationship"], "requires");
         assert_eq!(path["paths"][0]["edges"][1]["relationship"], "contains");
+        assert_eq!(path["paths"][0]["freshness"], "observed");
+        assert_eq!(
+            path["paths"][0]["sourceFactIds"],
+            json!(["aphrodite.1.2.0", "eos.24.6.0"])
+        );
+        assert_eq!(
+            path["paths"][0]["evidence"]["latestObservedAt"],
+            "2026-06-28T00:01:00Z"
+        );
 
         let siblings = graph.path_answer("aglaea", "athena", 5).unwrap();
         assert_eq!(siblings["found"], true);
@@ -12462,6 +12682,15 @@ mod tests {
             .unwrap();
         assert_eq!(versions["versions"], json!(["3.1.0"]));
         assert_eq!(versions["versionCandidates"][0]["confidence"], "medium");
+        assert_eq!(versions["versionCandidates"][0]["freshness"], "observed");
+        assert_eq!(
+            versions["versionCandidates"][0]["sourceFactIds"],
+            json!(["aphrodite.1.2.0", "eos.24.6.0"])
+        );
+        assert_eq!(
+            versions["versionCandidates"][0]["evidence"]["statuses"],
+            json!(["passed"])
+        );
     }
 
     #[test]
@@ -12482,6 +12711,42 @@ mod tests {
     }
 
     #[test]
+    fn graph_evidence_reports_blockers_and_fact_ids() {
+        let facts = vec![
+            json!({
+                "id": "app-1",
+                "track": "odin",
+                "status": "passed",
+                "observedAt": "2026-06-28T00:00:00Z",
+                "subject": {"type": "service", "name": "app", "version": "1.0.0"},
+                "requires": [{"capability": "db", "version": "1"}]
+            }),
+            json!({
+                "id": "db-1",
+                "track": "odin",
+                "status": "blocked",
+                "observedAt": "2026-06-28T00:05:00Z",
+                "subject": {"type": "service", "name": "database", "version": "2.0.0"},
+                "provides": [{"capability": "db", "version": "1"}]
+            }),
+        ];
+        let db = build_facts_db(&facts, &MatrixContext::default()).unwrap();
+        let graph = GraphIndex::from_db(&db).unwrap();
+        let value = graph.works_with_answer("app", "database", 5).unwrap();
+
+        assert_eq!(value["status"], "blocked");
+        assert_eq!(value["compatible"], false);
+        assert_eq!(value["paths"][0]["confidence"], "blocked");
+        assert_eq!(value["paths"][0]["freshness"], "observed");
+        assert_eq!(value["paths"][0]["sourceFactIds"], json!(["app-1", "db-1"]));
+        assert_eq!(value["paths"][0]["blockers"][0]["status"], "blocked");
+        assert_eq!(
+            value["paths"][0]["blockers"][0]["factIds"],
+            json!(["app-1", "db-1"])
+        );
+    }
+
+    #[test]
     fn native_graphql_binds_variables_and_projects_selection() {
         let db = graph_fixture_db();
         let graph = GraphIndex::from_db(&db).unwrap();
@@ -12496,7 +12761,7 @@ mod tests {
             "query Matrix($component:String!,$for:String!) {
                 versions(component:$component, for:$for) {
                     versions
-                    versionCandidates { version confidence score }
+                    versionCandidates { version confidence score freshness sourceFactIds evidence { statuses freshness latestObservedAt } }
                 }
             }",
             &vars,
@@ -12507,8 +12772,20 @@ mod tests {
         assert_eq!(value["kind"], "graphql-result");
         assert_eq!(value["data"]["versions"]["versions"], json!(["3.1.0"]));
         assert_eq!(
-            value["data"]["versions"]["versionCandidates"][0],
-            json!({"version": "3.1.0", "confidence": "medium", "score": 119})
+            value["data"]["versions"]["versionCandidates"][0]["version"],
+            "3.1.0"
+        );
+        assert_eq!(
+            value["data"]["versions"]["versionCandidates"][0]["confidence"],
+            "medium"
+        );
+        assert_eq!(
+            value["data"]["versions"]["versionCandidates"][0]["sourceFactIds"],
+            json!(["aphrodite.1.2.0", "eos.24.6.0"])
+        );
+        assert_eq!(
+            value["data"]["versions"]["versionCandidates"][0]["evidence"]["freshness"],
+            "observed"
         );
         assert!(value["data"]["versions"].get("kind").is_none());
     }

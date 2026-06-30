@@ -1,0 +1,29 @@
+# Evidence-rich answer for "why does Aphrodite connect to Eunomia?"
+query OperatorEvidence($from: String!, $to: String!) {
+  path(from: $from, to: $to) {
+    status
+    confidence
+    recommended {
+      confidence
+      freshness
+      sourceFactIds
+      evidence {
+        statuses
+        freshness
+        latestObservedAt
+        blockers {
+          status
+          relationship
+          factIds
+        }
+      }
+      nodes { component version repo }
+      edges {
+        relationship
+        status
+        factIds
+        observedAt
+      }
+    }
+  }
+}

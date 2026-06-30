@@ -1,0 +1,22 @@
+# Evidence-rich answer for "what version is used and why?"
+query VersionEvidence($component: String!, $for: String!) {
+  versions(component: $component, for: $for) {
+    versions
+    versionCandidates {
+      version
+      confidence
+      freshness
+      sourceFactIds
+      evidence {
+        statuses
+        freshness
+        latestObservedAt
+        blockers {
+          status
+          factIds
+          relationship
+        }
+      }
+    }
+  }
+}
