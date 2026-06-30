@@ -5,14 +5,17 @@ use std::{
     io::{self, IsTerminal, Read},
     path::{Path, PathBuf},
     process::{self, Command as ProcessCommand, Stdio},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use directories::ProjectDirs;
-use reqwest::{Method, StatusCode, header::CONTENT_TYPE};
+use reqwest::{
+    Method, StatusCode,
+    header::{CONTENT_TYPE, HeaderMap},
+};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -918,6 +921,35 @@ struct CachedDb {
     cache: FactCacheSummary,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ServiceCacheDiagnostics {
+    request_count: usize,
+    observed_latency_ms: u64,
+    cache: Option<String>,
+    cache_hits: usize,
+    cache_misses: usize,
+    cache_stale: usize,
+    cache_bypass: usize,
+    backend: Option<String>,
+    server_timing: Option<String>,
+    request_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ServiceResponseDiagnostics {
+    observed_latency_ms: u64,
+    cache: Option<String>,
+    backend: Option<String>,
+    server_timing: Option<String>,
+    request_id: Option<String>,
+}
+
+struct MatrixResponse {
+    value: Value,
+    service: Option<ServiceResponseDiagnostics>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct FactCacheMetadata {
@@ -934,6 +966,7 @@ struct FactCacheMetadata {
     head_latest_accepted_at: Option<String>,
     head_latest_fact_id: Option<String>,
     head_latest_content_hash: Option<String>,
+    service: Option<ServiceCacheDiagnostics>,
 }
 
 #[derive(Clone, Debug)]
@@ -958,6 +991,16 @@ struct FactsHead {
     latest_accepted_at: Option<String>,
     latest_fact_id: Option<String>,
     latest_content_hash: Option<String>,
+}
+
+struct FactsPageFetch {
+    facts: Vec<Value>,
+    service: Option<ServiceCacheDiagnostics>,
+}
+
+struct FactsHeadFetch {
+    head: Option<FactsHead>,
+    service: Option<ServiceCacheDiagnostics>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1327,8 +1370,13 @@ impl Matrix {
         self.request(Method::GET, path, None).await
     }
 
-    async fn get_optional(&self, path: &str) -> Result<Option<Value>> {
-        self.request_optional(Method::GET, path, None).await
+    async fn get_with_diagnostics(&self, path: &str) -> Result<MatrixResponse> {
+        self.request_with_diagnostics(Method::GET, path, None).await
+    }
+
+    async fn get_optional_with_diagnostics(&self, path: &str) -> Result<Option<MatrixResponse>> {
+        self.request_optional_with_diagnostics(Method::GET, path, None)
+            .await
     }
 
     async fn get_fallback(&self, primary: &str, fallback: &str) -> Result<Value> {
@@ -1342,6 +1390,17 @@ impl Matrix {
     }
 
     async fn request(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {
+        self.request_with_diagnostics(method, path, body)
+            .await
+            .map(|response| response.value)
+    }
+
+    async fn request_with_diagnostics(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<MatrixResponse> {
         let url = format!("{}{}{}", self.construct()?, self.api_prefix, path);
         let mut request = self.client.request(method, &url);
         if let Some(token) = self.auth_token()? {
@@ -1350,11 +1409,14 @@ impl Matrix {
         if let Some(body) = body {
             request = request.json(&body);
         }
+        let started = Instant::now();
         let response = request
             .send()
             .await
             .with_context(|| format!("request failed: {url}"))?;
+        let elapsed = started.elapsed();
         let status = response.status();
+        let service = service_response_diagnostics(response.headers(), elapsed);
         let content_type = response
             .headers()
             .get(CONTENT_TYPE)
@@ -1371,15 +1433,15 @@ impl Matrix {
         if !status.is_success() {
             bail!("construct {status}: {}", error_detail(&value, &text));
         }
-        Ok(value)
+        Ok(MatrixResponse { value, service })
     }
 
-    async fn request_optional(
+    async fn request_optional_with_diagnostics(
         &self,
         method: Method,
         path: &str,
         body: Option<Value>,
-    ) -> Result<Option<Value>> {
+    ) -> Result<Option<MatrixResponse>> {
         let url = format!("{}{}{}", self.construct()?, self.api_prefix, path);
         let mut request = self.client.request(method, &url);
         if let Some(token) = self.auth_token()? {
@@ -1388,11 +1450,14 @@ impl Matrix {
         if let Some(body) = body {
             request = request.json(&body);
         }
+        let started = Instant::now();
         let response = request
             .send()
             .await
             .with_context(|| format!("request failed: {url}"))?;
+        let elapsed = started.elapsed();
         let status = response.status();
+        let service = service_response_diagnostics(response.headers(), elapsed);
         let content_type = response
             .headers()
             .get(CONTENT_TYPE)
@@ -1412,7 +1477,7 @@ impl Matrix {
         if !status.is_success() {
             bail!("construct {status}: {}", error_detail(&value, &text));
         }
-        Ok(Some(value))
+        Ok(Some(MatrixResponse { value, service }))
     }
 
     fn auth_candidate(&self) -> Option<AuthCandidate> {
@@ -1496,6 +1561,154 @@ impl Matrix {
             return self.resolve_auth_candidate(&candidate);
         }
         Ok(None)
+    }
+}
+
+impl ServiceCacheDiagnostics {
+    fn record(&mut self, response: ServiceResponseDiagnostics) {
+        self.request_count += 1;
+        self.observed_latency_ms = self
+            .observed_latency_ms
+            .saturating_add(response.observed_latency_ms);
+        if let Some(cache) = response.cache {
+            match cache.as_str() {
+                "hit" => self.cache_hits += 1,
+                "miss" => self.cache_misses += 1,
+                "stale" => self.cache_stale += 1,
+                "bypass" => self.cache_bypass += 1,
+                _ => {}
+            }
+            self.cache = match self.cache.as_deref() {
+                None => Some(cache),
+                Some(existing) if existing == cache => Some(existing.to_string()),
+                Some(_) => Some("mixed".to_string()),
+            };
+        }
+        if response.backend.is_some() {
+            self.backend = response.backend;
+        }
+        if response.server_timing.is_some() {
+            self.server_timing = response.server_timing;
+        }
+        if response.request_id.is_some() {
+            self.request_id = response.request_id;
+        }
+    }
+
+    fn merge(&mut self, other: ServiceCacheDiagnostics) {
+        self.request_count += other.request_count;
+        self.observed_latency_ms = self
+            .observed_latency_ms
+            .saturating_add(other.observed_latency_ms);
+        self.cache_hits += other.cache_hits;
+        self.cache_misses += other.cache_misses;
+        self.cache_stale += other.cache_stale;
+        self.cache_bypass += other.cache_bypass;
+        if let Some(cache) = other.cache {
+            self.cache = match self.cache.as_deref() {
+                None => Some(cache),
+                Some(existing) if existing == cache => Some(existing.to_string()),
+                Some(_) => Some("mixed".to_string()),
+            };
+        }
+        if other.backend.is_some() {
+            self.backend = other.backend;
+        }
+        if other.server_timing.is_some() {
+            self.server_timing = other.server_timing;
+        }
+        if other.request_id.is_some() {
+            self.request_id = other.request_id;
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.request_count == 0
+    }
+
+    fn to_value(&self) -> Value {
+        json!({
+            "requestCount": self.request_count,
+            "observedLatencyMs": self.observed_latency_ms,
+            "cache": self.cache,
+            "cacheHits": self.cache_hits,
+            "cacheMisses": self.cache_misses,
+            "cacheStale": self.cache_stale,
+            "cacheBypass": self.cache_bypass,
+            "backend": self.backend,
+            "serverTiming": self.server_timing,
+            "requestId": self.request_id,
+        })
+    }
+}
+
+fn service_response_diagnostics(
+    headers: &HeaderMap,
+    elapsed: Duration,
+) -> Option<ServiceResponseDiagnostics> {
+    let cache = first_header(
+        headers,
+        &[
+            "x-compat-cache",
+            "x-compat-cache-status",
+            "x-matrix-cache",
+            "x-cache",
+        ],
+    )
+    .map(|value| normalize_cache_status(&value));
+    let backend = first_header(
+        headers,
+        &[
+            "x-compat-backend",
+            "x-compat-ledger-backend",
+            "x-compat-store",
+        ],
+    );
+    let server_timing = first_header(headers, &["server-timing"]);
+    let request_id = first_header(
+        headers,
+        &[
+            "x-request-id",
+            "x-correlation-id",
+            "x-amzn-trace-id",
+            "traceparent",
+        ],
+    );
+    if cache.is_none() && backend.is_none() && server_timing.is_none() && request_id.is_none() {
+        return None;
+    }
+    Some(ServiceResponseDiagnostics {
+        observed_latency_ms: elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
+        cache,
+        backend,
+        server_timing,
+        request_id,
+    })
+}
+
+fn first_header(headers: &HeaderMap, names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        headers
+            .get(*name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    })
+}
+
+fn normalize_cache_status(value: &str) -> String {
+    let lower = value.trim().to_ascii_lowercase();
+    if lower.contains("hit") {
+        "hit".to_string()
+    } else if lower.contains("miss") {
+        "miss".to_string()
+    } else if lower.contains("stale") {
+        "stale".to_string()
+    } else if lower.contains("bypass") || lower.contains("skip") {
+        "bypass".to_string()
+    } else {
+        lower
     }
 }
 
@@ -8351,43 +8564,76 @@ async fn blue_pill(matrix: &Matrix) -> Result<Value> {
     }))
 }
 
-async fn fetch_facts(matrix: &Matrix, max_facts: usize) -> Result<Vec<Value>> {
+async fn fetch_facts(matrix: &Matrix, max_facts: usize) -> Result<FactsPageFetch> {
     let mut facts = Vec::new();
     let mut cursor: Option<String> = None;
+    let mut service = ServiceCacheDiagnostics::default();
     while facts.len() < max_facts {
         let limit = (max_facts - facts.len()).min(200);
         let mut query = vec![("limit", limit.to_string())];
         if let Some(cursor) = cursor.clone() {
             query.push(("cursor", cursor));
         }
-        let body = matrix
-            .get(&format!("/facts?{}", query_string(query)))
+        let response = matrix
+            .get_with_diagnostics(&format!("/facts?{}", query_string(query)))
             .await?;
+        if let Some(diagnostics) = response.service {
+            service.record(diagnostics);
+        }
+        let body = response.value;
         facts.extend(page_values(&body, "facts"));
         cursor = body["page"]["nextCursor"].as_str().map(ToString::to_string);
         if cursor.is_none() {
             break;
         }
     }
-    Ok(facts)
+    Ok(FactsPageFetch {
+        facts,
+        service: (!service.is_empty()).then_some(service),
+    })
 }
 
-async fn fetch_facts_head(matrix: &Matrix) -> Result<Option<FactsHead>> {
-    let Some(body) = matrix.get_optional("/facts/head").await? else {
-        return Ok(None);
+async fn fetch_facts_head(matrix: &Matrix) -> Result<FactsHeadFetch> {
+    let Some(response) = matrix.get_optional_with_diagnostics("/facts/head").await? else {
+        return Ok(FactsHeadFetch {
+            head: None,
+            service: None,
+        });
     };
-    let head: FactsHead =
-        serde_json::from_value(body).context("construct returned an invalid facts head")?;
+    let mut service = ServiceCacheDiagnostics::default();
+    if let Some(diagnostics) = response.service {
+        service.record(diagnostics);
+    }
+    let head: FactsHead = serde_json::from_value(response.value)
+        .context("construct returned an invalid facts head")?;
     if head.kind != "compatibility-facts-head" || head.digest.trim().is_empty() {
         bail!("construct returned an invalid facts head");
     }
-    Ok(Some(head))
+    Ok(FactsHeadFetch {
+        head: Some(head),
+        service: (!service.is_empty()).then_some(service),
+    })
 }
 
 async fn sync_facts_to_cache(matrix: &Matrix, max_facts: usize) -> Result<FactCacheSummary> {
-    let head = fetch_facts_head(matrix).await.ok().flatten();
-    let facts = fetch_facts(matrix, max_facts).await?;
-    write_fact_cache_db(matrix, &facts, max_facts, head.as_ref())
+    let head = fetch_facts_head(matrix).await.ok();
+    let pages = fetch_facts(matrix, max_facts).await?;
+    let mut service = ServiceCacheDiagnostics::default();
+    if let Some(head) = &head
+        && let Some(head_service) = head.service.clone()
+    {
+        service.merge(head_service);
+    }
+    if let Some(page_service) = pages.service {
+        service.merge(page_service);
+    }
+    write_fact_cache_db(
+        matrix,
+        &pages.facts,
+        max_facts,
+        head.as_ref().and_then(|value| value.head.as_ref()),
+        (!service.is_empty()).then_some(&service),
+    )
 }
 
 async fn cache_source_for_policy(
@@ -8430,19 +8676,20 @@ async fn cache_head_matches(
     let Some(cached_digest) = metadata.head_digest.as_deref() else {
         return Ok(false);
     };
-    let Some(head) = fetch_facts_head(matrix).await? else {
+    let head = fetch_facts_head(matrix).await?;
+    let Some(head_value) = head.head.as_ref() else {
         return Ok(false);
     };
-    if cached_digest != head.digest {
+    if cached_digest != head_value.digest {
         return Ok(false);
     }
     if metadata
         .head_fact_count
-        .is_some_and(|fact_count| fact_count != head.fact_count)
+        .is_some_and(|fact_count| fact_count != head_value.fact_count)
     {
         return Ok(false);
     }
-    update_fact_cache_head_metadata(path, &head)?;
+    update_fact_cache_head_metadata(path, head_value, head.service.as_ref())?;
     Ok(true)
 }
 
@@ -8451,6 +8698,7 @@ fn write_fact_cache_db(
     facts: &[Value],
     max_facts: usize,
     head: Option<&FactsHead>,
+    service: Option<&ServiceCacheDiagnostics>,
 ) -> Result<FactCacheSummary> {
     let final_path = fact_cache_path(matrix)?;
     if let Some(parent) = final_path.parent() {
@@ -8478,6 +8726,7 @@ fn write_fact_cache_db(
         head_latest_accepted_at: head.and_then(|value| value.latest_accepted_at.clone()),
         head_latest_fact_id: head.and_then(|value| value.latest_fact_id.clone()),
         head_latest_content_hash: head.and_then(|value| value.latest_content_hash.clone()),
+        service: service.cloned(),
     };
     write_fact_cache_metadata(&db, &metadata)?;
     db.execute_batch("pragma optimize;")?;
@@ -8569,6 +8818,86 @@ fn write_fact_cache_metadata(db: &Connection, metadata: &FactCacheMetadata) -> R
                 .clone()
                 .unwrap_or_default(),
         ),
+        (
+            "serviceRequestCount",
+            metadata
+                .service
+                .as_ref()
+                .map(|value| value.request_count.to_string())
+                .unwrap_or_default(),
+        ),
+        (
+            "serviceObservedLatencyMs",
+            metadata
+                .service
+                .as_ref()
+                .map(|value| value.observed_latency_ms.to_string())
+                .unwrap_or_default(),
+        ),
+        (
+            "serviceCache",
+            metadata
+                .service
+                .as_ref()
+                .and_then(|value| value.cache.clone())
+                .unwrap_or_default(),
+        ),
+        (
+            "serviceCacheHits",
+            metadata
+                .service
+                .as_ref()
+                .map(|value| value.cache_hits.to_string())
+                .unwrap_or_default(),
+        ),
+        (
+            "serviceCacheMisses",
+            metadata
+                .service
+                .as_ref()
+                .map(|value| value.cache_misses.to_string())
+                .unwrap_or_default(),
+        ),
+        (
+            "serviceCacheStale",
+            metadata
+                .service
+                .as_ref()
+                .map(|value| value.cache_stale.to_string())
+                .unwrap_or_default(),
+        ),
+        (
+            "serviceCacheBypass",
+            metadata
+                .service
+                .as_ref()
+                .map(|value| value.cache_bypass.to_string())
+                .unwrap_or_default(),
+        ),
+        (
+            "serviceBackend",
+            metadata
+                .service
+                .as_ref()
+                .and_then(|value| value.backend.clone())
+                .unwrap_or_default(),
+        ),
+        (
+            "serviceServerTiming",
+            metadata
+                .service
+                .as_ref()
+                .and_then(|value| value.server_timing.clone())
+                .unwrap_or_default(),
+        ),
+        (
+            "serviceRequestId",
+            metadata
+                .service
+                .as_ref()
+                .and_then(|value| value.request_id.clone())
+                .unwrap_or_default(),
+        ),
     ];
     for (key, value) in fields {
         db.execute(
@@ -8590,6 +8919,7 @@ fn read_fact_cache_metadata(db: &Connection) -> Result<FactCacheMetadata> {
         .get("profile")
         .filter(|value| !value.is_empty())
         .and_then(|value| ConfigProfile::from_str(value, true).ok());
+    let service = read_service_cache_diagnostics(&entries);
     Ok(FactCacheMetadata {
         construct: entries
             .get("construct")
@@ -8640,12 +8970,69 @@ fn read_fact_cache_metadata(db: &Connection) -> Result<FactCacheMetadata> {
             .get("headLatestContentHash")
             .filter(|value| !value.is_empty())
             .cloned(),
+        service,
     })
 }
 
-fn update_fact_cache_head_metadata(path: &Path, head: &FactsHead) -> Result<()> {
+fn read_service_cache_diagnostics(
+    entries: &HashMap<String, String>,
+) -> Option<ServiceCacheDiagnostics> {
+    let request_count = entries
+        .get("serviceRequestCount")
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    if request_count == 0 {
+        return None;
+    }
+    Some(ServiceCacheDiagnostics {
+        request_count,
+        observed_latency_ms: entries
+            .get("serviceObservedLatencyMs")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0),
+        cache: entries
+            .get("serviceCache")
+            .filter(|value| !value.is_empty())
+            .cloned(),
+        cache_hits: entries
+            .get("serviceCacheHits")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0),
+        cache_misses: entries
+            .get("serviceCacheMisses")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0),
+        cache_stale: entries
+            .get("serviceCacheStale")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0),
+        cache_bypass: entries
+            .get("serviceCacheBypass")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0),
+        backend: entries
+            .get("serviceBackend")
+            .filter(|value| !value.is_empty())
+            .cloned(),
+        server_timing: entries
+            .get("serviceServerTiming")
+            .filter(|value| !value.is_empty())
+            .cloned(),
+        request_id: entries
+            .get("serviceRequestId")
+            .filter(|value| !value.is_empty())
+            .cloned(),
+    })
+}
+
+fn update_fact_cache_head_metadata(
+    path: &Path,
+    head: &FactsHead,
+    service: Option<&ServiceCacheDiagnostics>,
+) -> Result<()> {
     let db = Connection::open(path)?;
-    let fields = [
+    let mut fields = vec![
         ("checkedAtUnix", unix_now()?.to_string()),
         ("headDigest", head.digest.clone()),
         ("headFactCount", head.fact_count.to_string()),
@@ -8662,6 +9049,68 @@ fn update_fact_cache_head_metadata(path: &Path, head: &FactsHead) -> Result<()> 
             head.latest_content_hash.clone().unwrap_or_default(),
         ),
     ];
+    fields.extend([
+        (
+            "serviceRequestCount",
+            service
+                .map(|value| value.request_count.to_string())
+                .unwrap_or_default(),
+        ),
+        (
+            "serviceObservedLatencyMs",
+            service
+                .map(|value| value.observed_latency_ms.to_string())
+                .unwrap_or_default(),
+        ),
+        (
+            "serviceCache",
+            service
+                .and_then(|value| value.cache.clone())
+                .unwrap_or_default(),
+        ),
+        (
+            "serviceCacheHits",
+            service
+                .map(|value| value.cache_hits.to_string())
+                .unwrap_or_default(),
+        ),
+        (
+            "serviceCacheMisses",
+            service
+                .map(|value| value.cache_misses.to_string())
+                .unwrap_or_default(),
+        ),
+        (
+            "serviceCacheStale",
+            service
+                .map(|value| value.cache_stale.to_string())
+                .unwrap_or_default(),
+        ),
+        (
+            "serviceCacheBypass",
+            service
+                .map(|value| value.cache_bypass.to_string())
+                .unwrap_or_default(),
+        ),
+        (
+            "serviceBackend",
+            service
+                .and_then(|value| value.backend.clone())
+                .unwrap_or_default(),
+        ),
+        (
+            "serviceServerTiming",
+            service
+                .and_then(|value| value.server_timing.clone())
+                .unwrap_or_default(),
+        ),
+        (
+            "serviceRequestId",
+            service
+                .and_then(|value| value.request_id.clone())
+                .unwrap_or_default(),
+        ),
+    ]);
     for (key, value) in fields {
         db.execute(
             "insert or replace into matrix_cache_metadata (key, value) values (?1, ?2)",
@@ -8823,6 +9272,7 @@ impl FactCacheSummary {
             "headLatestAcceptedAt": metadata.and_then(|value| value.head_latest_accepted_at.clone()),
             "headLatestFactId": metadata.and_then(|value| value.head_latest_fact_id.clone()),
             "headLatestContentHash": metadata.and_then(|value| value.head_latest_content_hash.clone()),
+            "service": metadata.and_then(|value| value.service.as_ref().map(ServiceCacheDiagnostics::to_value)),
         })
     }
 
@@ -9354,6 +9804,7 @@ fn print_cache_command_human(object: &serde_json::Map<String, Value>) {
                     "headFactCount",
                     "headLatestFactId",
                     "headLatestAcceptedAt",
+                    "service",
                     "path",
                 ] {
                     if let Some(value) = cache.get(key) {
@@ -9438,6 +9889,33 @@ fn cache_human_line(cache: &serde_json::Map<String, Value>) -> String {
             "Warning: using stale local Matrix cache; run `matrix sync` or add `--refresh-cache` for fresh facts.\n",
         );
     }
+    if let Some(service) = cache.get("service").and_then(Value::as_object) {
+        line.push_str(&service_cache_human_line(service));
+    }
+    line
+}
+
+fn service_cache_human_line(service: &serde_json::Map<String, Value>) -> String {
+    let cache = service
+        .get("cache")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown");
+    let requests = service
+        .get("requestCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let latency = service
+        .get("observedLatencyMs")
+        .and_then(Value::as_u64)
+        .map(|value| format!("{value}ms"))
+        .unwrap_or_else(|| "unknown".to_string());
+    let mut line =
+        format!("Service cache: {cache}, {requests} request(s), observed latency {latency}");
+    if let Some(backend) = service.get("backend").and_then(Value::as_str) {
+        line.push_str(&format!(", backend {backend}"));
+    }
+    line.push('\n');
     line
 }
 
@@ -10899,6 +11377,15 @@ mod tests {
                 head_latest_accepted_at: Some("2026-05-22T00:00:00.000Z".to_string()),
                 head_latest_fact_id: Some("fact-1".to_string()),
                 head_latest_content_hash: Some("sha256:test-fact".to_string()),
+                service: Some(ServiceCacheDiagnostics {
+                    request_count: 2,
+                    observed_latency_ms: 42,
+                    cache: Some("hit".to_string()),
+                    cache_hits: 2,
+                    backend: Some("redis".to_string()),
+                    request_id: Some("req-1".to_string()),
+                    ..ServiceCacheDiagnostics::default()
+                }),
             },
         )
         .unwrap();
@@ -10923,6 +11410,20 @@ mod tests {
         assert_eq!(metadata.profile, Some(ConfigProfile::RedWiz));
         assert_eq!(metadata.fact_count, 1);
         assert_eq!(metadata.head_digest.as_deref(), Some("sha256:test-head"));
+        assert_eq!(
+            metadata
+                .service
+                .as_ref()
+                .and_then(|value| value.cache.as_deref()),
+            Some("hit")
+        );
+        assert_eq!(
+            metadata
+                .service
+                .as_ref()
+                .and_then(|value| value.backend.as_deref()),
+            Some("redis")
+        );
         assert_eq!(count, 1);
         assert_eq!(zones, 1);
         assert_eq!(persisted_views, 0);
@@ -10992,6 +11493,41 @@ mod tests {
         let text = cache_human_line(cache.as_object().unwrap());
         assert!(text.contains("last refreshed 2d ago"));
         assert!(text.contains("Warning: using stale local Matrix cache"));
+    }
+
+    #[test]
+    fn service_cache_diagnostics_parse_headers_and_render_human_line() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-compat-cache", "HIT".parse().unwrap());
+        headers.insert("x-compat-backend", "redis".parse().unwrap());
+        headers.insert("x-request-id", "req-123".parse().unwrap());
+
+        let response = service_response_diagnostics(&headers, Duration::from_millis(17)).unwrap();
+        let mut service = ServiceCacheDiagnostics::default();
+        service.record(response);
+
+        let value = service.to_value();
+        assert_eq!(value["cache"], "hit");
+        assert_eq!(value["cacheHits"], 1);
+        assert_eq!(value["observedLatencyMs"], 17);
+        assert_eq!(value["backend"], "redis");
+
+        let cache = json!({
+            "source": "live",
+            "factCount": 10,
+            "ageHuman": "0s",
+            "service": value
+        });
+        let text = cache_human_line(cache.as_object().unwrap());
+        assert!(text.contains("Cache: live, 10 facts"));
+        assert!(text.contains("Service cache: hit, 1 request(s), observed latency 17ms"));
+        assert!(text.contains("backend redis"));
+    }
+
+    #[test]
+    fn service_cache_diagnostics_are_optional_without_headers() {
+        let headers = HeaderMap::new();
+        assert!(service_response_diagnostics(&headers, Duration::from_millis(5)).is_none());
     }
 
     #[test]

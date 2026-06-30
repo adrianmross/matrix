@@ -206,6 +206,22 @@ count, and `--max-facts` used to populate the database. `matrix cache status -o
 json` reports the cache path, file size, age, and whether the database is older
 than Matrix's freshness hint.
 
+Matrix cache metadata may also include `cache.service` when the service-backed
+construct returns cache or latency headers. This describes the remote service
+read path, not the local SQLite file:
+
+- `cache.service.cache`: remote compatibility-service cache state such as
+  `hit`, `miss`, `stale`, `bypass`, or `mixed`.
+- `cache.service.observedLatencyMs`: Matrix-observed latency across the remote
+  requests made while syncing or checking the facts digest.
+- `cache.service.requestCount`: number of remote requests represented by the
+  service diagnostics.
+- `cache.service.backend`, `serverTiming`, and `requestId`: optional platform
+  hints when the route exposes them.
+
+If `cache.service` is absent, Matrix still works normally; the construct simply
+did not expose remote cache diagnostics for the last sync or digest check.
+
 Local SQL and graph commands use `cache-policy=auto` by default: a fresh cache
 hit opens the SQLite database immediately, while a stale cache first asks the
 construct for a tiny facts digest. If the digest still matches, Matrix reuses
