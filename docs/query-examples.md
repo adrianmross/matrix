@@ -10,6 +10,7 @@ List and run the embedded examples from any install:
 matrix examples list
 matrix examples show version-for
 matrix examples run version-for -o json
+matrix examples run operator-evidence -o json
 matrix examples run aphrodite-eunomia-path -o json
 matrix examples run eos-chaincode-members --offline -o table
 ```
@@ -74,7 +75,9 @@ matrix graphql -f examples/queries/version-for.graphql \
 | --- | --- |
 | Which Putto can work with an Aphrodite version? | `matrix works-with putto aphrodite -o json` |
 | Why are Aphrodite and Eunomia connected? | `matrix graphql -f examples/queries/aphrodite-eunomia-path.graphql --var from=aphrodite --var to=eunomia -o json` |
+| Why is a path blocked, stale, or only partially validated? | `matrix graphql -f examples/queries/operator-evidence.graphql --var from=aphrodite --var to=eunomia -o json` |
 | What version of Eunomia is Aphrodite using? | `matrix graphql -f examples/queries/version-for.graphql --var component=eunomia --var for=aphrodite -o json` |
+| Which facts support that version answer? | `matrix graphql -f examples/queries/version-evidence.graphql --var component=eunomia --var for=aphrodite -o json` |
 | What is connected to Aphrodite right now? | `matrix graphql -f examples/queries/component-status.graphql --var component=aphrodite -o json` |
 | Which producers are stale or missing metadata? | `matrix graphql -f examples/queries/producer-coverage.graphql --var limit=25 --var staleDays=7 -o json` |
 | What did Matrix resolve this name to? | `matrix graphql -f examples/queries/resolve-component.graphql --var name=red-wiz/eunomia -o json` |
